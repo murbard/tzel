@@ -2,7 +2,7 @@
 
 ## Overview
 
-A UTXO-based private transaction system using a Merkle commitment tree, nullifiers for double-spend prevention, and three transaction types: **Shield**, **Unshield**, and **Transfer**. All proofs will be realized as STARKs over a STARK-friendly hash function.
+A UTXO-based private transaction system using a Merkle commitment tree, nullifiers for double-spend prevention, and three transaction types: **Shield**, **Unshield**, and **Transfer**. All proofs are realized as two-level STARKs: a Cairo AIR proof compressed by an Stwo circuit reprover. The circuit proof has zero-knowledge blinding, ensuring that FRI query responses do not leak information about private witness data.
 
 ---
 
@@ -69,6 +69,7 @@ Deposits `v_pub` tokens from the public domain into a new private note.
 **Public inputs:**
 - `v_pub` — the deposited amount
 - `cm_new` — the new note commitment
+- `sender` — depositor's public address (prevents front-running)
 
 **Private inputs (witness):**
 - `pk` — recipient's paying key
@@ -77,8 +78,10 @@ Deposits `v_pub` tokens from the public domain into a new private note.
 **Constraints proved by the STARK:**
 1. `cm_new = H(pk, v_pub, rho, r)`
 
+**Public outputs:** `[v_pub, cm_new, sender]`
+
 **State changes:**
-- `v_pub` tokens are consumed from the caller's public balance.
+- `v_pub` tokens are consumed from `sender`'s public balance.
 - `cm_new` is appended to `T`.
 
 ---
@@ -91,6 +94,7 @@ Destroys a private note and releases its value publicly.
 - `root` — Merkle root of `T` at proof time
 - `nf` — nullifier of the spent note
 - `v_pub` — the withdrawn amount
+- `recipient` — destination address (prevents front-running)
 
 **Private inputs (witness):**
 - `sk` — spending key of the note owner
@@ -103,10 +107,12 @@ Destroys a private note and releases its value publicly.
 3. `cm` is in `T` under `root` via `path`
 4. `nf = H(sk, rho)`
 
+**Public outputs:** `[root, nf, v_pub, recipient]`
+
 **State changes:**
 - `nf` is checked against `NF_set` — reject if present.
 - `nf` is added to `NF_set`.
-- `v_pub` tokens are credited to the caller's public balance.
+- `v_pub` tokens are credited to `recipient`'s public balance.
 
 ---
 
@@ -150,6 +156,8 @@ Consumes up to two private notes and creates up to two new private notes, with t
 8. `v_a + v_b = v_1 + v_2`
 9. `v_1 < 2^k` and `v_2 < 2^k` (range checks via `k`-bit binary decomposition — prevents modular arithmetic overflow)
 
+**Public outputs:** `[root, nf_a, nf_b, cm_1, cm_2]`
+
 **Dummy notes:** For a 1-in split or 1-out merge, the unused input/output slot uses `v = 0`. A zero-value dummy commitment must still exist in the tree. Rather than relying on system-seeded dummies (whose well-known `sk` would let anyone grief by pre-spending them), users should create their own zero-value notes via Shield with `v_pub = 0`. The nullifier for a zero-value dummy input is still revealed and added to `NF_set`, so each dummy note can only be "spent" once — callers must use distinct dummy notes per transaction.
 
 **State changes:**
@@ -189,5 +197,5 @@ Both are publicly visible. `T` and `NF_set` reveal nothing about amounts or link
 - **Amount bit-width `k`:** All amounts must fit in `k` bits (e.g. `k = 64`). Transfer outputs are range-checked inside the circuit. Shield `v_pub` must be range-checked by the public layer before accepting the transaction — failure to do so would let an attacker shield a value near `p`, exploit modular wraparound in a Transfer, and extract inflated value.
 - **Dummy notes for flexible arity:** The 2-in-2-out Transfer handles split (1->2), merge (2->1), and 1-to-1 transfer by using zero-value notes in unused slots. Users create their own zero-value notes via Shield with `v_pub = 0` to avoid reliance on shared dummy notes that could be griefed.
 - **Viewing keys:** A recipient can derive a separate viewing key from `sk` and share it with auditors to allow decryption of incoming note memos without granting spend authority. This is an application-layer concern and does not affect the circuits.
-- **Public outputs:** Each circuit returns its public values as an array of field elements. Shield returns `[v_pub, cm_new]`. Unshield returns `[root, nf, v_pub, recipient]`. Transfer returns `[root, nf_a, nf_b, cm_1, cm_2]`. The on-chain verifier reads these from the proof to update state.
+- **Public outputs:** Each circuit returns its public values as an array of field elements. Shield returns `[v_pub, cm_new, sender]`. Unshield returns `[root, nf, v_pub, recipient]`. Transfer returns `[root, nf_a, nf_b, cm_1, cm_2]`. The on-chain verifier reads these from the proof to update state. Both Shield and Unshield bind the proof to a specific address (`sender`/`recipient`) to prevent front-running.
 - This spec intentionally omits: fee mechanisms and transaction-level encryption proofs. These can be layered on later.

@@ -13,7 +13,8 @@ fn main() -> Array<felt252> {
     let w = common::note_w();
 
     // Also prove the dummy shield (needed for split input later)
-    shield::verify(z.v, z.cm, z.pk, z.rho, z.r);
+    let sender: felt252 = 0xA11CE_ADD8;
+    shield::verify(z.v, z.cm, sender, z.pk, z.rho, z.r);
 
     // Build tree and Merkle paths
     let zh = tree::zero_hashes();

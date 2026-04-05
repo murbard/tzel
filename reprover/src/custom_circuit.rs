@@ -102,7 +102,11 @@ fn compute_output(output_preimage: &[Felt]) -> [M31; MEMORY_VALUES_LIMBS] {
 }
 
 pub struct CustomProofOutput {
+    /// Compressed circuit proof (zstd).
     pub proof: Vec<u8>,
+    /// Bootloader output preimage — the on-chain verifier needs this to
+    /// extract the program's public outputs (v_pub, cm, root, nf, etc.).
+    pub output_preimage: Vec<Felt>,
     pub cairo_prove_ms: u128,
     pub circuit_prove_ms: u128,
     pub verify_ms: u128,
@@ -310,6 +314,7 @@ pub fn custom_recursive_prove(
 
     Ok(CustomProofOutput {
         proof: compressed,
+        output_preimage,
         cairo_prove_ms,
         circuit_prove_ms,
         verify_ms,

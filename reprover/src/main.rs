@@ -24,7 +24,7 @@ use tracing_subscriber::fmt;
 use crate::custom_circuit::custom_recursive_prove;
 
 #[derive(Parser)]
-#[command(name = "reprove", about = "Run Cairo1 executable through privacy bootloader and generate Stwo proofs")]
+#[command(name = "reprove", about = "Generate privacy proofs for StarkPrivacy executables")]
 struct Cli {
     /// Path to a .executable.json file (Cairo 1 executable)
     executable: PathBuf,
@@ -33,13 +33,9 @@ struct Cli {
     #[arg(long, short)]
     output: Option<PathBuf>,
 
-    /// Use recursive circuit reprover (two-level, smaller proofs)
+    /// DEBUG ONLY: single-level Stwo proof (NOT zero-knowledge, leaks witness data)
     #[arg(long)]
-    recursive: bool,
-
-    /// Skip verification after proving (single-level mode only)
-    #[arg(long)]
-    no_verify: bool,
+    debug_single_level: bool,
 }
 
 fn run_privacy_bootloader_cairo1(
@@ -109,8 +105,31 @@ fn main() -> Result<()> {
     // Run through privacy bootloader
     let (prover_input, output_preimage) = run_privacy_bootloader_cairo1(&cli.executable)?;
 
-    if cli.recursive {
-        // Two-level recursive proving
+    if cli.debug_single_level {
+        // WARNING: Single-level Stwo proofs are NOT zero-knowledge.
+        // The FRI query responses leak information about the witness trace.
+        // Use only for debugging/benchmarking, never for real privacy transactions.
+        eprintln!("WARNING: single-level mode is NOT zero-knowledge — witness data may leak");
+        eprintln!("Generating Stwo proof...");
+        let t_prove = Instant::now();
+        let cairo_proof = prove_cairo::<Blake2sM31MerkleChannel>(prover_input, CAIRO_PROVER_PARAMS)
+            .map_err(|e| anyhow!("{e}"))?;
+        let prove_ms = t_prove.elapsed().as_millis();
+
+        let json_bytes = serde_json::to_vec(&cairo_proof)?;
+        let compressed = zstd::encode_all(&json_bytes[..], 3)?;
+
+        let peak_mem_kb = get_peak_memory_kb();
+        eprintln!("Prove: {}ms", prove_ms);
+        eprintln!("Proof zstd: {} bytes ({:.1} KB)", compressed.len(), compressed.len() as f64 / 1024.0);
+        eprintln!("Total: {}ms", t_total.elapsed().as_millis());
+        if let Some(mem) = peak_mem_kb {
+            eprintln!("Peak RSS: {:.1} MB", mem as f64 / 1024.0);
+        }
+        println!("prove_ms={}", prove_ms);
+        println!("proof_zstd_bytes={}", compressed.len());
+    } else {
+        // Recursive proving: Cairo proof → circuit proof (zero-knowledge)
         eprintln!("Running recursive prove...");
         let t_prove = Instant::now();
         let proof_output = custom_recursive_prove(prover_input, output_preimage)?;
@@ -140,49 +159,7 @@ fn main() -> Result<()> {
         println!("prove_ms={}", prove_ms);
         println!("verify_ms={}", proof_output.verify_ms);
         println!("proof_bytes={}", proof_size);
-        if let Some(mem) = peak_mem_kb {
-            println!("peak_rss_kb={}", mem);
-        }
-    } else {
-        // Single-level proving
-        eprintln!("Generating Stwo proof...");
-        let t_prove = Instant::now();
-        let cairo_proof = prove_cairo::<Blake2sM31MerkleChannel>(prover_input, CAIRO_PROVER_PARAMS)
-            .map_err(|e| anyhow!("{e}"))?;
-        let prove_ms = t_prove.elapsed().as_millis();
-
-        if !cli.no_verify {
-            eprintln!("Verifying proof...");
-            let t_verify = Instant::now();
-            cairo_air::verifier::verify_cairo_ex::<Blake2sM31MerkleChannel>(
-                cairo_proof.clone().into(),
-                CAIRO_PROVER_PARAMS.include_all_preprocessed_columns,
-            ).map_err(|e| anyhow!("{e}"))?;
-            eprintln!("Verify: {}ms", t_verify.elapsed().as_millis());
-        }
-
-        let json_bytes = serde_json::to_vec(&cairo_proof)?;
-        let compressed = zstd::encode_all(&json_bytes[..], 3)?;
-
-        let json_size = json_bytes.len();
-        let compressed_size = compressed.len();
-        eprintln!("Prove: {}ms", prove_ms);
-        eprintln!("Proof JSON: {} bytes ({:.1} KB)", json_size, json_size as f64 / 1024.0);
-        eprintln!("Proof zstd: {} bytes ({:.1} KB)", compressed_size, compressed_size as f64 / 1024.0);
-
-        if let Some(path) = cli.output {
-            fs::write(&path, &compressed)?;
-            eprintln!("Proof written to {:?}", path);
-        }
-
-        let peak_mem_kb = get_peak_memory_kb();
-        eprintln!("Total: {}ms", t_total.elapsed().as_millis());
-        if let Some(mem) = peak_mem_kb {
-            eprintln!("Peak RSS: {:.1} MB", mem as f64 / 1024.0);
-        }
-        println!("prove_ms={}", prove_ms);
-        println!("proof_json_bytes={}", json_size);
-        println!("proof_zstd_bytes={}", compressed_size);
+        println!("output_preimage_len={}", proof_output.output_preimage.len());
         if let Some(mem) = peak_mem_kb {
             println!("peak_rss_kb={}", mem);
         }

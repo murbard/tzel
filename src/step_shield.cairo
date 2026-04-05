@@ -6,5 +6,6 @@ use starkprivacy::{common, shield};
 #[executable]
 fn main() -> Array<felt252> {
     let a = common::note_a();
-    shield::verify(a.v, a.cm, a.pk, a.rho, a.r)
+    let sender: felt252 = 0xA11CE_ADD8; // Alice's public address
+    shield::verify(a.v, a.cm, sender, a.pk, a.rho, a.r)
 }

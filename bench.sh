@@ -1,13 +1,13 @@
 #!/bin/bash
 set -e
 
-# Usage: ./bench.sh [--depth 16|32|48] [--single]
+# Usage: ./bench.sh [--depth 16|32|48] [--debug-single-level]
 DEPTH=48
 RECURSIVE=1
 while [[ $# -gt 0 ]]; do
     case $1 in
         --depth) DEPTH="$2"; shift 2 ;;
-        --single) RECURSIVE=0; shift ;;
+        --debug-single-level) RECURSIVE=0; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -70,7 +70,7 @@ if [ "$RECURSIVE" = "1" ]; then
     done
 else
     echo ""
-    echo "--- Single-level mode (Stwo only) ---"
+    echo "--- Single-level mode (NOT zero-knowledge, debug only) ---"
     echo ""
 
     declare -a PROVES VERIFY_TIMES PROOF_SIZES PEAK_MEMS
@@ -80,7 +80,7 @@ else
         label=${LABELS[$i]}
         echo "[$label]"
 
-        OUTPUT=$(./reprover/target/release/reprove "target/dev/${step}.executable.json" 2>&1)
+        OUTPUT=$(./reprover/target/release/reprove "target/dev/${step}.executable.json" --debug-single-level 2>&1)
         PROVES[$i]=$(echo "$OUTPUT" | grep "^prove_ms=" | cut -d= -f2)
         PROOF_SIZES[$i]=$(echo "$OUTPUT" | grep "^proof_zstd_bytes=" | cut -d= -f2)
         PEAK_MEMS[$i]=$(echo "$OUTPUT" | grep "^peak_rss_kb=" | cut -d= -f2)
