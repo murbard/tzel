@@ -70,6 +70,12 @@ pub fn verify(leaf: felt252, root: felt252, siblings: Span<felt252>, path_indice
         i += 1;
     };
 
+    // Reject if path_indices had bits above TREE_DEPTH. Without this check
+    // an attacker could use path_indices = real_pos + k·2^TREE_DEPTH, which
+    // passes Merkle verification (same low bits) but produces a distinct
+    // nullifier (which hashes the full path_indices), enabling double-spend.
+    assert(idx == 0, 'path_indices out of range');
+
     // After traversing all levels, current must equal the expected root.
     assert(current == root, 'merkle root mismatch');
 }
