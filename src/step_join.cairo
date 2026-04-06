@@ -1,12 +1,6 @@
-/// Test executable: Join A(1000) + B(500) → C(1500) + W(0).
-///
-/// The proof outputs [root, nf_a, nf_b, cm_c, cm_w, ak_a, ak_b].
-/// The contract verifies signatures under both ak_a and ak_b, ensuring
-/// both input note owners authorized the spend.
-///
-/// Tree state: [cm_a, cm_b, cm_z] → adds [cm_c, cm_w]
+/// Step 3: Join A(1000) + B(500) → C(1500, bob) + W(0, dummy).
+/// Also shields dummy note Z. Tree: [cm_a, cm_b, cm_z]
 
-use starkprivacy::blake_hash as hash;
 use starkprivacy::{common, shield, transfer, tree};
 
 #[executable]
@@ -17,24 +11,28 @@ fn main() -> Array<felt252> {
     let c = common::note_c();
     let w = common::note_w();
 
-    // Shield the dummy note Z for later use in step_split.
+    // Shield dummy note Z for later use in split.
+    let (_, ak_z) = common::derive_ask(common::dummy_account().ask_base, 0);
     let sender: felt252 = 0xA11CE_ADD8;
-    shield::verify(z.v, z.cm, z.ak, sender, z.pk, z.rho, z.r);
+    shield::verify(z.v, z.cm, ak_z, sender, z.d_j, z.rseed);
 
-    // Build tree and Merkle paths.
     let zh = tree::zero_hashes();
     let leaves: Array<felt252> = array![a.cm, b.cm, z.cm];
     let (sib_a, idx_a, root) = tree::auth_path(leaves.span(), 0, zh.span());
     let (sib_b, idx_b, _) = tree::auth_path(leaves.span(), 1, zh.span());
 
+    // Both inputs are Alice's → same nk.
+    let (_, ak_a) = common::derive_ask(common::alice_account().ask_base, 0);
+    let (_, ak_b) = common::derive_ask(common::alice_account().ask_base, 1);
+
     transfer::verify(
-        root,
-        hash::nullifier(a.nsk, a.rho),
-        hash::nullifier(b.nsk, b.rho),
-        c.cm, w.cm,
-        a.nsk, a.ak, a.v, a.rho, a.r, sib_a.span(), idx_a,
-        b.nsk, b.ak, b.v, b.rho, b.r, sib_b.span(), idx_b,
-        c.pk, c.ak, c.v, c.rho, c.r,
-        w.pk, w.ak, w.v, w.rho, w.r,
+        root, a.nf, b.nf, c.cm, w.cm,
+        // input A (Alice)
+        a.nk, ak_a, a.d_j, a.v, a.rseed, sib_a.span(), idx_a,
+        // input B (Alice)
+        b.nk, ak_b, b.d_j, b.v, b.rseed, sib_b.span(), idx_b,
+        // output C (Bob), output W (Dummy)
+        c.d_j, c.v, c.rseed, c.ak,
+        w.d_j, w.v, w.rseed, w.ak,
     )
 }

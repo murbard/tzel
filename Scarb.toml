@@ -1,6 +1,6 @@
 [package]
 name = "starkprivacy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2025_12"
 
 [[target.executable]]
@@ -18,7 +18,6 @@ function = "starkprivacy::step_join::main"
 [[target.executable]]
 name = "step_split"
 function = "starkprivacy::step_split::main"
-
 
 [cairo]
 enable-gas = false
