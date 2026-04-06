@@ -28,6 +28,10 @@ pub const TREE_DEPTH: u32 = 32;
 #[cfg(feature: 'depth48')]
 pub const TREE_DEPTH: u32 = 48;
 
+/// Depth of the per-address auth key tree.
+/// 2^10 = 1024 one-time signing keys per address.
+pub const AUTH_DEPTH: u32 = 10;
+
 /// Assert that `leaf` belongs to a Merkle tree with the given `root`.
 ///
 /// # Arguments
@@ -78,4 +82,29 @@ pub fn verify(leaf: felt252, root: felt252, siblings: Span<felt252>, path_indice
 
     // After traversing all levels, current must equal the expected root.
     assert(current == root, 'merkle root mismatch');
+}
+
+/// Verify membership in an auth key tree (depth = AUTH_DEPTH).
+/// Same algorithm as `verify` but for the smaller per-address auth tree.
+pub fn verify_auth(leaf: felt252, root: felt252, siblings: Span<felt252>, path_indices: u64) {
+    assert(siblings.len() == AUTH_DEPTH, 'bad auth path length');
+
+    let mut current = leaf;
+    let mut idx = path_indices;
+    let mut i: u32 = 0;
+
+    while i < AUTH_DEPTH {
+        let sibling = *siblings.at(i);
+        let bit = idx & 1;
+        idx = idx / 2;
+        current = if bit == 1 {
+            hash2(sibling, current)
+        } else {
+            hash2(current, sibling)
+        };
+        i += 1;
+    };
+
+    assert(idx == 0, 'auth_index out of range');
+    assert(current == root, 'auth root mismatch');
 }

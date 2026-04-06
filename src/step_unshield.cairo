@@ -1,4 +1,4 @@
-/// Test: Unshield note A — withdraw 1000 (N=1, no change).
+/// Test: Unshield note A -- withdraw 1000 (N=1, no change).
 /// Tree: [cm_a]
 
 use starkprivacy::blake_hash as hash;
@@ -6,15 +6,18 @@ use starkprivacy::{common, tree, unshield};
 
 #[executable]
 fn main() -> Array<felt252> {
-    let a = common::note_a();
-    let (_, ak) = common::derive_ask(common::alice_account().ask_base, 0);
+    let (a, ad_a) = common::note_a();
     let recipient: felt252 = 0xCAFE;
 
+    // Commitment tree path.
     let zh = tree::zero_hashes();
     let leaves: Array<felt252> = array![a.cm];
-    let (siblings, idx, root) = tree::auth_path(leaves.span(), 0, zh.span());
+    let (cm_siblings, idx, root) = tree::auth_path(leaves.span(), 0, zh.span());
 
-    // Compute nullifier: nf = H_nf(nk_spend, cm, pos) where pos = leaf index.
+    // Auth tree path for the one-time key.
+    let auth_siblings_a = common::auth_path(ad_a.auth_leaves.span(), a.auth_key_idx);
+
+    // Compute nullifier: nf = H_nf(nk_spend, cm, pos).
     let nf = hash::nullifier(a.nk_spend, a.cm, idx);
 
     unshield::verify(
@@ -24,11 +27,14 @@ fn main() -> Array<felt252> {
         recipient,
         // per-input (N=1)
         array![a.nk_spend].span(),
-        array![ak].span(),
+        array![a.auth_root].span(),
+        array![a.auth_leaf_hash].span(),
+        auth_siblings_a.span(),
+        array![a.auth_key_idx.into()].span(),
         array![a.d_j].span(),
         array![a.v].span(),
         array![a.rseed].span(),
-        siblings.span(),
+        cm_siblings.span(),
         array![idx].span(),
         // no change
         false, 0, 0, 0, 0, 0, 0,

@@ -9,7 +9,8 @@
 ///   │   │   └── nk_spend_j = H_nksp(nk, d_j)   — per-address secret nullifier key
 ///   │   │       └── nk_tag_j = H_nktg(nk_spend_j) — per-address public binding tag
 ///   │   └── ask_base = H("ask", spend_seed)     — authorization derivation root
-///   │       └── ak_j = H(H(ask_base, j))        — per-address auth verifying key
+///   │       └── ask_j = H(ask_base, j)          — per-address auth secret
+///   │           └── auth_root_j = Merkle root of one-time key tree
 ///   │
 ///   └── incoming_seed = H("incoming", master_sk)
 ///       └── dsk = H("dsk", incoming_seed)
@@ -18,7 +19,7 @@
 ///
 /// # Note structure
 ///
-///   owner_tag_j = H_owner(ak_j, nk_tag_j)
+///   owner_tag_j = H_owner(auth_root_j, nk_tag_j)
 ///   cm = H_commit(d_j, v, rcm, owner_tag_j)  — commitment
 ///   nf = H_nf(nk_spend_j, cm, pos)           — nullifier (position-dependent)
 ///
@@ -31,7 +32,7 @@
 ///   - cmmtSP__:  note commitments
 ///   - nkspSP__:  nk_spend_j derivation (per-address secret nullifier key)
 ///   - nktgSP__:  nk_tag_j derivation (per-address public binding tag)
-///   - ownrSP__:  owner_tag_j (fuses ak + nk_tag into commitment)
+///   - ownrSP__:  owner_tag_j (fuses auth_root + nk_tag into commitment)
 
 use core::blake::{blake2s_compress, blake2s_finalize};
 use core::box::BoxTrait;
@@ -203,20 +204,20 @@ pub fn derive_nk_tag(nk_spend: felt252) -> felt252 {
     u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
 }
 
-/// Compute owner tag: owner_tag_j = H_owner(ak_j, nk_tag_j).
+/// Compute owner tag: owner_tag_j = H_owner(auth_root_j, nk_tag_j).
 ///
-/// Fuses the authorization key and the nullifier binding tag into a single
+/// Fuses the auth key tree root and the nullifier binding tag into a single
 /// value for the commitment. Binds the note to both the spending authority
-/// (ak) and the nullifier key chain (nk_tag). Uses "ownrSP__" domain.
-pub fn owner_tag(ak: felt252, nk_tag: felt252) -> felt252 {
-    hash2_with_iv(blake2s_iv_owner(), ak, nk_tag)
+/// (auth_root) and the nullifier key chain (nk_tag). Uses "ownrSP__" domain.
+pub fn owner_tag(auth_root: felt252, nk_tag: felt252) -> felt252 {
+    hash2_with_iv(blake2s_iv_owner(), auth_root, nk_tag)
 }
 
 /// Note commitment: cm = H_commit(d_j, v, rcm, owner_tag_j).
 ///
 /// Binds to the diversified address, value, randomness, and the owner tag
-/// (which fuses ak and nk_tag). This ensures:
-///   - The prover can't substitute a different ak (breaks Merkle proof)
+/// (which fuses auth_root and nk_tag). This ensures:
+///   - The prover can't substitute a different auth_root (breaks Merkle proof)
 ///   - The prover can't use a different nk (changes nk_tag → changes
 ///     owner_tag → changes cm → breaks Merkle proof)
 pub fn commit(d_j: felt252, v: u64, rcm: felt252, owner_tag: felt252) -> felt252 {
