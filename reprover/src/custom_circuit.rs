@@ -189,6 +189,36 @@ pub struct CustomProofOutput {
     pub verify_ms: u128,
 }
 
+/// Proof bundle: everything needed for standalone verification.
+/// Serialized as JSON for transport between prover and verifier.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct ProofBundle {
+    /// Hex-encoded zstd-compressed circuit proof
+    pub proof_hex: String,
+    /// Output preimage (public outputs as decimal felt strings)
+    pub output_preimage: Vec<String>,
+}
+
+impl ProofBundle {
+    pub fn from_output(out: &CustomProofOutput) -> Self {
+        Self {
+            proof_hex: hex::encode(&out.proof),
+            output_preimage: out.output_preimage.iter().map(|f| f.to_string()).collect(),
+        }
+    }
+
+    pub fn proof_bytes(&self) -> Vec<u8> {
+        hex::decode(&self.proof_hex).expect("bad proof hex")
+    }
+
+    pub fn output_preimage_felts(&self) -> Vec<Felt> {
+        self.output_preimage
+            .iter()
+            .map(|s| Felt::from_dec_str(s).expect("bad felt"))
+            .collect()
+    }
+}
+
 /// Generate a two-level recursive zero-knowledge proof.
 ///
 /// This is the main entry point for proof generation. It:
@@ -199,6 +229,8 @@ pub struct CustomProofOutput {
 ///   5. Proves the circuit execution with Stwo
 ///   6. Verifies both proofs for correctness
 ///   7. Serializes and compresses the circuit proof (~290 KB)
+/// Generate a two-level recursive ZK proof from an execution trace.
+/// Returns proof bytes (zstd-compressed), public outputs, and timing data.
 pub fn custom_recursive_prove(
     prover_input: ProverInput,
     output_preimage: Vec<Felt>,

@@ -34,15 +34,18 @@ impl WalletFile {
         (ek_v, dk_v, ek_d, dk_d)
     }
 
+    /// Generate next address. Returns (d_j, auth_root, nk_tag, j).
+    /// Builds the full auth tree (1024 ML-DSA keygens, ~1s).
     fn next_address(&mut self) -> (F, F, F, u32) {
         let acc = self.account();
         let j = self.addr_counter;
         let d_j = derive_address(&acc.incoming_seed, j);
-        let ak = derive_ak(&acc.ask_base, j);
+        let ask_j = derive_ask(&acc.ask_base, j);
+        let (auth_root, _leaves) = build_auth_tree(&ask_j);
         let nk_sp = derive_nk_spend(&acc.nk, &d_j);
         let nk_tg = derive_nk_tag(&nk_sp);
         self.addr_counter += 1;
-        (d_j, ak, nk_tg, j)
+        (d_j, auth_root, nk_tg, j)
     }
 
     fn balance(&self) -> u128 {
@@ -262,12 +265,12 @@ fn cmd_keygen(path: &str) -> Result<(), String> {
 
 fn cmd_address(path: &str) -> Result<(), String> {
     let mut w = load_wallet(path)?;
-    let (d_j, ak, nk_tag, j) = w.next_address();
+    let (d_j, auth_root, nk_tag, j) = w.next_address();
     let (ek_v, _, ek_d, _) = w.kem_keys();
 
     let addr = PaymentAddress {
         d_j,
-        ak,
+        auth_root,
         nk_tag,
         ek_v: ek_v.to_bytes().to_vec(),
         ek_d: ek_d.to_bytes().to_vec(),
@@ -314,36 +317,27 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
         let Some((v, rseed, _memo)) = decrypt_memo(&nm.enc, &dk_v) else {
             continue;
         };
-        // Stage 3: match address
+        // Stage 3: match address — try each address's auth_root
         let rcm = derive_rcm(&rseed);
         for j in 0..w.addr_counter {
             let d_j = derive_address(&acc.incoming_seed, j);
-            let ak = derive_ak(&acc.ask_base, j);
+            let ask_j = derive_ask(&acc.ask_base, j);
+            let (auth_root, _) = build_auth_tree(&ask_j);
             let nk_sp = derive_nk_spend(&acc.nk, &d_j);
             let nk_tg = derive_nk_tag(&nk_sp);
-            let otag = owner_tag(&ak, &nk_tg);
+            let otag = owner_tag(&auth_root, &nk_tg);
             if commit(&d_j, v, &rcm, &otag) == nm.cm {
-                // Find the tree index for this commitment
-                // memo index == tree leaf index (ledger posts one memo per tree append)
-                // The NoteMemo.index is the memo index, we need the tree leaf index.
-                // For now, use the memo index as a proxy — in our ledger, memos and tree
-                // leaves are appended in lockstep, but multiple leaves can be added per tx.
-                // We need a better way. Let's query the tree size and figure out the leaf index.
-                // Actually, the ledger returns leaf indices in shield/transfer/unshield responses.
-                // During scan, we need to find which tree leaf matches this cm.
-                // The simplest approach: the ledger memo index doesn't directly correspond to tree index
-                // because transfer adds 2 leaves but 2 memos. So memo index == tree leaf index
-                // since post_note is called once per tree.append.
                 let leaf_index = nm.index;
                 w.notes.push(Note {
                     nk_spend: nk_sp,
                     nk_tag: nk_tg,
-                    ak,
+                    auth_root,
                     d_j,
                     v,
                     rseed,
                     cm: nm.cm,
                     index: leaf_index,
+                    addr_index: j,
                 });
                 found += 1;
                 println!("  found: v={} cm={} index={}", v, short(&nm.cm), leaf_index);
@@ -397,10 +391,10 @@ fn cmd_shield(
     let address = if let Some(addr_path) = to {
         load_address(&addr_path)?
     } else {
-        let (d_j, ak, nk_tag, _) = w.next_address();
+        let (d_j, auth_root, nk_tag, _) = w.next_address();
         PaymentAddress {
             d_j,
-            ak,
+            auth_root,
             nk_tag,
             ek_v: ek_v.to_bytes().to_vec(),
             ek_d: ek_d.to_bytes().to_vec(),
@@ -460,16 +454,16 @@ fn cmd_transfer(
     let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
         recipient.ek_d.as_slice().try_into().map_err(|_| "bad ek_d")?,
     ).map_err(|_| "invalid ek_d")?;
-    let otag_1 = owner_tag(&recipient.ak, &recipient.nk_tag);
+    let otag_1 = owner_tag(&recipient.auth_root, &recipient.nk_tag);
     let cm_1 = commit(&recipient.d_j, amount, &rcm_1, &otag_1);
     let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
     let enc_1 = encrypt_note(amount, &rseed_1, memo_bytes, &ek_v_recv, &ek_d_recv);
 
     // Build output 2: change to self
-    let (d_j_c, ak_c, nk_tag_c, _) = w.next_address();
+    let (d_j_c, auth_root_c, nk_tag_c, _) = w.next_address();
     let rseed_2: F = rng.random();
     let rcm_2 = derive_rcm(&rseed_2);
-    let otag_2 = owner_tag(&ak_c, &nk_tag_c);
+    let otag_2 = owner_tag(&auth_root_c, &nk_tag_c);
     let cm_2 = commit(&d_j_c, change, &rcm_2, &otag_2);
     let enc_2 = encrypt_note(change, &rseed_2, None, &ek_v, &ek_d);
 
@@ -526,10 +520,10 @@ fn cmd_unshield(
 
     let (cm_change, enc_change) = if change > 0 {
         let mut rng = rand::rng();
-        let (d_j_c, ak_c, nk_tag_c, _) = w.next_address();
+        let (d_j_c, auth_root_c, nk_tag_c, _) = w.next_address();
         let rseed_c: F = rng.random();
         let rcm_c = derive_rcm(&rseed_c);
-        let otag_c = owner_tag(&ak_c, &nk_tag_c);
+        let otag_c = owner_tag(&auth_root_c, &nk_tag_c);
         let cm = commit(&d_j_c, change, &rcm_c, &otag_c);
         let enc = encrypt_note(change, &rseed_c, None, &ek_v, &ek_d);
         (cm, Some(enc))
