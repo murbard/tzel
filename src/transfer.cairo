@@ -12,7 +12,7 @@
 /// published nullifiers reveals the input count.
 ///
 /// # Public outputs
-///   [root, nf_0, ..., nf_{N-1}, cm_1, cm_2, ak_0, ..., ak_{N-1}]
+///   [root, nf_0..nf_{N-1}, cm_1, cm_2, ak_0..ak_{N-1}, memo_ct_hash_1, memo_ct_hash_2]
 ///
 /// # Constraints
 ///   For each input i (0..N):
@@ -46,9 +46,9 @@ pub fn verify(
     siblings_flat: Span<felt252>,// N * TREE_DEPTH siblings, concatenated
     path_indices_list: Span<u64>,// per-input Merkle path index
     // --- output 1 ---
-    d_j_1: felt252, v_1: u64, rseed_1: felt252, ak_1: felt252,
+    d_j_1: felt252, v_1: u64, rseed_1: felt252, ak_1: felt252, memo_ct_hash_1: felt252,
     // --- output 2 ---
-    d_j_2: felt252, v_2: u64, rseed_2: felt252, ak_2: felt252,
+    d_j_2: felt252, v_2: u64, rseed_2: felt252, ak_2: felt252, memo_ct_hash_2: felt252,
 ) -> Array<felt252> {
     // Determine N from the nullifier list length.
     let n = nf_list.len();
@@ -115,7 +115,8 @@ pub fn verify(
     assert(sum_in == sum_out, 'transfer: balance mismatch');
 
     // ── Build public outputs ─────────────────────────────────────────
-    // Format: [root, nf_0..nf_{n-1}, cm_1, cm_2, ak_0..ak_{n-1}]
+    // Format: [root, nf_0..nf_{n-1}, cm_1, cm_2, ak_0..ak_{n-1},
+    //          memo_ct_hash_1, memo_ct_hash_2]
     let mut outputs: Array<felt252> = array![root];
     let mut j: u32 = 0;
     while j < n {
@@ -129,5 +130,7 @@ pub fn verify(
         outputs.append(*ak_in_list.at(j));
         j += 1;
     };
+    outputs.append(memo_ct_hash_1);
+    outputs.append(memo_ct_hash_2);
     outputs
 }

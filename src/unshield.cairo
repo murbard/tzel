@@ -4,13 +4,21 @@
 /// and optionally creates one private change note.
 ///
 /// # Public outputs
-///   [root, nf_0, ..., nf_{N-1}, v_pub, ak_0, ..., ak_{N-1}, recipient, cm_change]
-///   (cm_change = 0 if no change output)
+///   [root, nf_0..nf_{N-1}, v_pub, ak_0..ak_{N-1}, recipient, cm_change, memo_ct_hash_change]
+///   cm_change = 0 if no change output; memo_ct_hash_change = 0 if no change
 ///
 /// # Constraints
-///   Same per-input verification as Transfer (Merkle, nullifier, commitment)
+///   For each input: rcm = H("rcm", rseed), cm = H_commit(d_j, v, rcm, ak),
+///                   Merkle membership, nf = H_null(nk, cm)
+///   All nullifiers pairwise distinct
 ///   If has_change: cm_change = H_commit(d_j_c, v_change, rcm_c, ak_c)
-///   sum(v_inputs) = v_pub + v_change
+///   If !has_change: v_change = 0
+///   Balance: sum(v_inputs) = v_pub + v_change
+///
+/// # memo_ct_hash_change
+///   Hash of the change output's encrypted memo ciphertext, computed
+///   client-side and passed in as a public input. Prevents a relayer
+///   from tampering with the memo data. Zero if no change output.
 
 use starkprivacy::blake_hash as hash;
 use starkprivacy::merkle;
@@ -37,6 +45,7 @@ pub fn verify(
     v_change: u64,
     rseed_change: felt252,
     ak_change: felt252,
+    memo_ct_hash_change: felt252, // 0 if no change
 ) -> Array<felt252> {
     let n = nf_list.len();
     assert(n >= 1, 'unshield: need >= 1 input');
@@ -91,6 +100,7 @@ pub fn verify(
         hash::commit(d_j_change, v_change, rcm_c, ak_change)
     } else {
         assert(v_change == 0, 'unshield: no change but v!=0');
+        assert(memo_ct_hash_change == 0, 'unshield: mh!=0 but no change');
         0
     };
 
@@ -113,5 +123,6 @@ pub fn verify(
     };
     outputs.append(recipient);
     outputs.append(cm_change);
+    outputs.append(memo_ct_hash_change);
     outputs
 }

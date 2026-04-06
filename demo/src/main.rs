@@ -148,6 +148,19 @@ fn commit(d_j: &F, v: u64, rcm: &F, ak: &F) -> F {
 /// Nullifier: nf = H_null(nk, cm). Account-level nk bound to this commitment.
 fn nullifier(nk: &F, cm: &F) -> F { hash_null(nk, cm) }
 
+/// Compute the memo ciphertext hash that the circuit commits to.
+/// This is H_memo(ct_v || encrypted_data) — the portion the recipient decrypts.
+/// Uses a dedicated personalization ("memoSP__") for domain separation.
+/// Computed client-side, passed into the circuit as a public input, and
+/// verified on-chain by the contract against the posted calldata.
+/// This prevents a malicious relayer from swapping memo data.
+fn memo_ct_hash(enc: &EncryptedNote) -> F {
+    let mut buf = Vec::with_capacity(enc.ct_v.len() + enc.encrypted_data.len());
+    buf.extend_from_slice(&enc.ct_v);
+    buf.extend_from_slice(&enc.encrypted_data);
+    blake2s(b"memoSP__", &buf)
+}
+
 /// Display first 4 bytes as hex for readable output.
 fn short(f: &F) -> String { hex::encode(&f[..4]) }
 
@@ -486,6 +499,8 @@ impl Wallet {
 struct Chain {
     tree: MerkleTree,
     nullifiers: HashSet<F>,
+    /// Maps commitment → memo_ct_hash (simulates on-chain verification).
+    memo_hashes: HashMap<F, F>,
     balances: HashMap<String, u64>,
     valid_roots: HashSet<F>,
     memos: Vec<(F, EncryptedNote)>,
@@ -496,7 +511,7 @@ impl Chain {
         let tree = MerkleTree::new();
         let mut roots = HashSet::new();
         roots.insert(tree.root());
-        Self { tree, nullifiers: HashSet::new(), balances: HashMap::new(), valid_roots: roots, memos: vec![] }
+        Self { tree, nullifiers: HashSet::new(), memo_hashes: HashMap::new(), balances: HashMap::new(), valid_roots: roots, memos: vec![] }
     }
 
     fn fund(&mut self, addr: &str, amount: u64) {
@@ -504,6 +519,27 @@ impl Chain {
     }
 
     fn snapshot_root(&mut self) { self.valid_roots.insert(self.tree.root()); }
+
+    /// Post an encrypted note on-chain: store it and record its memo hash.
+    /// In production, the contract verifies H(posted_calldata) == memo_ct_hash
+    /// from the proof's public outputs. Here we simulate that by storing the
+    /// hash and verifying it in `verify_memo`.
+    fn post_note(&mut self, cm: F, enc: EncryptedNote) {
+        let mh = memo_ct_hash(&enc);
+        self.memo_hashes.insert(cm, mh);
+        self.memos.push((cm, enc));
+    }
+
+    /// Contract-side memo verification: check that the posted memo data
+    /// matches the hash committed in the proof's public outputs.
+    fn verify_memo(&self, cm: &F) -> bool {
+        if let Some(expected) = self.memo_hashes.get(cm) {
+            if let Some((_, enc)) = self.memos.iter().find(|(c, _)| c == cm) {
+                return memo_ct_hash(enc) == *expected;
+            }
+        }
+        false
+    }
 
     /// Shield: deposit public tokens into a private note.
     fn shield(&mut self, sender: &str, v: u64, d_j: &F, ak: &F, memo: Option<&[u8]>, ek_v: &Ek, ek_d: &Ek) -> Result<(), String> {
@@ -516,7 +552,7 @@ impl Chain {
         *self.balances.get_mut(sender).unwrap() -= v;
         let index = self.tree.append(cm);
         self.snapshot_root();
-        self.memos.push((cm, encrypt_note(v, &rseed, memo, ek_v, ek_d)));
+        self.post_note(cm, encrypt_note(v, &rseed, memo, ek_v, ek_d));
         println!("    cm={} index={}", short(&cm), index);
         Ok(())
     }
@@ -562,7 +598,7 @@ impl Chain {
             let rcm = derive_rcm(&rseed);
             let cm = commit(d_j, v_change as u64, &rcm, ak);
             let index = self.tree.append(cm);
-            self.memos.push((cm, encrypt_note(v_change as u64, &rseed, None, ek_v, ek_d)));
+            self.post_note(cm, encrypt_note(v_change as u64, &rseed, None, ek_v, ek_d));
             println!("    change cm={} v={} index={}", short(&cm), v_change, index);
         } else {
             assert_eq!(v_change, 0, "no change output but value remains");
@@ -617,7 +653,7 @@ impl Chain {
             let rcm = derive_rcm(&rseed);
             let cm = commit(d, v, &rcm, ak);
             let index = self.tree.append(cm);
-            self.memos.push((cm, encrypt_note(v, &rseed, memo, ev, ed)));
+            self.post_note(cm, encrypt_note(v, &rseed, memo, ev, ed));
             println!("    output cm={} v={} index={}", short(&cm), v, index);
         }
         for nf in &nfs { self.nullifiers.insert(*nf); }
@@ -876,5 +912,39 @@ mod tests {
         assert_eq!(d_j, exp_dj, "d_j mismatch");
         assert_eq!(cm, exp_cm, "cm mismatch");
         assert_eq!(nf, exp_nf, "nf mismatch");
+    }
+
+    /// memo_ct_hash is recorded for every posted note and is deterministic.
+    #[test]
+    fn test_memo_ct_hash_recorded() {
+        let (mut c, mut a, _) = setup();
+        c.fund("a", 100);
+        let (d, ak) = a.next_address();
+        c.shield("a", 100, &d, &ak, Some(b"test memo"), &a.ek_v, &a.ek_d).unwrap();
+        // The chain should have recorded a memo hash for the commitment.
+        let cm = c.tree.leaves[0];
+        assert!(c.memo_hashes.contains_key(&cm), "memo hash not recorded");
+        let mh = c.memo_hashes[&cm];
+        assert_ne!(mh, ZERO, "memo hash should not be zero");
+    }
+
+    /// Tampering with the encrypted memo data is detected by the
+    /// contract-side verify_memo check.
+    #[test]
+    fn test_memo_tamper_detected() {
+        let (mut c, mut a, _) = setup();
+        c.fund("a", 100);
+        let (d, ak) = a.next_address();
+        c.shield("a", 100, &d, &ak, Some(b"real memo"), &a.ek_v, &a.ek_d).unwrap();
+        let cm = c.tree.leaves[0];
+
+        // Before tampering: memo verification passes.
+        assert!(c.verify_memo(&cm), "memo should verify before tampering");
+
+        // Simulate a relayer tampering with the encrypted data.
+        c.memos[0].1.encrypted_data[0] ^= 0xFF;
+
+        // After tampering: memo verification fails.
+        assert!(!c.verify_memo(&cm), "tampered memo should fail verification");
     }
 }
