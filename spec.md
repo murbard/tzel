@@ -26,9 +26,9 @@ master_sk
 │   │       └── nk_tag_j  = H_nktg(nk_spend_j)   — per-address public binding tag
 │   ├── ask_base   = H("ask", spend_seed)         — base authorization secret
 │   │   └── ask_j  = H(ask_base, j)               — per-address auth secret
-│   │       └── seed_i = H("auth-key", ask_j, i)  — per-key WOTS+ seed
+│   │       └── seed_i = H(H("auth-key", ask_j), i) — per-key WOTS+ seed
 │   │           └── pk_i = WOTS+.KeyGen(seed_i)   — 133 chain endpoints (w=4)
-│   │       └── auth_root_j = MerkleRoot(H(pk_0), ..., H(pk_{K-1}))
+│   │       └── auth_root_j = MerkleRoot(fold(pk_0), ..., fold(pk_{K-1}))
 │   └── ovk        = H("ovk", spend_seed)         — outgoing viewing key
 │
 └── incoming_seed = H("incoming", master_sk)
@@ -46,9 +46,9 @@ master_sk
 
 Each address `j` has a Merkle tree of K one-time WOTS+ public keys (K = 2^AUTH_DEPTH, default AUTH_DEPTH = 10, giving 1024 keys per address). WOTS+ uses Winternitz parameter w=4 with 133 hash chains per key, all using BLAKE2s. The tree is constructed at address generation time:
 
-1. For each index i in 0..K: `seed_i = H("auth-key", ask_j, i)`
+1. For each index i in 0..K: `seed_i = H(H("auth-key", ask_j), i)`
 2. `pk_i = WOTS+.KeyGen(seed_i)` — 133 chain endpoints derived from seed via BLAKE2s hash chains
-3. `leaf_i = H(pk_i_folded)` — BLAKE2s hash of the 133 chain endpoints folded to a single leaf hash
+3. `leaf_i = fold(pk_0, pk_1, ..., pk_132)` — sequential left-fold of the 133 chain endpoints using `H_pkfold`
 4. `auth_root_j = MerkleRoot(leaf_0, ..., leaf_{K-1})` — standard Merkle tree using `H_merkle`
 
 The `auth_root_j` is included in the payment address and bound into commitments via `owner_tag`. Each key is used at most once. When spending, the STARK proves the chosen `pk_i` is a leaf in the tree and verifies the WOTS+ signature inside the circuit. No auth leaf, public key, or signature appears in the public outputs — the STARK proof itself proves spend authorization.
@@ -143,9 +143,9 @@ Note: `auth_root` does NOT appear in the public outputs. It is a private input u
 2. `owner_tag = H_owner(auth_root, nk_tag)` where both `auth_root` and `nk_tag` are private inputs from the recipient's payment address
 3. `cm_new = H_commit(d_j, v_pub, rcm, owner_tag)`
 
-Note: the circuit cannot verify that `auth_root` or `nk_tag` are correctly derived because the sender does not have the recipient's secrets. Incorrect values create an unspendable note (self-griefing only — the sender loses their own deposited tokens). The spending circuits (transfer/unshield) enforce the full derivation chain when the note is later spent.
+Note: the circuit cannot verify that `auth_root` or `nk_tag` are correctly derived because the sender does not have the recipient's secrets. Incorrect values create an unspendable note — the deposited tokens are permanently locked. This is a sender-griefing risk: a malicious or buggy sender can burn their deposit by using incorrect recipient address components. The spending circuits (transfer/unshield) enforce the full derivation chain when the note is later spent.
 
-`memo_ct_hash` is computed client-side as `H(ct_v || encrypted_data)` and passed into the circuit as a public input.
+`memo_ct_hash` is computed client-side as `H(ct_d || tag || ct_v || encrypted_data)` — covering ALL on-chain note data — and passed into the circuit as a public input.
 
 **Contract checks:** proof valid, `msg.sender == sender`, `H(posted_memo_calldata) == memo_ct_hash`.
 
@@ -165,14 +165,14 @@ WOTS+ signature verification happens inside the STARK. No auth leaves, public ke
 
 **Circuit constraints:**
 1. For each input i (0..N):
-   - `rcm_i = H("rcm", rseed_i)`
+   - `rcm_i = H(H("rcm"), rseed_i)`
    - `nk_tag_i = H_nktg(nk_spend_i)`
    - `owner_tag_i = H_owner(auth_root_i, nk_tag_i)`
    - `cm_i = H_commit(d_j_i, v_i, rcm_i, owner_tag_i)`
    - Merkle membership of `cm_i` at position `pos_i` against `root` (commitment tree)
    - `nf_i = H_nf(nk_spend_i, H_nf(cm_i, pos_i))`
    - Merkle membership of `auth_leaf_i` at position `key_idx_i` against `auth_root_i` (auth key tree)
-   - WOTS+ signature verification: verify the WOTS+ signature over the sighash under `pk_i`, confirming spend authorization
+   - WOTS+ signature verification: the circuit computes the sighash from the public outputs, decomposes it into 128 base-4 digits + 5 checksum digits, then for each of the 133 chains verifies `H_wots^{w-1-digit}(sig_j) == pk_j`. The digits are NOT witness data — they are deterministically derived inside the circuit.
 2. All nullifiers pairwise distinct
 3. For both outputs:
    - `owner_tag_out = H_owner(auth_root_out, nk_tag_out)` where `auth_root_out` and `nk_tag_out` are private inputs from the recipient's payment address
@@ -320,7 +320,7 @@ The memo is end-to-end encrypted — only the recipient (with `dk_v`) can read i
 
 ## Memo Integrity (Anti-Tampering)
 
-Each circuit includes a `memo_ct_hash` per output note in its public outputs. This is the hash of the encrypted memo ciphertext (`H(ct_v || encrypted_data)`), computed **client-side** before proving. The circuit does not compute it — it simply passes it through as a public output.
+Each circuit includes a `memo_ct_hash` per output note in its public outputs. This is a hash of ALL on-chain note data (`H(ct_d || tag || ct_v || encrypted_data)`), computed **client-side** before proving. The circuit does not compute it — it simply passes it through as a public output. Including the detection ciphertext and tag prevents a relayer from swapping detection data to redirect note discovery.
 
 The on-chain contract verifies `H(posted_calldata) == memo_ct_hash` for each output note. If a malicious relayer or sequencer swaps the encrypted memo data in transit, the hash won't match and the contract rejects the transaction.
 
@@ -358,25 +358,25 @@ note_data         —  3.2 KB    1 output note
 
 ```
 proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
-public_outputs    — 128+32N B  [root, cm_1, cm_2, mh_1, mh_2] + N x [nf_i]
+public_outputs    — (N+5)*32 B  [root, nf_0..nf_{N-1}, cm_1, cm_2, mh_1, mh_2]
 note_data         —  6.4 KB    2 output notes
                   ----------
-                  ~301 KB + 32N B
+                  ~301 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
 ```
 
-No pk_calldata or signatures — WOTS+ verification happens inside the STARK. For a typical N=2 transfer: ~302 KB total.
+For a typical N=2 transfer: ~302 KB total.
 
 ### Unshield (N->withdrawal + change)
 
 ```
 proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
-public_outputs    — 160+32N B  [root, v_pub, recipient, cm_change, mh_change] + N x [nf_i]
+public_outputs    — (N+5)*32 B  [root, nf_0..nf_{N-1}, v_pub, recipient, cm_change, mh_change]
 note_data         — 0-3.2 KB   0 or 1 change note
                   ----------
-                  ~295-299 KB + 32N B
+                  ~295-299 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
 ```
 
-The proof dominates at ~295 KB. There is no per-input overhead for public keys or signatures. For a typical N=2 unshield: ~296-299 KB total.
+For a typical N=2 unshield: ~296-299 KB total.
 
 ## Domain Separation
 
@@ -391,8 +391,10 @@ All hashing uses BLAKE2s-256 truncated to 251 bits, with domain separation via B
 | Per-address nk_spend | `nkspSP__` | `derive_nk_spend` |
 | Per-address nk_tag | `nktgSP__` | `derive_nk_tag` |
 | Owner tag | `ownrSP__` | `owner_tag` |
-| Memo hash (client-side) | `memoSP__` | -- (not in circuit) |
+| WOTS+ chain hash | `wotsSP__` | `hash1_wots` (in circuit) |
+| WOTS+ PK fold | `pkfdSP__` | `hash2_pkfold` (in circuit) |
 | Sighash | `sighSP__` | `sighash_fold` (in circuit + client) |
+| Memo hash (client-side) | `memoSP__` | -- (not in circuit) |
 
 The commitment tree and auth tree both use `mrklSP__` for internal nodes. This is safe because they are verified against different roots in different circuit contexts — there is no cross-tree confusion.
 
