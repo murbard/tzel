@@ -15,6 +15,8 @@ use std::collections::{HashMap, HashSet};
 pub type F = [u8; 32];
 pub const ZERO: F = [0u8; 32];
 pub const DETECT_K: usize = 10;
+pub const ML_KEM768_CIPHERTEXT_BYTES: usize = 1088;
+pub const ENCRYPTED_NOTE_BYTES: usize = 8 + 32 + MEMO_SIZE + 16;
 
 /// Generate a random valid felt252 (251-bit value).
 pub fn random_felt() -> F {
@@ -633,6 +635,39 @@ pub struct EncryptedNote {
     pub encrypted_data: Vec<u8>,
 }
 
+impl EncryptedNote {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.ct_d.len() != ML_KEM768_CIPHERTEXT_BYTES {
+            return Err(format!(
+                "bad ct_d length: got {} bytes, expected {}",
+                self.ct_d.len(),
+                ML_KEM768_CIPHERTEXT_BYTES
+            ));
+        }
+        if self.ct_v.len() != ML_KEM768_CIPHERTEXT_BYTES {
+            return Err(format!(
+                "bad ct_v length: got {} bytes, expected {}",
+                self.ct_v.len(),
+                ML_KEM768_CIPHERTEXT_BYTES
+            ));
+        }
+        if self.encrypted_data.len() != ENCRYPTED_NOTE_BYTES {
+            return Err(format!(
+                "bad encrypted_data length: got {} bytes, expected {}",
+                self.encrypted_data.len(),
+                ENCRYPTED_NOTE_BYTES
+            ));
+        }
+        if (self.tag as usize) >= (1 << DETECT_K) {
+            return Err(format!(
+                "bad detection tag: got {}, expected low {} bits only",
+                self.tag, DETECT_K
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub fn encrypt_note(
     v: u64,
     rseed: &F,
@@ -1033,6 +1068,10 @@ impl Ledger {
         if bal < req.v {
             return Err("insufficient balance".into());
         }
+        if let Some(ref enc) = req.client_enc {
+            enc.validate()
+                .map_err(|e| format!("invalid client encrypted note: {}", e))?;
+        }
 
         // Validate output_preimage for Stark proofs
         match &req.proof {
@@ -1121,6 +1160,12 @@ impl Ledger {
         if n == 0 || n > 16 {
             return Err("bad nullifier count".into());
         }
+        req.enc_1
+            .validate()
+            .map_err(|e| format!("invalid output note 1: {}", e))?;
+        req.enc_2
+            .validate()
+            .map_err(|e| format!("invalid output note 2: {}", e))?;
         if !self.valid_roots.contains(&req.root) {
             return Err("invalid root".into());
         }
@@ -1209,6 +1254,16 @@ impl Ledger {
         let n = req.nullifiers.len();
         if n == 0 || n > 16 {
             return Err("bad nullifier count".into());
+        }
+        match (req.cm_change == ZERO, req.enc_change.as_ref()) {
+            (true, Some(_)) => {
+                return Err("change note data provided with zero cm_change".into());
+            }
+            (false, Some(enc)) => {
+                enc.validate()
+                    .map_err(|e| format!("invalid change note: {}", e))?;
+            }
+            _ => {}
         }
         if !self.valid_roots.contains(&req.root) {
             return Err("invalid root".into());
@@ -2889,6 +2944,105 @@ mod tests {
             decrypt_memo(&bad_enc, &dk_v).is_none(),
             "malformed ct_v should return None"
         );
+    }
+
+    #[test]
+    fn test_encrypted_note_validate_accepts_canonical_sizes() {
+        let seed: [u8; 64] = [0x33; 64];
+        let (ek_v, _, ek_d, _) = {
+            let (ekv, dkv) = kem_keygen_from_seed(&seed);
+            let (ekd, dkd) = kem_keygen_from_seed(&seed);
+            (ekv, dkv, ekd, dkd)
+        };
+        let enc = encrypt_note(17, &random_felt(), None, &ek_v, &ek_d);
+        assert!(enc.validate().is_ok());
+    }
+
+    #[test]
+    fn test_ledger_shield_rejects_malformed_client_note_lengths() {
+        let mut ledger = Ledger::new();
+        ledger.fund("alice", 1000);
+
+        let mut master_sk = ZERO;
+        master_sk[0] = 0x44;
+        let acc = derive_account(&master_sk);
+        let d_j = derive_address(&acc.incoming_seed, 0);
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let (auth_root, _) = build_auth_tree(&ask_j);
+        let nk_sp = derive_nk_spend(&acc.nk, &d_j);
+        let nk_tg = derive_nk_tag(&nk_sp);
+        let seed: [u8; 64] = [0x77; 64];
+        let (ek_v, _, ek_d, _) = {
+            let (ekv, dkv) = kem_keygen_from_seed(&seed);
+            let (ekd, dkd) = kem_keygen_from_seed(&seed);
+            (ekv, dkv, ekd, dkd)
+        };
+        let addr = PaymentAddress {
+            d_j,
+            auth_root,
+            nk_tag: nk_tg,
+            ek_v: ek_v.to_bytes().to_vec(),
+            ek_d: ek_d.to_bytes().to_vec(),
+        };
+        let bad_enc = EncryptedNote {
+            ct_d: vec![0; 10],
+            tag: 0,
+            ct_v: vec![0; ML_KEM768_CIPHERTEXT_BYTES],
+            encrypted_data: vec![0; ENCRYPTED_NOTE_BYTES],
+        };
+        let mut client_cm = ZERO;
+        client_cm[0] = 1;
+
+        let err = ledger
+            .shield(&ShieldReq {
+                sender: "alice".into(),
+                v: 100,
+                address: addr,
+                memo: None,
+                proof: Proof::TrustMeBro,
+                client_cm,
+                client_enc: Some(bad_enc),
+            })
+            .unwrap_err();
+        assert!(err.contains("invalid client encrypted note"));
+    }
+
+    #[test]
+    fn test_ledger_transfer_rejects_malformed_output_note_lengths() {
+        let (mut ledger, _cm, nf, root, enc) = setup_with_note();
+        let mut bad_enc = enc.clone();
+        bad_enc.ct_d.pop();
+
+        let err = ledger
+            .transfer(&TransferReq {
+                root,
+                nullifiers: vec![nf],
+                cm_1: random_felt(),
+                cm_2: random_felt(),
+                enc_1: bad_enc,
+                enc_2: enc,
+                proof: Proof::TrustMeBro,
+            })
+            .unwrap_err();
+        assert!(err.contains("invalid output note 1"));
+    }
+
+    #[test]
+    fn test_ledger_unshield_rejects_change_note_without_cm() {
+        let (mut ledger, _cm, nf, root, enc) = setup_with_note();
+
+        let err = ledger
+            .unshield(&UnshieldReq {
+                root,
+                nullifiers: vec![nf],
+                v_pub: 1000,
+                recipient: "alice".into(),
+                cm_change: ZERO,
+                enc_change: Some(enc),
+                proof: Proof::TrustMeBro,
+            })
+            .unwrap_err();
+        assert!(err.contains("change note data provided with zero cm_change"));
     }
 
     /// Ledger transfer: mh_2 mismatch rejected.

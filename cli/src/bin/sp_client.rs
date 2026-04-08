@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use ml_kem::KeyExport;
 use serde::{Deserialize, Serialize};
 use starkprivacy_cli::*;
+use std::io::Write;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Wallet file
@@ -185,10 +186,30 @@ fn load_wallet(path: &str) -> Result<WalletFile, String> {
 
 fn save_wallet(path: &str, w: &WalletFile) -> Result<(), String> {
     let data = serde_json::to_string_pretty(w).map_err(|e| format!("serialize: {}", e))?;
-    // Atomic write: write to temp file then rename. Prevents corruption on crash.
-    let tmp = format!("{}.tmp", path);
-    std::fs::write(&tmp, &data).map_err(|e| format!("write tmp: {}", e))?;
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename: {}", e))
+    // Durable write: fsync temp file, rename atomically, then fsync the parent
+    // directory so one-time WOTS state survives crashes before submit returns.
+    let wallet_path = std::path::Path::new(path);
+    let tmp = std::path::PathBuf::from(format!("{}.tmp", path));
+    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {}", e))?;
+    file.write_all(data.as_bytes())
+        .map_err(|e| format!("write tmp: {}", e))?;
+    file.sync_all().map_err(|e| format!("fsync tmp: {}", e))?;
+    drop(file);
+    std::fs::rename(&tmp, wallet_path).map_err(|e| format!("rename: {}", e))?;
+    sync_parent_dir(wallet_path)
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(path: &std::path::Path) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let dir = std::fs::File::open(parent).map_err(|e| format!("open parent dir: {}", e))?;
+    dir.sync_all()
+        .map_err(|e| format!("fsync parent dir: {}", e))
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn load_address(path: &str) -> Result<PaymentAddress, String> {
@@ -224,6 +245,22 @@ fn get_json<Resp: for<'de> Deserialize<'de>>(url: &str) -> Result<Resp, String> 
     resp.into_body()
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
+}
+
+fn ensure_path_matches_root(
+    path_root: &F,
+    expected_root: &F,
+    tree_idx: usize,
+) -> Result<(), String> {
+    if path_root != expected_root {
+        return Err(format!(
+            "stale Merkle path for note at tree index {}: expected root {}, got {}",
+            tree_idx,
+            short(expected_root),
+            short(path_root)
+        ));
+    }
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -678,6 +715,30 @@ mod tests {
         assert_eq!(note.v, 91);
         assert_eq!(note.cm, cm);
     }
+
+    #[test]
+    fn test_save_wallet_roundtrip_cleans_tmp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let w = test_wallet(2, None);
+
+        save_wallet(wallet_path_str, &w).expect("wallet should save");
+        let loaded = load_wallet(wallet_path_str).expect("wallet should load");
+
+        assert_eq!(loaded.addr_counter, 2);
+        assert_eq!(loaded.master_sk, w.master_sk);
+        assert!(!dir.path().join("wallet.json.tmp").exists());
+    }
+
+    #[test]
+    fn test_ensure_path_matches_root_rejects_mismatch() {
+        let expected = [1u8; 32];
+        let actual = [2u8; 32];
+        let err = ensure_path_matches_root(&actual, &expected, 7).unwrap_err();
+        assert!(err.contains("stale Merkle path"));
+        assert!(err.contains("tree index 7"));
+    }
 }
 
 fn cmd_balance(path: &str) -> Result<(), String> {
@@ -887,6 +948,7 @@ fn cmd_transfer(
         for &(tree_idx, addr_idx, stored_auth_root) in &selected_notes {
             let path_resp: MerklePathResp =
                 get_json(&format!("{}/tree/path/{}", ledger, tree_idx))?;
+            ensure_path_matches_root(&path_resp.root, &root, tree_idx)?;
             cm_paths.push(path_resp.siblings);
             let ask_j = derive_ask(&w.account().ask_base, addr_idx);
             let key_idx = w.next_wots_key(addr_idx);
@@ -1099,6 +1161,7 @@ fn cmd_unshield(
         for &(tree_idx, addr_idx, stored_auth_root) in &selected_notes {
             let path_resp: MerklePathResp =
                 get_json(&format!("{}/tree/path/{}", ledger, tree_idx))?;
+            ensure_path_matches_root(&path_resp.root, &root, tree_idx)?;
             cm_paths.push(path_resp.siblings);
             let ask_j = derive_ask(&w.account().ask_base, addr_idx);
             let key_idx = w.next_wots_key(addr_idx);

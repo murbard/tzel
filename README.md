@@ -50,6 +50,8 @@ scarb build
 ```
 
 > **WARNING:** The ledger now refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). `--trust-me-bro` is never appropriate for real value.
+>
+> **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, and memo-hash checks. Its public-balance layer intentionally uses submitted strings such as `"alice"` as stand-ins for chain-native caller identity. It is not a network-authenticated wallet service and should not be exposed as a real public endpoint.
 
 ## Architecture
 
@@ -154,6 +156,7 @@ bench.sh                Benchmark script
 See spec.md for a complete list. Key items:
 
 - **Active development** -- protocol and implementation are not audited for production use
+- **Reference ledger is localhost-only** -- `sp-ledger` is a demo/reference verifier for the protocol checks, not a real authenticated public-balance server
 - **WOTS+ key reuse compromises funds** -- unlike multi-use signature schemes, reusing a WOTS+ key lets an attacker forge signatures and steal funds
 - **One-time key exhaustion** -- each address has 1024 signing keys; rotate addresses before exhaustion
 - **N is not private** -- nullifier count reveals input count

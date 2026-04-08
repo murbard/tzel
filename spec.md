@@ -175,7 +175,7 @@ Note: the circuit cannot verify that `auth_root` or `nk_tag` are correctly deriv
 
 **State changes:** deduct `v_pub` from sender, append `cm_new` to T.
 
-The reference CLI ledger uses submitted sender strings as public balance-account identifiers. A real chain deployment would typically replace this with chain-native caller authentication, but the byte encoding and verifier check MUST then be specified exactly.
+The reference CLI ledger uses submitted sender strings as public balance-account identifiers. This is a localhost demo / reference implementation of the consensus checks, not a real authenticated public-balance service. A real chain deployment would typically replace this with chain-native caller authentication, but the byte encoding and verifier check MUST then be specified exactly.
 
 ### Transfer (N->2, where 1 <= N <= 16)
 
@@ -445,7 +445,7 @@ using unpersonalized BLAKE2s-256 truncated to 251 bits.
 - Unshield proves `recipient_id = account_id(recipient_string)`
 - The submitted string is checked by re-hashing it and comparing to the proved felt
 
-Deployments that replace this with chain-native addresses MUST specify the exact byte serialization and verifier check. "Address" alone is not a sufficient consensus definition.
+The reference CLI ledger's string-based public accounts are intentionally a demo-only stand-in for verifier-environment identity. They are suitable for local testing and for illustrating what the proof must bind, but not as a secure networked account model. Deployments that replace this with chain-native addresses MUST specify the exact byte serialization and verifier check. "Address" alone is not a sufficient consensus definition.
 
 ### Merkle Tree Structure
 
@@ -503,5 +503,6 @@ The on-chain contract verifies that hashing the posted note data (exactly these 
 - **N is not private:** The number of published nullifiers reveals the input count.
 - **No outgoing viewing in the current protocol:** The protocol does not currently carry an outgoing-view ciphertext or an `ovk`-based recovery path. Full-view capability tracks incoming notes plus nullifiers / spent state only.
 - **Malformed viewing ciphertexts (honest-sender):** The circuit proves commitments and memo hashes, but does NOT prove that `ct_v` / `encrypted_data` actually decrypt to the same `(v, rseed, memo)` used for the commitment. A malicious sender can create a valid on-chain note that the recipient cannot decrypt or that decrypts to inconsistent values. This is analogous to the detection bypass — honest-sender behavior is assumed. The memo-hash check binds ciphertext bytes (preventing relay tampering) but not semantic correctness of the encryption.
+- **Reference CLI ledger is not a public account system:** `sp-ledger` is a localhost demo / reference implementation of the proof-verification and state-transition checks. Its string-based public "accounts" are placeholders for a real verifier environment, not a secure multi-user API.
 - **Wallet state is security-critical for WOTS+ safety:** The wallet tracks per-address WOTS+ key indices locally. Unlike multi-use signature schemes, the chain cannot enforce one-time use of hidden auth leaves without revealing metadata. This means wallet state consistency across backups, concurrent devices, and failed submissions is part of the security boundary. A wallet restored from a stale backup may reuse a WOTS+ key that was already consumed, leading to catastrophic key compromise. Implementations MUST serialize wallet state durably before submitting transactions.
 - **Delegated prover can link same-address spends:** The prover sees `nk_spend_j` and `auth_root_j`, which are per-address values. If the same proving service handles multiple spends from the same address, it can link them. On-chain unlinkability is preserved regardless. See Delegated Proving section for details.

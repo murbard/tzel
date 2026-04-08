@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TzEL — Tezos Encrypted Ledger</title>
+  <meta name="description" content="Post-quantum private transactions for Tezos. No elliptic curves. STARK proofs. Future-proof privacy today.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --blue: #0D61FF;
+      --blue-dark: #0A4FD4;
+      --blue-light: #408CFF;
+      --purple: #6843C3;
+      --gradient: linear-gradient(135deg, #0D61FF 0%, #6843C3 100%);
+      --gradient-subtle: linear-gradient(135deg, #0D61FF10 0%, #6843C310 100%);
+      --black: #000000;
+      --gray-900: #111111;
+      --gray-800: #1A1A2E;
+      --gray-700: #2D2D44;
+      --gray-600: #4A4A68;
+      --gray-400: #8888A4;
+      --gray-200: #D0D0E0;
+      --gray-100: #F0F0F8;
+      --white: #FFFFFF;
+      --radius: 16px;
+      --radius-sm: 8px;
+      --radius-pill: 30px;
+      --font: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      --mono: 'Roboto Mono', 'SF Mono', 'Fira Code', monospace;
+      --transition: 0.3s ease;
+      --max-width: 1100px;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: var(--font);
+      background: var(--black);
+      color: var(--white);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    /* ── Nav ─────────────────────────────────────── */
+
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      padding: 20px 40px;
+      display: flex; align-items: center; justify-content: space-between;
+      background: rgba(0, 0, 0, 0.7);
+      backdrop-filter: blur(20px);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .logo {
+      font-size: 1.25rem; font-weight: 700; letter-spacing: -0.02em;
+      display: flex; align-items: center; gap: 10px;
+      text-decoration: none; color: var(--white);
+    }
+
+    .logo-icon {
+      width: 32px; height: 32px;
+    }
+
+    .logo-icon svg { width: 32px; height: 32px; }
+
+    .nav-links { display: flex; gap: 32px; align-items: center; }
+
+    .nav-links a {
+      color: var(--gray-400); text-decoration: none;
+      font-size: 0.9rem; font-weight: 500; transition: color var(--transition);
+    }
+    .nav-links a:hover { color: var(--white); }
+
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 12px 28px; border-radius: var(--radius-pill);
+      font-size: 0.9rem; font-weight: 600; text-decoration: none;
+      transition: all var(--transition); cursor: pointer;
+      border: none; font-family: var(--font);
+    }
+
+    .btn-primary { background: var(--blue); color: var(--white); }
+    .btn-primary:hover {
+      background: var(--blue-dark); transform: translateY(-1px);
+      box-shadow: 0 8px 32px rgba(13, 97, 255, 0.3);
+    }
+
+    .btn-outline {
+      background: transparent; color: var(--white);
+      border: 1.5px solid rgba(255, 255, 255, 0.2);
+    }
+    .btn-outline:hover { border-color: var(--blue); color: var(--blue-light); }
+
+    /* ── Hero ────────────────────────────────────── */
+
+    .hero {
+      min-height: 100vh; display: flex; align-items: center; justify-content: center;
+      text-align: center; padding: 140px 40px 100px; position: relative; overflow: hidden;
+    }
+
+    .hero::before {
+      content: ''; position: absolute; top: -40%; left: 50%; transform: translateX(-50%);
+      width: 800px; height: 800px;
+      background: radial-gradient(circle, rgba(13, 97, 255, 0.12) 0%, rgba(104, 67, 195, 0.06) 40%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .hero-content { position: relative; max-width: 780px; }
+
+    .hero-badge {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 8px 20px; border-radius: var(--radius-pill);
+      background: rgba(13, 97, 255, 0.1); border: 1px solid rgba(13, 97, 255, 0.2);
+      font-size: 0.85rem; font-weight: 500; color: var(--blue-light); margin-bottom: 32px;
+    }
+    .hero-badge::before {
+      content: ''; width: 8px; height: 8px; border-radius: 50%; background: var(--blue);
+    }
+
+    h1 {
+      font-size: clamp(2.5rem, 6vw, 4.5rem); font-weight: 700;
+      line-height: 1.1; letter-spacing: -0.03em; margin-bottom: 24px;
+    }
+
+    .gradient-text {
+      background: var(--gradient);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+    }
+
+    .hero-sub {
+      font-size: clamp(1.1rem, 2vw, 1.3rem); color: var(--gray-400);
+      max-width: 600px; margin: 0 auto 48px; line-height: 1.7;
+    }
+
+    .hero-actions { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+
+    /* ── Section base ────────────────────────────── */
+
+    section { padding: 120px 40px; max-width: var(--max-width); margin: 0 auto; }
+
+    .section-label {
+      font-size: 0.8rem; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.1em; color: var(--blue); margin-bottom: 16px;
+    }
+
+    h2 {
+      font-size: clamp(2rem, 4vw, 3rem); font-weight: 700;
+      letter-spacing: -0.02em; line-height: 1.15; margin-bottom: 20px;
+    }
+
+    .section-sub {
+      font-size: 1.1rem; color: var(--gray-400); max-width: 600px; line-height: 1.7;
+    }
+
+    /* ── Numbers ─────────────────────────────────── */
+
+    .numbers {
+      padding: 80px 40px; position: relative;
+    }
+    .numbers::before {
+      content: ''; position: absolute; inset: 0;
+      background: var(--gradient-subtle);
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .numbers-inner {
+      max-width: var(--max-width); margin: 0 auto; position: relative;
+      display: grid; grid-template-columns: repeat(4, 1fr); gap: 40px;
+    }
+
+    .stat { text-align: center; }
+    .stat-value {
+      font-size: clamp(2rem, 4vw, 2.75rem); font-weight: 700; letter-spacing: -0.02em;
+      background: var(--gradient);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+    }
+    .stat-label { font-size: 0.85rem; color: var(--gray-400); margin-top: 4px; font-weight: 500; }
+
+    /* ── Feature rows ────────────────────────────── */
+
+    .features { padding: 120px 40px; max-width: var(--max-width); margin: 0 auto; }
+
+    .feature {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 80px;
+      padding: 80px 0; border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      align-items: center;
+    }
+    .feature:first-child { padding-top: 0; }
+    .feature:last-child { border-bottom: none; padding-bottom: 0; }
+
+    .feature h3 {
+      font-size: 1.75rem; font-weight: 700; letter-spacing: -0.02em;
+      line-height: 1.2; margin-bottom: 16px;
+    }
+
+    .feature p {
+      color: var(--gray-400); font-size: 1rem; line-height: 1.75;
+    }
+
+    .feature p + p { margin-top: 16px; }
+
+    .feature-visual {
+      border-radius: var(--radius);
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      padding: 40px; font-family: var(--mono); font-size: 0.85rem;
+      line-height: 2; color: var(--gray-200);
+    }
+
+    .feature-visual .dim { color: var(--gray-600); }
+    .feature-visual .hl { color: var(--blue-light); }
+
+    .feature:nth-child(even) { direction: rtl; }
+    .feature:nth-child(even) > * { direction: ltr; }
+
+    /* ── CTA ──────────────────────────────────────── */
+
+    .cta-section {
+      text-align: center; padding: 120px 40px 140px; position: relative;
+    }
+    .cta-section::before {
+      content: ''; position: absolute; bottom: 0; left: 50%; transform: translateX(-50%);
+      width: 600px; height: 600px;
+      background: radial-gradient(circle, rgba(104, 67, 195, 0.1) 0%, transparent 60%);
+      pointer-events: none;
+    }
+
+    .cta-inner { position: relative; max-width: 600px; margin: 0 auto; }
+    .cta-inner h2 { margin-bottom: 16px; }
+    .cta-inner p { color: var(--gray-400); margin-bottom: 40px; font-size: 1.1rem; line-height: 1.7; }
+    .cta-actions { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; }
+
+    /* ── Footer ───────────────────────────────────── */
+
+    footer {
+      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      padding: 40px; text-align: center;
+    }
+    footer p { color: var(--gray-600); font-size: 0.85rem; }
+    footer a { color: var(--gray-400); text-decoration: none; transition: color var(--transition); }
+    footer a:hover { color: var(--blue-light); }
+
+    /* ── Responsive ───────────────────────────────── */
+
+    @media (max-width: 900px) {
+      nav { padding: 16px 24px; }
+      .nav-links a:not(.btn) { display: none; }
+      section, .features, .cta-section { padding: 80px 24px; }
+      .hero { padding: 120px 24px 80px; }
+      .feature { grid-template-columns: 1fr; gap: 32px; }
+      .feature:nth-child(even) { direction: ltr; }
+      .numbers-inner { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    @media (max-width: 540px) {
+      .numbers-inner { grid-template-columns: 1fr 1fr; gap: 24px; }
+      .hero-actions { flex-direction: column; align-items: center; }
+    }
+  </style>
+</head>
+<body>
+
+  <nav>
+    <a href="#" class="logo">
+      <div class="logo-icon"><svg viewBox="0 0 47 64" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="tz-grad" x1="0" y1="0" x2="47" y2="64" gradientUnits="userSpaceOnUse"><stop stop-color="#0D61FF"/><stop offset="1" stop-color="#6843C3"/></linearGradient></defs><path fill="url(#tz-grad)" d="M30.252 63.441c-4.55 0-7.864-1.089-9.946-3.267-2.08-2.177-3.121-4.525-3.121-7.041 0-.92.181-1.694.544-2.323a3.993 3.993 0 0 1 1.489-1.489c.629-.363 1.403-.544 2.323-.544.92 0 1.693.181 2.323.544.629.363 1.125.86 1.488 1.489.363.629.544 1.403.544 2.323 0 1.113-.266 2.02-.798 2.722-.533.702-1.162 1.161-1.888 1.38.63.87 1.622 1.487 2.977 1.85 1.355.388 2.71.581 4.065.581 1.887 0 3.593-.508 5.118-1.524 1.524-1.017 2.65-2.517 3.376-4.501.726-1.984 1.089-4.235 1.089-6.752 0-2.734-.4-5.07-1.198-7.005-.775-1.96-1.924-3.412-3.449-4.356a9.21 9.21 0 0 0-4.936-1.415c-1.162 0-2.613.484-4.356 1.452l-3.194 1.597v-1.597L37.076 16.4H17.185v19.89c0 1.646.363 3.001 1.089 4.066s1.839 1.597 3.34 1.597c1.16 0 2.274-.387 3.339-1.162a11.803 11.803 0 0 0 2.758-2.83c.097-.219.218-.376.363-.473a.723.723 0 0 1 .472-.181c.266 0 .58.133.944.4.339.386.508.834.508 1.342a9.243 9.243 0 0 1-.182 1.017c-.822 1.839-1.96 3.242-3.412 4.21a8.457 8.457 0 0 1-4.79 1.452c-4.308 0-7.285-.847-8.93-2.54-1.645-1.695-2.468-3.994-2.468-6.897V16.4H.052v-3.703h10.164v-8.42L7.893 1.952V.066h6.751l2.54 1.306v11.325l26.28-.072 2.614 2.613-16.116 16.116a10.807 10.807 0 0 1 3.049-.726c1.742 0 3.702.557 5.88 1.67 2.202 1.089 3.896 2.59 5.081 4.5 1.186 1.888 1.948 3.703 2.287 5.445.363 1.743.545 3.291.545 4.646 0 3.098-.654 5.977-1.96 8.64-1.307 2.661-3.291 4.645-5.953 5.952-2.662 1.307-5.542 1.96-8.639 1.96z"/></svg></div>
+      TzEL
+    </a>
+    <div class="nav-links">
+      <a href="#features">Features</a>
+      <a href="https://github.com/murbard/starkprivacy/blob/main/spec.md" target="_blank">Spec</a>
+      <a href="https://github.com/murbard/starkprivacy" class="btn btn-primary" target="_blank">GitHub</a>
+    </div>
+  </nav>
+
+  <!-- ════ Hero ════ -->
+  <section class="hero">
+    <div class="hero-content">
+      <div class="hero-badge">Post-Quantum Ready</div>
+      <h1>Tezos Encrypted Ledger.<br><span class="gradient-text">Private. Post-quantum. Now.</span></h1>
+      <p class="hero-sub">
+        Private transactions for Tezos with no elliptic curves anywhere in the stack. Every cryptographic choice is built to survive a quantum computer.
+      </p>
+      <div class="hero-actions">
+        <a href="https://github.com/murbard/starkprivacy" class="btn btn-primary" target="_blank">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+          View on GitHub
+        </a>
+        <a href="https://github.com/murbard/starkprivacy/blob/main/spec.md" class="btn btn-outline" target="_blank">Read the spec</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════ Numbers ════ -->
+  <section class="numbers">
+    <div class="numbers-inner">
+      <div class="stat">
+        <div class="stat-value">~295 KB</div>
+        <div class="stat-label">Proof size</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value">~35 ms</div>
+        <div class="stat-label">Verification time</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value">~35 s</div>
+        <div class="stat-label">Proving time</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value">0</div>
+        <div class="stat-label">Elliptic curves</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ════ Features ════ -->
+  <div class="features" id="features">
+
+    <div class="feature">
+      <div>
+        <h3>No elliptic curves.<br>Anywhere.</h3>
+        <p>Every privacy system deployed today relies on elliptic curve cryptography that a sufficiently large quantum computer will break. The "harvest now, decrypt later" threat makes this urgent even before such hardware exists.</p>
+        <p>TzEL replaces the entire stack: BLAKE2s for hashing, ML-KEM-768 (NIST-standardized lattice KEM) for encryption, hash-based one-time signatures for spend authorization, and STARKs for proofs. The only hardness assumption is the collision resistance of BLAKE2s.</p>
+      </div>
+      <div class="feature-visual">
+        <span class="dim">commitment</span>&nbsp; = <span class="hl">BLAKE2s</span>(d, v, rcm, tag)<br>
+        <span class="dim">nullifier</span>&nbsp;&nbsp; = <span class="hl">BLAKE2s</span>(nk, cm, pos)<br>
+        <span class="dim">memo</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = <span class="hl">ML-KEM-768</span> + ChaCha20<br>
+        <span class="dim">spend auth</span> = <span class="hl">WOTS+</span> verified in-STARK<br>
+        <span class="dim">proof</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = <span class="hl">recursive STARK</span> (Cairo + Stwo)
+      </div>
+    </div>
+
+    <div class="feature">
+      <div>
+        <h3>Sign on your hardware wallet.<br>Prove anywhere.</h3>
+        <p>TzEL separates signing from proving. Even the most lightweight device&mdash;a hardware wallet, a phone, a smart card&mdash;can authorize a transaction by producing a single hash-based signature. The heavy proof generation is outsourced to any untrusted machine.</p>
+        <p>The signature is verified <em>inside</em> the STARK circuit. A malicious prover cannot redirect funds&mdash;the signature binds to the exact outputs. The prover never sees your signing key and nothing on-chain links back to your address.</p>
+        <p>Run the prover on your own machine, or delegate to a third-party service running a TEE. In the worst case&mdash;a TEE breach&mdash;the attacker learns which transaction you made, but still cannot steal funds or forge spends. Proving is a pure computation with no secret key access.</p>
+      </div>
+      <div class="feature-visual">
+        <span class="dim">hardware wallet:</span><br>
+        &nbsp;&nbsp;sign(sighash) &rarr; <span class="hl">wots_signature</span><br>
+        <br>
+        <span class="dim">untrusted prover:</span><br>
+        &nbsp;&nbsp;witness + signature &rarr; <span class="hl">STARK proof</span><br>
+        <br>
+        <span class="dim">on-chain verifier sees:</span><br>
+        &nbsp;&nbsp;proof, nullifiers, commitments<br>
+        &nbsp;&nbsp;<span class="hl">no keys, no signatures, no links</span>
+      </div>
+    </div>
+
+    <div class="feature">
+      <div>
+        <h3>Your transactions.<br>Your choice who sees them.</h3>
+        <p>Every transaction is encrypted on-chain by default. No one can read your balances, trace your payments, or link your addresses&mdash;unless you decide otherwise.</p>
+        <p>TzEL gives you fine-grained viewing keys you can share selectively. Give an auditor read access to a single address. Let a portfolio tracker see balances without spending power. Disclose exactly what you choose, to exactly who you choose, and nothing more.</p>
+      </div>
+      <div class="feature-visual">
+        <span class="dim">on-chain:</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span class="hl">encrypted</span>, unlinkable<br>
+        <br>
+        <span class="dim">detection key:</span> flag incoming txs<br>
+        <span class="dim">viewing key:</span>&nbsp;&nbsp; read balances + memos<br>
+        <span class="dim">spending key:</span>&nbsp; full control<br>
+        <br>
+        <span class="hl">you choose who gets what</span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ════ CTA ════ -->
+  <section class="cta-section">
+    <div class="cta-inner">
+      <h2>Built in the open</h2>
+      <p>TzEL is under active development. The protocol spec, Cairo circuits, Rust wallet, and STARK prover are all open source.</p>
+      <div class="cta-actions">
+        <a href="https://github.com/murbard/starkprivacy" class="btn btn-primary" target="_blank">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+          GitHub Repository
+        </a>
+        <a href="https://github.com/murbard/starkprivacy/blob/main/spec.md" class="btn btn-outline" target="_blank">Protocol Specification</a>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <p>TzEL &mdash; Tezos Encrypted Ledger &mdash; <a href="https://github.com/murbard/starkprivacy" target="_blank">github.com/murbard/starkprivacy</a></p>
+  </footer>
+
+</body>
+</html>
