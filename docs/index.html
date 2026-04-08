@@ -355,31 +355,68 @@
     }
 
     .stat {
-      text-align: center;
-      padding: 20px 16px;
+      text-align: left;
+      padding: 24px 22px;
       border-radius: var(--radius);
       background: rgba(15, 22, 32, 0.42);
       border: 1px solid rgba(173, 197, 255, 0.08);
     }
 
+    .stat-icon {
+      width: 52px;
+      height: 52px;
+      border-radius: 16px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 18px;
+      border: 1px solid rgba(173, 197, 255, 0.14);
+      background:
+        linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.01)),
+        rgba(12, 19, 29, 0.84);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+      color: var(--blue-light);
+    }
+
+    .stat:nth-child(2) .stat-icon {
+      color: #81c3ff;
+    }
+
+    .stat:nth-child(3) .stat-icon {
+      color: var(--teal);
+    }
+
+    .stat:nth-child(4) .stat-icon {
+      color: #8cc6ff;
+    }
+
+    .stat-icon svg {
+      width: 24px;
+      height: 24px;
+      stroke: currentColor;
+      stroke-width: 1.8;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      fill: none;
+    }
+
     .stat-value {
       font-family: var(--display);
-      font-size: clamp(2rem, 4vw, 2.85rem);
-      font-weight: 700;
+      font-size: clamp(1.18rem, 2vw, 1.48rem);
+      font-weight: 600;
       letter-spacing: -0.03em;
-      background: var(--gradient);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      background-clip: text;
+      color: var(--text);
+      line-height: 1.2;
     }
 
     .stat-label {
-      font-size: 0.84rem;
+      font-size: 0.94rem;
       color: var(--muted);
-      margin-top: 6px;
-      font-weight: 600;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
+      margin-top: 10px;
+      font-weight: 500;
+      letter-spacing: 0;
+      text-transform: none;
+      line-height: 1.6;
     }
 
     .features {
@@ -575,20 +612,51 @@
     <section class="numbers">
       <div class="numbers-inner">
         <div class="stat">
-          <div class="stat-value">~295 KB</div>
-          <div class="stat-label">Proof size</div>
+          <div class="stat-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <rect x="4" y="4" width="6" height="6" rx="1.5"></rect>
+              <rect x="14" y="4" width="6" height="6" rx="1.5"></rect>
+              <rect x="4" y="14" width="6" height="6" rx="1.5"></rect>
+              <path d="M14 17h6"></path>
+              <path d="M17 14v6"></path>
+            </svg>
+          </div>
+          <div class="stat-value">Curve-free by design</div>
+          <div class="stat-label">The privacy stack avoids elliptic curves end to end.</div>
         </div>
         <div class="stat">
-          <div class="stat-value">~35 ms</div>
-          <div class="stat-label">Verification time</div>
+          <div class="stat-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <rect x="3.5" y="5" width="7" height="5.5" rx="1.5"></rect>
+              <rect x="13.5" y="13.5" width="7" height="5.5" rx="1.5"></rect>
+              <path d="M10.5 7.75h4.5a2 2 0 0 1 2 2v3.75"></path>
+              <path d="M13.75 10.75 17 14l3.25-3.25"></path>
+            </svg>
+          </div>
+          <div class="stat-value">Delegated proving</div>
+          <div class="stat-label">Authorize on constrained hardware and prove on larger machines.</div>
         </div>
         <div class="stat">
-          <div class="stat-value">~35 s</div>
-          <div class="stat-label">Proving time</div>
+          <div class="stat-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <rect x="5" y="10" width="14" height="10" rx="2"></rect>
+              <path d="M8 10V8a4 4 0 0 1 8 0v2"></path>
+              <path d="M12 13.5v3"></path>
+            </svg>
+          </div>
+          <div class="stat-value">Encrypted by default</div>
+          <div class="stat-label">Notes, balances, and memos are private unless you choose to disclose them.</div>
         </div>
         <div class="stat">
-          <div class="stat-value">0</div>
-          <div class="stat-label">Elliptic curves</div>
+          <div class="stat-icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M8 7 4 12l4 5"></path>
+              <path d="m16 7 4 5-4 5"></path>
+              <path d="M13.5 5 10.5 19"></path>
+            </svg>
+          </div>
+          <div class="stat-value">Built in the open</div>
+          <div class="stat-label">Spec, circuits, wallet, ledger, and prover are all public.</div>
         </div>
       </div>
     </section>
@@ -598,7 +666,7 @@
         <div>
           <h3>No elliptic curves.<br>Anywhere.</h3>
           <p>Every privacy system deployed today relies on elliptic curve cryptography that a sufficiently large quantum computer will break. The "harvest now, decrypt later" threat makes this urgent even before such hardware exists.</p>
-          <p>TzEL replaces the entire stack: BLAKE2s for hashing, ML-KEM-768 (NIST-standardized lattice KEM) for encryption, hash-based one-time signatures for spend authorization, and STARKs for proofs. The only hardness assumption is the collision resistance of BLAKE2s.</p>
+          <p>TzEL replaces the entire stack: BLAKE2s for hashing, ML-KEM-768 (NIST-standardized lattice KEM) for encryption, hash-based one-time signatures for spend authorization, and STARKs for proofs. Fund safety comes from the hash-based spend path and STARK proofs; note confidentiality and recipient privacy additionally rely on ML-KEM and authenticated encryption.</p>
         </div>
         <div class="feature-visual">
           <span class="dim">commitment</span>&nbsp; = <span class="hl">BLAKE2s</span>(d, v, rcm, tag)<br>
