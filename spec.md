@@ -44,12 +44,12 @@ master_sk
 
 ### Auth Key Tree
 
-Each address `j` has a Merkle tree of K one-time WOTS+ public keys (K = 2^AUTH_DEPTH, default AUTH_DEPTH = 10, giving 1024 keys per address). WOTS+ uses Winternitz parameter w=4 with 133 hash chains per key, all using BLAKE2s. The tree is constructed at address generation time:
+Each address `j` has a Merkle tree of K one-time WOTS+ public keys (K = 2^AUTH_DEPTH, default AUTH_DEPTH = 10, giving 1024 keys per address). The scheme is a Winternitz-style one-time signature inspired by WOTS+ (RFC 8391 / XMSS), instantiated with BLAKE2s and w=4 (133 hash chains: 128 message + 5 checksum). It uses project-specific domain-separated hash functions (`wotsSP__` for chain hashing, `pkfdSP__` for public key folding) rather than the exact XMSS WOTS+ parameterization — the security argument is equivalent (one-time unforgeability from second-preimage resistance of the hash function) but the construction is self-contained. The tree is constructed at address generation time:
 
 1. For each index i in 0..K: `seed_i = H(H("auth-key", ask_j), i)`
 2. `pk_i = WOTS+.KeyGen(seed_i)` — 133 chain endpoints derived from seed via BLAKE2s hash chains
 3. `leaf_i = fold(pk_0, pk_1, ..., pk_132)` — sequential left-fold of the 133 chain endpoints using `H_pkfold`
-4. `auth_root_j = MerkleRoot(leaf_0, ..., leaf_{K-1})` — standard Merkle tree using `H_merkle`
+4. `auth_root_j = MerkleRoot(leaf_0, ..., leaf_{K-1})` — binary Merkle tree using `H_merkle` (see Canonical Encodings for tree structure)
 
 The `auth_root_j` is included in the payment address and bound into commitments via `owner_tag`. Each key is used at most once. When spending, the STARK proves the chosen `pk_i` is a leaf in the tree and verifies the WOTS+ signature inside the circuit. No auth leaf, public key, or signature appears in the public outputs — the STARK proof itself proves spend authorization.
 
@@ -252,7 +252,7 @@ sighash = fold(0x02, root, nf_0, ..., nf_{N-1}, v_pub, recipient, cm_change, mh_
 
 The circuit-type tag prevents cross-circuit replay (a transfer signature cannot be used for an unshield). Nullifier uniqueness prevents replay on the same chain. Cross-chain replay prevention relies on distinct Merkle tree roots across deployments.
 
-**Not yet included:** `chain_id`, `contract_addr`, `program_hash`, `expiry`, `nonce`. These would provide defense-in-depth against replay across chains/contracts sharing tree state (e.g., after a fork). For production, these fields should be added as circuit public inputs folded into the sighash.
+**Out of scope:** `chain_id`, `contract_addr`, `program_hash`, `expiry`, `nonce` are not included in the sighash. Cross-chain replay is prevented by distinct Merkle tree roots across deployments — an authorization signed against one chain's root is invalid on another chain unless both chains share identical tree state. The edge case of forked chains with identical state is accepted as a deployment concern, not a protocol concern. Implementations that deploy on multiple chains sharing state MUST add a chain discriminator as a circuit public input.
 
 ### Change output handling (unshield)
 
@@ -260,7 +260,7 @@ If `cm_change == 0` in the proof's public outputs, the contract MUST NOT append 
 
 ### Tree append ordering
 
-The contract appends commitments to the tree in a deterministic order and snapshots the root after each transaction. The new root is added to the historical root set.
+The contract appends commitments to the tree in sequential order (each new commitment gets the next available leaf index) and snapshots the root after each transaction. The new root is added to the historical root set. See Canonical Encodings for Merkle tree structure details.
 
 ## Delegated Proving
 
@@ -273,7 +273,7 @@ The contract appends commitments to the tree in a deterministic order and snapsh
 The prover sees `nk_spend_j` (per-address nullifier key) and the WOTS+ signature, but NOT `ask_j` or any WOTS+ secret key. The prover:
 - **Cannot redirect funds** — the WOTS+ signature is bound to specific output commitments via the sighash. A prover who substitutes different outputs cannot produce a valid proof because the signature verification inside the STARK would fail.
 - **Cannot forge a signature** — doesn't have `sk_i`
-- **Cannot link spends** — sees `auth_root_j` but not the relationship between different keys across transactions
+- **Cannot link spends on-chain** — no auth leaves, public keys, or signatures appear in public outputs, so on-chain observers cannot link spends. However, the delegated prover itself sees `nk_spend_j` and `auth_root_j`, which are per-address values. If the same address is reused for multiple notes and the same proving service handles later spends, the prover can link those spends to the same address context. Unlinkability against the prover depends on address rotation and prover diversity.
 - **Cannot spend other notes** — doesn't have witness data for notes not involved in this transaction
 
 Both self-prove and delegated modes produce identical on-chain outputs.
@@ -398,6 +398,45 @@ All hashing uses BLAKE2s-256 truncated to 251 bits, with domain separation via B
 
 The commitment tree and auth tree both use `mrklSP__` for internal nodes. This is safe because they are verified against different roots in different circuit contexts — there is no cross-tree confusion.
 
+## Canonical Encodings
+
+### Felt252 Representation
+
+All hash outputs are BLAKE2s-256 (32 bytes) with the top 5 bits cleared (`output[31] &= 0x07`), producing values in `[0, 2^251)` that fit in a felt252. Values are encoded as 32-byte little-endian arrays.
+
+### Merkle Tree Structure
+
+Both the commitment tree and auth key tree use left-right BLAKE2s Merkle trees:
+
+- **Leaf encoding:** leaves are raw felt252 values (32 bytes), not hashed before insertion.
+- **Internal nodes:** `H_merkle(left, right)` using the `mrklSP__` personalization.
+- **Zero nodes:** derived recursively: `zero[0] = [0u8; 32]`, `zero[d+1] = H_merkle(zero[d], zero[d])`.
+- **Append-only:** the commitment tree is append-only. New leaves are added at the next available index. The root is recomputed after each append.
+- **Bit ordering:** Merkle path indices use the standard convention: bit 0 of `pos` selects left (0) or right (1) at depth 0 (leaf level), bit 1 at depth 1, etc.
+
+### Position and Index Canonicalization
+
+- **Commitment tree position `pos`:** MUST satisfy `0 <= pos < 2^TREE_DEPTH` (TREE_DEPTH=48). The Cairo circuit enforces this by checking all `path_indices` bits are 0 or 1, and rejecting the path if any bit beyond depth TREE_DEPTH is set (`src/merkle.cairo:77-81`). This prevents alias nullifiers via `pos = real_pos + k*2^TREE_DEPTH`.
+- **Auth tree key index `key_idx`:** MUST satisfy `0 <= key_idx < 2^AUTH_DEPTH` (AUTH_DEPTH=10). The circuit rejects out-of-range indices (`src/merkle.cairo:108`). This prevents aliasing of auth tree leaves.
+- **Values `v`:** MUST be u64. Arithmetic uses u128 to prevent overflow. The circuit enforces this via felt-to-u64 conversion.
+
+### Memo-Hash Preimage
+
+The `memo_ct_hash` public output is defined as:
+
+```
+memo_ct_hash = H_memo(ct_d || tag_le || ct_v || encrypted_data)
+```
+
+where:
+- `ct_d` is the ML-KEM-768 detection ciphertext (1088 bytes)
+- `tag_le` is the 2-byte detection tag in little-endian
+- `ct_v` is the ML-KEM-768 viewing ciphertext (1088 bytes)
+- `encrypted_data` is the ChaCha20-Poly1305 ciphertext (1080 bytes)
+- `H_memo` uses the `memoSP__` personalization, truncated to 251 bits
+
+The on-chain contract verifies that hashing the posted note data (exactly these four fields in this order) produces the `memo_ct_hash` from the proof's public outputs. The commitment (`cm`) is NOT included in this hash — it is verified separately via the commitment binding check.
+
 ## Security Properties
 
 - **Balance:** u64 values, u128 arithmetic, exact equality. No overflow or wraparound.
@@ -419,3 +458,6 @@ The commitment tree and auth tree both use `mrklSP__` for internal nodes. This i
 - **ML-KEM key anonymity (ANO-CCA):** We rely on Kyber's key anonymity property, proven separately from IND-CCA2. Should be cited explicitly in production.
 - **Detection statistics:** False positive rate 2^(-k) does not automatically provide plausible deniability. Depends on network throughput and user activity.
 - **N is not private:** The number of published nullifiers reveals the input count.
+- **Malformed viewing ciphertexts (honest-sender):** The circuit proves commitments and memo hashes, but does NOT prove that `ct_v` / `encrypted_data` actually decrypt to the same `(v, rseed, memo)` used for the commitment. A malicious sender can create a valid on-chain note that the recipient cannot decrypt or that decrypts to inconsistent values. This is analogous to the detection bypass — honest-sender behavior is assumed. The memo-hash check binds ciphertext bytes (preventing relay tampering) but not semantic correctness of the encryption.
+- **Wallet state is security-critical for WOTS+ safety:** The wallet tracks per-address WOTS+ key indices locally. Unlike multi-use signature schemes, the chain cannot enforce one-time use of hidden auth leaves without revealing metadata. This means wallet state consistency across backups, concurrent devices, and failed submissions is part of the security boundary. A wallet restored from a stale backup may reuse a WOTS+ key that was already consumed, leading to catastrophic key compromise. Implementations MUST serialize wallet state durably before submitting transactions.
+- **Delegated prover can link same-address spends:** The prover sees `nk_spend_j` and `auth_root_j`, which are per-address values. If the same proving service handles multiple spends from the same address, it can link them. On-chain unlinkability is preserved regardless. See Delegated Proving section for details.

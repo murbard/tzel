@@ -494,6 +494,47 @@ pub fn kem_keygen_from_seed(seed: &[u8; 64]) -> (Ek, Dk) {
     (ek, dk)
 }
 
+/// Derive per-address ML-KEM viewing keypair from incoming_seed and address index j.
+/// Each address gets unique ek_v_j / dk_v_j so that addresses are unlinkable.
+pub fn derive_kem_view_seed(incoming_seed: &F, j: u32) -> [u8; 64] {
+    let view_seed = hash_two(&felt_tag(b"view"), incoming_seed);
+    let mut idx = ZERO;
+    idx[..4].copy_from_slice(&j.to_le_bytes());
+    let h1 = hash_two(&felt_tag(b"mlkem-v"), &view_seed);
+    let h2 = hash_two(&h1, &idx);
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(&h2);
+    // Second half: hash again with different domain for full 64 bytes
+    let h3 = hash_two(&felt_tag(b"mlkem-v2"), &h2);
+    out[32..].copy_from_slice(&h3);
+    out
+}
+
+/// Derive per-address ML-KEM detection keypair from incoming_seed and address index j.
+/// Each address gets unique ek_d_j / dk_d_j so that addresses are unlinkable.
+pub fn derive_kem_detect_seed(incoming_seed: &F, j: u32) -> [u8; 64] {
+    let view_seed = hash_two(&felt_tag(b"view"), incoming_seed);
+    let det_seed = hash_two(&felt_tag(b"detect"), &view_seed);
+    let mut idx = ZERO;
+    idx[..4].copy_from_slice(&j.to_le_bytes());
+    let h1 = hash_two(&felt_tag(b"mlkem-d"), &det_seed);
+    let h2 = hash_two(&h1, &idx);
+    let mut out = [0u8; 64];
+    out[..32].copy_from_slice(&h2);
+    let h3 = hash_two(&felt_tag(b"mlkem-d2"), &h2);
+    out[32..].copy_from_slice(&h3);
+    out
+}
+
+/// Derive per-address ML-KEM key pairs (view + detect) from incoming_seed and address index.
+pub fn derive_kem_keys(incoming_seed: &F, j: u32) -> (Ek, Dk, Ek, Dk) {
+    let sv = derive_kem_view_seed(incoming_seed, j);
+    let sd = derive_kem_detect_seed(incoming_seed, j);
+    let (ek_v, dk_v) = kem_keygen_from_seed(&sv);
+    let (ek_d, dk_d) = kem_keygen_from_seed(&sd);
+    (ek_v, dk_v, ek_d, dk_d)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EncryptedNote {
     #[serde(with = "hex_bytes")]
@@ -550,9 +591,9 @@ pub fn detect(enc: &EncryptedNote, dk_d: &Dk) -> bool {
     let Ok(ct) = ml_kem_768::Ciphertext::try_from(enc.ct_d.as_slice()) else {
         return false;
     };
-    let ss = dk_d
-        .try_decapsulate(&ct)
-        .expect("ML-KEM decaps is infallible");
+    let Ok(ss) = dk_d.try_decapsulate(&ct) else {
+        return false; // malformed ciphertext from untrusted source
+    };
     let tag_hash = hash(ss.as_slice());
     let computed = u16::from_le_bytes([tag_hash[0], tag_hash[1]]) & ((1 << DETECT_K) - 1);
     computed == enc.tag
@@ -599,6 +640,7 @@ impl MerkleTree {
 
     pub fn append(&mut self, leaf: F) -> usize {
         let i = self.leaves.len();
+        assert!(i < (1u64 << DEPTH) as usize, "Merkle tree full: 2^{} leaves", DEPTH);
         self.leaves.push(leaf);
         i
     }
@@ -2944,5 +2986,124 @@ mod tests {
             proof: fake_stark(bad_preimage),
         });
         assert!(r.is_err(), "swapped nullifier order in preimage must be caught");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Regression tests for security audit findings
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Regression: per-address KEM keys must be unique across addresses.
+    /// Without per-address derivation, all addresses share the same ek_v/ek_d,
+    /// making them trivially linkable (finding #3 from static audit).
+    #[test]
+    fn test_per_address_kem_keys_unique() {
+        let mut master_sk = ZERO;
+        master_sk[0] = 0xDD;
+        let acc = derive_account(&master_sk);
+
+        let (ek_v_0, _, ek_d_0, _) = derive_kem_keys(&acc.incoming_seed, 0);
+        let (ek_v_1, _, ek_d_1, _) = derive_kem_keys(&acc.incoming_seed, 1);
+        let (ek_v_2, _, ek_d_2, _) = derive_kem_keys(&acc.incoming_seed, 2);
+
+        // All viewing keys must differ
+        assert_ne!(ek_v_0.to_bytes(), ek_v_1.to_bytes(), "ek_v must differ across addresses");
+        assert_ne!(ek_v_0.to_bytes(), ek_v_2.to_bytes());
+        assert_ne!(ek_v_1.to_bytes(), ek_v_2.to_bytes());
+
+        // All detection keys must differ
+        assert_ne!(ek_d_0.to_bytes(), ek_d_1.to_bytes(), "ek_d must differ across addresses");
+        assert_ne!(ek_d_0.to_bytes(), ek_d_2.to_bytes());
+        assert_ne!(ek_d_1.to_bytes(), ek_d_2.to_bytes());
+
+        // Viewing and detection keys must also differ from each other
+        assert_ne!(ek_v_0.to_bytes(), ek_d_0.to_bytes(), "ek_v and ek_d must differ");
+    }
+
+    /// Regression: per-address KEM derivation must be deterministic.
+    #[test]
+    fn test_per_address_kem_keys_deterministic() {
+        let mut master_sk = ZERO;
+        master_sk[0] = 0xEE;
+        let acc = derive_account(&master_sk);
+
+        let (ek_v_a, _, ek_d_a, _) = derive_kem_keys(&acc.incoming_seed, 5);
+        let (ek_v_b, _, ek_d_b, _) = derive_kem_keys(&acc.incoming_seed, 5);
+
+        assert_eq!(ek_v_a.to_bytes(), ek_v_b.to_bytes(), "same index must produce same ek_v");
+        assert_eq!(ek_d_a.to_bytes(), ek_d_b.to_bytes(), "same index must produce same ek_d");
+    }
+
+    /// Regression: encrypt-then-detect must work with per-address keys.
+    /// Sender encrypts to address j's public keys, recipient detects + decrypts
+    /// with address j's secret keys. Must NOT detect with address k's keys.
+    #[test]
+    fn test_per_address_encrypt_detect_decrypt_isolation() {
+        let mut master_sk = ZERO;
+        master_sk[0] = 0xFF;
+        let acc = derive_account(&master_sk);
+
+        let (ek_v_0, dk_v_0, ek_d_0, dk_d_0) = derive_kem_keys(&acc.incoming_seed, 0);
+        let (_, dk_v_1, _, dk_d_1) = derive_kem_keys(&acc.incoming_seed, 1);
+
+        // Encrypt to address 0
+        let rseed = random_felt();
+        let enc = encrypt_note(42, &rseed, Some(b"test"), &ek_v_0, &ek_d_0);
+
+        // Address 0's dk_d should detect it
+        assert!(detect(&enc, &dk_d_0), "address 0 must detect its own note");
+
+        // Address 1's dk_d should almost certainly NOT detect it (tag collision ~1/1024)
+        // We test this probabilistically — if it fails, it's a 1-in-1024 fluke
+        // (acceptable for a regression test)
+        let detected_by_1 = detect(&enc, &dk_d_1);
+        // Don't assert — just verify decryption isolation below
+
+        // Address 0's dk_v should decrypt it
+        let dec = decrypt_memo(&enc, &dk_v_0);
+        assert!(dec.is_some(), "address 0 must decrypt its own note");
+        let (v, rs, _) = dec.unwrap();
+        assert_eq!(v, 42);
+        assert_eq!(rs, rseed);
+
+        // Address 1's dk_v must NOT decrypt it (wrong shared secret)
+        let dec_1 = decrypt_memo(&enc, &dk_v_1);
+        assert!(dec_1.is_none(), "address 1 must NOT decrypt address 0's note");
+        let _ = detected_by_1;
+    }
+
+    /// Regression: detect() must not panic on correctly-sized but mismatched ciphertext.
+    /// (Finding #14 from static audit — untrusted input from ledger feed.)
+    #[test]
+    fn test_detect_well_sized_but_wrong_ciphertext_no_panic() {
+        let mut master_sk = ZERO;
+        master_sk[0] = 0xAB;
+        let acc = derive_account(&master_sk);
+        let (_, _, _, dk_d) = derive_kem_keys(&acc.incoming_seed, 0);
+
+        // Create a correctly-sized but garbage ciphertext
+        let ct_d = vec![0xAA; 1088]; // ML-KEM-768 ciphertext size
+        let enc = EncryptedNote {
+            ct_d,
+            tag: 42,
+            ct_v: vec![0xBB; 1088],
+            encrypted_data: vec![0xCC; 100],
+        };
+
+        // Must not panic — should return false
+        let result = detect(&enc, &dk_d);
+        assert!(!result, "garbage ciphertext must not match");
+    }
+
+    /// Regression: derive_kem_view_seed and derive_kem_detect_seed must produce
+    /// different seeds even for the same address index.
+    #[test]
+    fn test_kem_view_detect_seeds_differ() {
+        let mut master_sk = ZERO;
+        master_sk[0] = 0x77;
+        let acc = derive_account(&master_sk);
+
+        let sv = derive_kem_view_seed(&acc.incoming_seed, 0);
+        let sd = derive_kem_detect_seed(&acc.incoming_seed, 0);
+        assert_ne!(sv, sd, "view and detect seeds for same address must differ");
     }
 }

@@ -85,6 +85,18 @@ fn start_ledger() -> Child {
     child
 }
 
+fn start_ledger_with_verifier(port: u16) -> Child {
+    let reprove = reprove_bin();
+    let child = Command::new(sp_ledger())
+        .args(["--port", &port.to_string(), "--trust-me-bro", "--reprove-bin", &reprove])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start ledger with verifier");
+    std::thread::sleep(Duration::from_millis(500));
+    child
+}
+
 fn has_reprover() -> bool {
     std::path::Path::new(&reprove_bin()).exists()
         && std::path::Path::new(&executables_dir()).join("run_shield.executable.json").exists()
@@ -367,6 +379,53 @@ fn test_e2e_with_real_proofs() {
         assert_eq!(alice_public, 3500, "alice public should be 3500");
 
         eprintln!(">>> All three real proofs verified successfully");
+    }));
+
+    let _ = ledger.kill();
+    let _ = ledger.wait();
+    if let Err(e) = result { std::panic::resume_unwind(e); }
+}
+
+/// Tests the ledger's --reprove-bin proof verification path.
+/// The ledger verifies submitted STARK proofs via the reprover binary.
+/// This exercises the ProofBundle::verify() code path including the
+/// output_preimage binding check (security finding #1).
+#[test]
+fn test_ledger_verifies_proofs_with_reprover() {
+    if !has_reprover() {
+        eprintln!("SKIP: reprover binary or Cairo executables not found.");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let dir = dir.path();
+    let alice = dir.join("alice.json").to_str().unwrap().to_string();
+    let port = LEDGER_PORT + 3;
+    let l = format!("http://localhost:{}", port);
+
+    // Start ledger WITH --reprove-bin so it actually verifies proofs
+    let mut ledger = start_ledger_with_verifier(port);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // Setup
+        let (ok, _) = client_tmb(&alice, &["keygen"]);
+        assert!(ok);
+        let (ok, _) = client_tmb(&alice, &["fund", "-l", &l, "--addr", "alice", "--amount", "5000"]);
+        assert!(ok);
+
+        // Submit a real proof — ledger verifies it via reprover
+        eprintln!(">>> Generating shield proof for ledger-side verification...");
+        let (ok, out) = client_prove(&alice, &["shield", "-l", &l, "--sender", "alice", "--amount", "1000"]);
+        assert!(ok, "shield with ledger verification failed: {}", out);
+        assert!(out.contains("Shielded 1000"), "shield output: {}", out);
+        eprintln!(">>> Ledger-verified shield OK");
+
+        // Scan and verify the note was accepted
+        let (ok, out) = client_tmb(&alice, &["scan", "-l", &l]);
+        assert!(ok, "scan: {}", out);
+        assert!(out.contains("1 new notes found"), "should find the shielded note: {}", out);
+
+        eprintln!(">>> Ledger proof verification path exercised successfully");
     }));
 
     let _ = ledger.kill();

@@ -12,9 +12,11 @@ use starkprivacy_cli::*;
 struct WalletFile {
     #[serde(with = "hex_f")]
     master_sk: F,
-    #[serde(with = "hex_bytes")]
+    /// Legacy global KEM seeds — ignored when per-address derivation is available.
+    /// Kept for backwards compatibility during wallet migration.
+    #[serde(default, with = "hex_bytes")]
     kem_seed_v: Vec<u8>,
-    #[serde(with = "hex_bytes")]
+    #[serde(default, with = "hex_bytes")]
     kem_seed_d: Vec<u8>,
     addr_counter: u32,
     notes: Vec<Note>,
@@ -31,12 +33,12 @@ impl WalletFile {
         derive_account(&self.master_sk)
     }
 
-    fn kem_keys(&self) -> (Ek, Dk, Ek, Dk) {
-        let seed_v: [u8; 64] = self.kem_seed_v.as_slice().try_into().expect("bad kem_seed_v");
-        let seed_d: [u8; 64] = self.kem_seed_d.as_slice().try_into().expect("bad kem_seed_d");
-        let (ek_v, dk_v) = kem_keygen_from_seed(&seed_v);
-        let (ek_d, dk_d) = kem_keygen_from_seed(&seed_d);
-        (ek_v, dk_v, ek_d, dk_d)
+    /// Per-address KEM keys derived from incoming_seed + address index.
+    /// Each address j gets unique (ek_v_j, dk_v_j, ek_d_j, dk_d_j) so that
+    /// addresses from the same wallet are unlinkable by their public keys.
+    fn kem_keys(&self, j: u32) -> (Ek, Dk, Ek, Dk) {
+        let acc = self.account();
+        derive_kem_keys(&acc.incoming_seed, j)
     }
 
     /// Generate next address. Returns (d_j, auth_root, nk_tag, j).
@@ -379,15 +381,12 @@ fn cmd_keygen(path: &str) -> Result<(), String> {
     if std::path::Path::new(path).exists() {
         return Err(format!("{} already exists", path));
     }
-    let mut rng = rand::rng();
     let master_sk = random_felt();
-    let kem_seed_v: [u8; 64] = rng.random();
-    let kem_seed_d: [u8; 64] = rng.random();
 
     let w = WalletFile {
         master_sk,
-        kem_seed_v: kem_seed_v.to_vec(),
-        kem_seed_d: kem_seed_d.to_vec(),
+        kem_seed_v: vec![],  // legacy, unused — keys derived per-address from incoming_seed
+        kem_seed_d: vec![],
         addr_counter: 0,
         notes: vec![],
         scanned: 0,
@@ -401,7 +400,7 @@ fn cmd_keygen(path: &str) -> Result<(), String> {
 fn cmd_address(path: &str) -> Result<(), String> {
     let mut w = load_wallet(path)?;
     let (d_j, auth_root, nk_tag, j) = w.next_address();
-    let (ek_v, _, ek_d, _) = w.kem_keys();
+    let (ek_v, _, ek_d, _) = w.kem_keys(j);
 
     let addr = PaymentAddress {
         d_j,
@@ -419,24 +418,32 @@ fn cmd_address(path: &str) -> Result<(), String> {
 
 fn cmd_export_detect(path: &str) -> Result<(), String> {
     let w = load_wallet(path)?;
-    println!("{}", hex::encode(&w.kem_seed_d));
+    let acc = w.account();
+    // Export incoming_seed in detect mode: holder can derive per-address dk_d_j
+    // for any j (via derive_kem_detect_seed), enabling detection but not decryption.
+    println!(
+        "{{\"incoming_seed\":\"{}\",\"addr_count\":{},\"mode\":\"detect\"}}",
+        hex::encode(acc.incoming_seed),
+        w.addr_counter
+    );
     Ok(())
 }
 
 fn cmd_export_view(path: &str) -> Result<(), String> {
     let w = load_wallet(path)?;
     let acc = w.account();
+    // Export incoming_seed: holder can derive per-address dk_v_j and dk_d_j
+    // for any j, enabling full viewing (decrypt + detect) but not spending.
     println!(
-        "{{\"incoming_seed\":\"{}\",\"kem_seed_v\":\"{}\"}}",
+        "{{\"incoming_seed\":\"{}\",\"addr_count\":{}}}",
         hex::encode(acc.incoming_seed),
-        hex::encode(&w.kem_seed_v)
+        w.addr_counter
     );
     Ok(())
 }
 
 fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
     let mut w = load_wallet(path)?;
-    let (_, dk_v, _, dk_d) = w.kem_keys();
     let acc = w.account();
 
     let url = format!("{}/notes?cursor={}", ledger, w.scanned);
@@ -444,23 +451,27 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
 
     let mut found = 0usize;
     for nm in &feed.notes {
-        // Stage 1: detection
-        if !detect(&nm.enc, &dk_d) {
-            continue;
-        }
-        // Stage 2: decrypt
-        let Some((v, rseed, _memo)) = decrypt_memo(&nm.enc, &dk_v) else {
-            continue;
-        };
-        // Stage 3: match address — try each address's auth_root
-        let rcm = derive_rcm(&rseed);
+        // Try each address's per-address KEM keys for detection + decryption
+        let mut matched = false;
         for j in 0..w.addr_counter {
+            let (_, dk_v_j, _, dk_d_j) = derive_kem_keys(&acc.incoming_seed, j);
+
+            // Stage 1: detection with per-address dk_d_j
+            if !detect(&nm.enc, &dk_d_j) {
+                continue;
+            }
+            // Stage 2: decrypt with per-address dk_v_j
+            let Some((v, rseed, _memo)) = decrypt_memo(&nm.enc, &dk_v_j) else {
+                continue;
+            };
+            // Stage 3: verify commitment matches this address
             let d_j = derive_address(&acc.incoming_seed, j);
             let ask_j = derive_ask(&acc.ask_base, j);
             let (auth_root, _) = build_auth_tree(&ask_j);
             let nk_sp = derive_nk_spend(&acc.nk, &d_j);
             let nk_tg = derive_nk_tag(&nk_sp);
             let otag = owner_tag(&auth_root, &nk_tg);
+            let rcm = derive_rcm(&rseed);
             if commit(&d_j, v, &rcm, &otag) == nm.cm {
                 let leaf_index = nm.index;
                 w.notes.push(Note {
@@ -476,9 +487,11 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
                 });
                 found += 1;
                 println!("  found: v={} cm={} index={}", v, short(&nm.cm), leaf_index);
+                matched = true;
                 break;
             }
         }
+        let _ = matched; // suppress unused warning
     }
 
     // Check which notes have been spent (nullified)
@@ -522,12 +535,12 @@ fn cmd_shield(
     pc: &ProveConfig,
 ) -> Result<(), String> {
     let mut w = load_wallet(path)?;
-    let (ek_v, _, ek_d, _) = w.kem_keys();
 
     let address = if let Some(addr_path) = to {
         load_address(&addr_path)?
     } else {
-        let (d_j, auth_root, nk_tag, _) = w.next_address();
+        let (d_j, auth_root, nk_tag, j) = w.next_address();
+        let (ek_v, _, ek_d, _) = w.kem_keys(j);
         PaymentAddress {
             d_j,
             auth_root,
@@ -604,7 +617,6 @@ fn cmd_transfer(
 ) -> Result<(), String> {
     let mut w = load_wallet(path)?;
     let recipient = load_address(to_path)?;
-    let (ek_v, _, ek_d, _) = w.kem_keys();
 
     // Select notes
     let selected = w.select_notes(amount)?;
@@ -638,13 +650,14 @@ fn cmd_transfer(
     let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
     let enc_1 = encrypt_note(amount, &rseed_1, memo_bytes, &ek_v_recv, &ek_d_recv);
 
-    // Build output 2: change to self
-    let (d_j_c, auth_root_c, nk_tag_c, _) = w.next_address();
+    // Build output 2: change to self (per-address KEM keys)
+    let (d_j_c, auth_root_c, nk_tag_c, j_c) = w.next_address();
+    let (ek_v_c, _, ek_d_c, _) = w.kem_keys(j_c);
     let rseed_2 = random_felt();
     let rcm_2 = derive_rcm(&rseed_2);
     let otag_2 = owner_tag(&auth_root_c, &nk_tag_c);
     let cm_2 = commit(&d_j_c, change, &rcm_2, &otag_2);
-    let enc_2 = encrypt_note(change, &rseed_2, None, &ek_v, &ek_d);
+    let enc_2 = encrypt_note(change, &rseed_2, None, &ek_v_c, &ek_d_c);
 
     let proof = if !pc.skip_proof {
         // Build witness for run_transfer with WOTS+ w=4 inside the STARK.
@@ -775,7 +788,6 @@ fn cmd_unshield(
     pc: &ProveConfig,
 ) -> Result<(), String> {
     let mut w = load_wallet(path)?;
-    let (ek_v, _, ek_d, _) = w.kem_keys();
 
     let selected = w.select_notes(amount)?;
     let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
@@ -792,16 +804,21 @@ fn cmd_unshield(
         })
         .collect();
 
-    let (cm_change, enc_change) = if change > 0 {
-        let (d_j_c, auth_root_c, nk_tag_c, _) = w.next_address();
+    // Build change output — save intermediate values for proving path
+    struct ChangeData { d_j: F, rseed: F, auth_root: F, nk_tag: F, mh: F }
+    let (cm_change, enc_change, change_data) = if change > 0 {
+        let (d_j_c, auth_root_c, nk_tag_c, j_c) = w.next_address();
+        let (ek_v_c, _, ek_d_c, _) = w.kem_keys(j_c);
         let rseed_c = random_felt();
         let rcm_c = derive_rcm(&rseed_c);
         let otag_c = owner_tag(&auth_root_c, &nk_tag_c);
         let cm = commit(&d_j_c, change, &rcm_c, &otag_c);
-        let enc = encrypt_note(change, &rseed_c, None, &ek_v, &ek_d);
-        (cm, Some(enc))
+        let enc = encrypt_note(change, &rseed_c, None, &ek_v_c, &ek_d_c);
+        let mh = memo_ct_hash(&enc);
+        let cd = ChangeData { d_j: d_j_c, rseed: rseed_c, auth_root: auth_root_c, nk_tag: nk_tag_c, mh };
+        (cm, Some(enc), Some(cd))
     } else {
-        (ZERO, None)
+        (ZERO, None, None)
     };
 
     let proof = if !pc.skip_proof {
@@ -814,7 +831,7 @@ fn cmd_unshield(
 
         let has_change_val: u64 = if change > 0 { 1 } else { 0 };
         let recipient_f = hash(recipient.as_bytes());
-        let mh_change_f = ZERO; // no change memo hash for now
+        let mh_change_f = change_data.as_ref().map(|cd| cd.mh).unwrap_or(ZERO);
 
         // Compute sighash matching Cairo circuit
         let nfs_for_sh: Vec<F> = selected.iter()
@@ -868,8 +885,13 @@ fn cmd_unshield(
         for pk in &wots_pks { for p in pk { args.push(felt_to_hex(p)); } }
 
         args.push(felt_u64_to_hex(has_change_val));
-        if change > 0 {
-            return Err("--prove with unshield change not yet wired".into());
+        if let Some(cd) = &change_data {
+            args.push(felt_to_hex(&cd.d_j));
+            args.push(felt_u64_to_hex(change));
+            args.push(felt_to_hex(&cd.rseed));
+            args.push(felt_to_hex(&cd.auth_root));
+            args.push(felt_to_hex(&cd.nk_tag));
+            args.push(felt_to_hex(&cd.mh));
         } else {
             for _ in 0..6 { args.push("0x0".to_string()); }
         }

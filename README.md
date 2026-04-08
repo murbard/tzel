@@ -29,19 +29,27 @@ A UTXO-based private transaction system where:
 ## Quick start
 
 ```bash
-# Run the CLI (ledger + wallet)
+# Build everything
 cd cli && cargo build --release
-./target/release/sp-ledger --port 8080 &
-./target/release/sp-client keygen
-./target/release/sp-client fund -l http://localhost:8080 --addr alice --amount 1000
-./target/release/sp-client shield -l http://localhost:8080 --sender alice --amount 1000
-./target/release/sp-client scan -l http://localhost:8080
-./target/release/sp-client balance
+cd ../reprover && cargo build --release
+cd ..
+
+# Run the ledger with proof verification (production mode)
+cli/target/release/sp-ledger --port 8080 --reprove-bin reprover/target/release/reprove &
+
+# Run the wallet
+cli/target/release/sp-client keygen
+cli/target/release/sp-client fund -l http://localhost:8080 --addr alice --amount 1000
+cli/target/release/sp-client shield -l http://localhost:8080 --sender alice --amount 1000
+cli/target/release/sp-client scan -l http://localhost:8080
+cli/target/release/sp-client balance
 
 # Run the STARK proofs (requires ~13 GB RAM)
 scarb build
 ./bench.sh
 ```
+
+> **WARNING:** Running the ledger without `--reprove-bin` starts it in `--trust-me-bro` mode, which accepts transactions without verifying STARK proofs. This is for development only — never use it for real value.
 
 ## Architecture
 

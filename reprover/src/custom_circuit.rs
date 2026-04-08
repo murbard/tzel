@@ -251,6 +251,11 @@ impl ProofBundle {
 
     /// Standalone verification: deserialize the circuit proof and verify it
     /// using the stored verification metadata. Returns Ok(()) if valid.
+    ///
+    /// SECURITY: This method also verifies that `output_preimage` hashes to the
+    /// same public output values that the STARK proof was verified against.
+    /// Without this check, a tampered `output_preimage` could pass verification
+    /// while the ledger interprets different (attacker-chosen) public outputs.
     pub fn verify(&self) -> Result<()> {
         use circuit_air::verify::{CircuitConfig, CircuitPublicData, verify_circuit};
         use circuit_serialize::deserialize::deserialize_proof_with_config;
@@ -261,6 +266,20 @@ impl ProofBundle {
 
         let meta = self.verify_meta.as_ref()
             .ok_or_else(|| anyhow!("proof bundle missing verify_meta"))?;
+
+        // ── Step 0: Bind output_preimage to the verified public outputs ──
+        // The STARK proof authenticates public_output_values (an M31 hash).
+        // We must verify that output_preimage hashes to the same values,
+        // otherwise the ledger could be tricked into using tampered outputs.
+        let preimage_felts = self.output_preimage_felts();
+        let recomputed = compute_output(&preimage_felts);
+        let expected_m31s: Vec<u32> = recomputed.iter().map(|m| m.0).collect();
+        if expected_m31s != meta.public_output_values {
+            return Err(anyhow!(
+                "output_preimage does not match verified public_output_values — \
+                 the preimage may have been tampered with"
+            ));
+        }
 
         // Reconstruct ProofConfig (uses circuits_stark_verifier::fri_proof::FriConfig)
         let proof_config = ProofConfig {
