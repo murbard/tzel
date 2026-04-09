@@ -488,13 +488,13 @@
           <div class="badge">Protocol Reference</div>
           <h1>Readable web view.<br>Single markdown source.</h1>
           <p>
-            The canonical protocol document lives in <code>specs/spec.md</code>. This page renders that same file through a symlinked <code>docs/spec.md</code> so the site stays readable without creating a second spec to maintain.
+            The canonical protocol document lives in <code>specs/spec.md</code>. This page renders that same file through a symlinked <code>docs/spec.md</code>, with fallbacks for local previews and static hosting, so the site stays readable without creating a second spec to maintain.
           </p>
         </div>
         <aside class="mirror-card">
           <h2>Source of truth</h2>
           <p>
-            Edit <code>specs/spec.md</code>. The site reads <code>docs/spec.md</code>, which is only a symlink to the canonical file for publishing.
+            Edit <code>specs/spec.md</code>. The site tries <code>docs/spec.md</code> first, then falls back to the canonical repo copy when needed.
           </p>
           <div class="mirror-actions">
             <a href="https://github.com/murbard/tzel/blob/main/specs/spec.md" class="btn btn-primary" target="_blank" rel="noreferrer">Open markdown</a>
@@ -512,7 +512,7 @@
 
       <div class="article-shell">
         <div class="article-meta">
-          <span>Rendered from <code>docs/spec.md</code> → <code>../specs/spec.md</code></span>
+          <span>Rendered from the canonical <code>specs/spec.md</code> source</span>
         </div>
         <article id="content" class="markdown">
           <div class="loading">Loading specification…</div>
@@ -534,14 +534,35 @@
         .trim()
         .replace(/\s+/g, "-");
 
+    const specSources = [
+      "./spec.md",
+      "../specs/spec.md",
+      "https://raw.githubusercontent.com/murbard/tzel/main/specs/spec.md",
+      "https://cdn.jsdelivr.net/gh/murbard/tzel@main/specs/spec.md"
+    ];
+
+    async function fetchFirstAvailable(urls) {
+      let lastError = null;
+      for (const url of urls) {
+        try {
+          const response = await fetch(url, { cache: "no-store" });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+          return {
+            markdown: await response.text(),
+            url
+          };
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw lastError || new Error("Unable to load specification");
+    }
+
     async function loadSpec() {
       try {
-        const response = await fetch("./spec.md");
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-
-        const markdown = await response.text();
+        const { markdown, url } = await fetchFirstAvailable(specSources);
         marked.setOptions({
           gfm: true,
           breaks: false,
@@ -550,12 +571,14 @@
         });
 
         content.innerHTML = marked.parse(markdown);
+        document.querySelector(".article-meta span").innerHTML =
+          `Rendered from <code>${url.replace(/^https?:\/\//, "")}</code>`;
         decorateHeadings();
         buildToc();
       } catch (error) {
         content.innerHTML = `
           <div class="error">
-            Failed to load <code>docs/spec.md</code>. If you opened this page directly from the filesystem, try serving <code>docs/</code> over HTTP instead.
+            Failed to load the spec from the local docs mirror or the canonical GitHub source.
           </div>
         `;
         tocRoot.innerHTML = `
