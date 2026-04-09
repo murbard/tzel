@@ -5,6 +5,7 @@
 ## Overview
 
 A UTXO-based private transaction system with:
+
 - **Merkle commitment tree** for note storage
 - **Nullifiers** for double-spend prevention
 - **Two-level recursive STARKs** (Cairo AIR + Stwo circuit reprover) with ZK blinding
@@ -319,6 +320,7 @@ The contract appends commitments to the tree in sequential order (each new commi
 5. Transaction (proof + note data) submitted on-chain. No separate signatures or public keys needed.
 
 The prover sees `nk_spend_j` (per-address nullifier key) and the WOTS+ signature, but NOT `ask_j` or any WOTS+ secret key. The prover:
+
 - **Cannot redirect funds** — the WOTS+ signature is bound to specific output commitments via the sighash. A prover who substitutes different outputs cannot produce a valid proof because the signature verification inside the STARK would fail.
 - **Cannot forge a signature** — doesn't have `sk_i`
 - **Cannot link spends on-chain** — no auth leaves, public keys, or signatures appear in public outputs, so on-chain observers cannot link spends. However, the delegated prover itself sees `nk_spend_j` and `auth_root_j`, which are per-address values. If the same address is reused for multiple notes and the same proving service handles later spends, the prover can link those spends to the same address context. Unlinkability against the prover depends on address rotation and prover diversity.
@@ -349,6 +351,7 @@ Precision `k` should NOT be claimed to provide "plausible deniability" without m
 Each note carries a 1024-byte user memo field, encrypted alongside `(v, rseed)` inside the AEAD ciphertext. The memo can contain arbitrary data: payment references, return addresses, human-readable messages, or structured metadata.
 
 Memo format conventions (following Zcash ZIP 302):
+
 - If the first byte is <= 0xF4: the memo is a UTF-8 string, zero-padded.
 - If the first byte is 0xF6: "no memo" (remainder is zeros).
 - If the first byte is >= 0xF5: application-defined binary format.
@@ -362,6 +365,7 @@ Each circuit includes a `memo_ct_hash` per output note in its public outputs. Th
 The on-chain contract verifies `H(posted_calldata) == memo_ct_hash` for each output note. If a malicious relayer or sequencer swaps the encrypted memo data in transit, the hash won't match and the contract rejects the transaction.
 
 This prevents:
+
 - **Memo spoofing**: a relayer replacing "Payment for invoice #42" with "Send your seed phrase to evil.com"
 - **Selective censorship**: a relayer stripping memo data while keeping the proof valid
 
@@ -484,6 +488,7 @@ For cross-implementation interoperability, the stable protocol objects in this s
 This canonical binary format is the interoperability target for clean-room implementations. The current JSON HTTP API and proof-bundle JSON are convenience transports used by the reference CLI; they are **not** the normative binary compatibility layer.
 
 Unless otherwise stated:
+
 - all records are encoded in the field order listed below
 - `felt252` means exactly 32 raw little-endian bytes
 - `bytes[N]` means exactly `N` raw bytes
@@ -524,6 +529,7 @@ NoteMemo := record {
 ```
 
 Notes:
+
 - `PaymentAddress` and `EncryptedNote` are consensus-relevant application objects and MUST decode exactly as above in interoperable implementations.
 - `PublishedNote` is the canonical binary form of posted note data (`cm` plus memo/detection ciphertexts).
 - `NoteMemo` is the canonical binary form of the reference ledger's notes feed item.
@@ -533,6 +539,7 @@ Notes:
 ### Reference JSON Mapping
 
 The reference CLI currently exposes JSON over HTTP. That JSON must map losslessly to the canonical binary objects above:
+
 - `felt252` fields are serialized as lowercase hex strings of exactly 64 hex characters, no `0x` prefix, representing the 32 raw little-endian bytes
 - raw byte fields are serialized as lowercase hex strings, no `0x` prefix
 - `index` is serialized as a JSON integer
@@ -582,6 +589,7 @@ memo_ct_hash = H_memo(ct_d || tag_le || ct_v || encrypted_data)
 ```
 
 where:
+
 - `ct_d` is the ML-KEM-768 detection ciphertext (1088 bytes)
 - `tag_le` is the 2-byte little-endian encoding of `tag_u16 = LE16(H(ss_d)[0], H(ss_d)[1]) & ((1 << k) - 1)`
 - `ct_v` is the ML-KEM-768 viewing ciphertext (1088 bytes)
