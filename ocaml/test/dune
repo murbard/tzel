@@ -5,6 +5,11 @@
  (modules test_main)
  (libraries tzel alcotest hex mirage-crypto))
 
+(test
+ (name test_interop)
+ (modules test_interop)
+ (libraries tzel alcotest hex yojson unix))
+
 (executable
  (name test_vectors)
  (modules test_vectors)
@@ -13,4 +18,9 @@
 (executable
  (name gen_vectors)
  (modules gen_vectors)
+ (libraries tzel hex yojson))
+
+(executable
+ (name gen_interop_scenario)
+ (modules gen_interop_scenario)
  (libraries tzel hex yojson))

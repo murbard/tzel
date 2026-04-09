@@ -1,6 +1,7 @@
 //! TzEL shared library — crypto, types, Merkle tree, API types.
 
 pub mod canonical_wire;
+pub mod interop_scenario;
 pub mod protocol_vectors;
 
 use blake2s_simd::Params;

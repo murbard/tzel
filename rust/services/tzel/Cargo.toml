@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "gen-test-vectors"
 path = "src/bin/gen_test_vectors.rs"
 
+[[bin]]
+name = "gen-interop-scenario"
+path = "src/bin/gen_interop_scenario.rs"
+
 [dependencies]
 blake2s_simd = "1.0"
 rand = "0.9"
