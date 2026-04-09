@@ -7,10 +7,6 @@ edition = "2024"
 name = "tzel_reprover"
 path = "src/lib.rs"
 
-[[bin]]
-name = "reprove"
-path = "src/main.rs"
-
 [dependencies]
 anyhow = "1.0.98"
 hex = "0.4"

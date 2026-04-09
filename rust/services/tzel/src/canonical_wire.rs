@@ -428,7 +428,7 @@ mod tests {
     fn test_canonical_vectors_match_file() {
         let expected = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../specs/test_vectors/canonical_wire_v1.json"
+            "/../../../specs/test_vectors/canonical_wire_v1.json"
         ))
         .trim_end_matches('\n');
         assert_eq!(generate_canonical_wire_v1_json(), expected);

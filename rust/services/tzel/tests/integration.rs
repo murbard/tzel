@@ -7,9 +7,9 @@
 
 use ml_kem::{ml_kem_768, KeyExport};
 use serde::Serialize;
-use tzel_cli::*;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+use tzel_services::*;
 use ureq::{http, RequestExt};
 
 const LEDGER_PORT: u16 = 19876;
@@ -18,29 +18,50 @@ fn ledger_url() -> String {
     format!("http://localhost:{}", LEDGER_PORT)
 }
 
+fn workspace_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .unwrap()
+        .to_path_buf()
+}
+
+fn ensure_app_bin(package: &str, bin: &str) -> String {
+    let path = workspace_root().join("target/debug").join(bin);
+    if !path.exists() {
+        let out = Command::new("cargo")
+            .current_dir(workspace_root())
+            .args(["build", "-p", package, "--bin", bin])
+            .output()
+            .expect("failed to build app binary");
+        assert!(
+            out.status.success(),
+            "failed to build {}:\nstdout:\n{}\nstderr:\n{}",
+            bin,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    path.to_str().unwrap().to_string()
+}
+
 fn sp_client() -> String {
-    env!("CARGO_BIN_EXE_sp-client").to_string()
+    ensure_app_bin("tzel-wallet-app", "sp-client")
 }
 
 fn sp_ledger() -> String {
-    env!("CARGO_BIN_EXE_sp-ledger").to_string()
+    ensure_app_bin("tzel-ledger-app", "sp-ledger")
 }
 
-/// Path to the reprove binary (built separately in ../reprover)
+/// Path to the reprove binary in the workspace target dir.
 fn reprove_bin() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("reprover/target/release/reprove");
+    let path = workspace_root().join("apps/prover/target/release/reprove");
     path.to_str().unwrap().to_string()
 }
 
 /// Path to compiled Cairo executables
 fn executables_dir() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .join("target/dev");
+    let path = workspace_root().join("rust/protocol/cairo/target/dev");
     path.to_str().unwrap().to_string()
 }
 
@@ -516,13 +537,13 @@ fn test_ledger_refuses_insecure_startup() {
 /// then proves specific transactions with the real reprover.
 ///
 /// This test is slow (~2 minutes) and requires:
-/// - reprover built: `cd rust/reprover && cargo build --release`
+/// - reprover built: `cd apps/prover && cargo build --release`
 /// - Cairo executables built: `cd rust && scarb build`
 #[test]
 fn test_e2e_with_real_proofs() {
     if !has_reprover() {
         eprintln!("SKIP: reprover binary or Cairo executables not found. Build with:");
-        eprintln!("  cd rust/reprover && cargo build --release");
+        eprintln!("  cd apps/prover && cargo build --release");
         eprintln!("  cd rust && scarb build");
         return;
     }

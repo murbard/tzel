@@ -5,9 +5,9 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use tzel_cli::*;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
+use tzel_backend::*;
 
 struct LedgerState {
     ledger: Mutex<Ledger>,
@@ -32,7 +32,7 @@ struct Cli {
     reprove_bin: Option<String>,
 
     /// Directory containing the compiled Cairo executables used by verified proofs.
-    #[arg(long, default_value = "target/dev")]
+    #[arg(long, default_value = "rust/protocol/cairo/target/dev")]
     executables_dir: String,
 
     /// Optional big-endian felt252 domain binding for spend authorizations.

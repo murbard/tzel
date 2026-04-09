@@ -30,27 +30,26 @@ A UTXO-based private transaction system where:
 
 ```bash
 # Build everything
-cd rust/cli && cargo build --release
-cd ../reprover && cargo build --release
-cd .. && scarb build
+cargo build --release -p tzel-wallet-app -p tzel-ledger-app
+cd apps/prover && cargo build --release && cd ../..
+cd rust/protocol/cairo && scarb build && cd ../../..
 
 # Run the ledger with proof verification (verified mode)
-# If you launch it from elsewhere, also pass --executables-dir /abs/path/to/target/dev
-cli/target/release/sp-ledger --port 8080 --reprove-bin reprover/target/release/reprove &
+# If you launch it from elsewhere, also pass --executables-dir /abs/path/to/rust/protocol/cairo/target/dev
+target/release/sp-ledger --port 8080 --reprove-bin apps/prover/target/release/reprove &
 
 # Run the wallet
-cli/target/release/sp-client keygen
-cli/target/release/sp-client fund -l http://localhost:8080 --addr alice --amount 1000
-cli/target/release/sp-client shield -l http://localhost:8080 --sender alice --amount 1000
-cli/target/release/sp-client scan -l http://localhost:8080
-cli/target/release/sp-client balance
+target/release/sp-client keygen
+target/release/sp-client fund -l http://localhost:8080 --addr alice --amount 1000
+target/release/sp-client shield -l http://localhost:8080 --sender alice --amount 1000
+target/release/sp-client scan -l http://localhost:8080
+target/release/sp-client balance
 
 # Run the STARK proofs (requires ~13 GB RAM)
-./bench.sh
-cd ..
+./apps/prover/bench.sh
 ```
 
-> **WARNING:** The ledger now refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `target/dev`). `--trust-me-bro` is never appropriate for real value.
+> **WARNING:** The ledger now refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `rust/protocol/cairo/target/dev`). `--trust-me-bro` is never appropriate for real value.
 >
 > **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, and memo-hash checks. Its public-balance layer intentionally uses submitted strings such as `"alice"` as stand-ins for chain-native caller identity. It is not a network-authenticated wallet service and should not be exposed as a real public endpoint.
 
@@ -128,24 +127,22 @@ nf = H_nf(nk_spend, H_nf(cm, pos))      -- nullifier (prevents double-spend)
 ```
 docs/                   Site assets
 specs/                  Protocol spec and shared test vectors
-  spec.md               Protocol specification
-  security.md           Security notes and operational caveats
-  rationale.md          Design rationale
-  test_vectors/         Canonical wire/reference vectors
-  ocaml_vectors/        Cross-implementation vector docs and fixtures
-rust/                   Rust/Cairo reference implementation
-  src/                  Cairo circuits
-  reprover/             Two-level recursive STARK prover
-  cli/                  CLI client + HTTP ledger
-  bench.sh              Benchmark script
+apps/                   Thin shells (wallet, ledger, prover, demo)
+backends/               Backend adapters used by the shells
+  rust/                 Current adapter to the Rust libraries
+rust/                   Rust implementation libraries
+  protocol/cairo/       Cairo circuits and executable build
+  services/             Rust libraries used by the shells and tests
 ocaml/                  Independent OCaml implementation
+  protocol/             Pure protocol modules
+  services/             Ledger/prover service modules
 ```
 
 ## Running benchmarks
 
 ```bash
-cd rust && ./bench.sh                # Recursive proofs (currently ~300 KB)
-cd rust && ./bench.sh --depth 16
+./apps/prover/bench.sh
+./apps/prover/bench.sh --depth 16
 ```
 
 ## Known limitations

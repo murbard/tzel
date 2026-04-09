@@ -2,6 +2,9 @@
 
 This directory contains the independent OCaml implementation of the protocol.
 
+- `protocol/` contains the pure protocol modules.
+- `services/` contains the higher-level ledger/prover service modules.
+
 - Canonical protocol spec: `../specs/spec.md`
 - Shared cross-implementation vectors: `../specs/ocaml_vectors/`
 - Canonical wire vectors: `../specs/test_vectors/`
@@ -10,7 +13,7 @@ Typical commands:
 
 ```bash
 cd ocaml
-LIBRARY_PATH=$PWD/vendor/mlkem-native/test/build opam exec -- dune runtest
+opam exec -- dune runtest
 ```
 
 Notes:

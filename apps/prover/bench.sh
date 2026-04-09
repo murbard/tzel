@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# Usage: ./bench.sh [--depth 16|32|48] [--debug-single-level]
+# Usage: ./apps/prover/bench.sh [--depth 16|32|48] [--debug-single-level]
 DEPTH=48
 RECURSIVE=1
 while [[ $# -gt 0 ]]; do
@@ -20,14 +20,23 @@ esac
 echo "=== TzEL Proof Benchmark (depth=$DEPTH) ==="
 echo ""
 
+# Run from repo root
+cd "$(dirname "$0")/../.."
+
 # Build Cairo executables
 echo "Building Cairo executables..."
-scarb build --no-default-features --features "depth${DEPTH}" 2>&1 | tail -1
+(
+  cd rust/protocol/cairo
+  scarb build --no-default-features --features "depth${DEPTH}" 2>&1 | tail -1
+)
 
 # Build reprover if needed
-if [ ! -f reprover/target/release/reprove ]; then
+if [ ! -f apps/prover/target/release/reprove ]; then
     echo "Building reprover (first time, may take a few minutes)..."
-    (cd reprover && cargo build --release 2>&1 | tail -1)
+    (
+      cd apps/prover
+      cargo build --release 2>&1 | tail -1
+    )
 fi
 
 STEPS=("step_shield" "step_unshield" "step_join" "step_split")
@@ -50,7 +59,7 @@ if [ "$RECURSIVE" = "1" ]; then
         label=${LABELS[$i]}
         echo "[$label]"
 
-        OUTPUT=$(./reprover/target/release/reprove "target/dev/${step}.executable.json" 2>&1)
+        OUTPUT=$(./apps/prover/target/release/reprove "rust/protocol/cairo/target/dev/${step}.executable.json" 2>&1)
         CAIRO_PROVES[$i]=$(echo "$OUTPUT" | grep "^cairo_prove_ms=" | cut -d= -f2)
         CIRCUIT_PROVES[$i]=$(echo "$OUTPUT" | grep "^circuit_prove_ms=" | cut -d= -f2)
         TOTAL_PROVES[$i]=$(echo "$OUTPUT" | grep "^prove_ms=" | cut -d= -f2)
@@ -82,7 +91,7 @@ else
         label=${LABELS[$i]}
         echo "[$label]"
 
-        OUTPUT=$(./reprover/target/release/reprove "target/dev/${step}.executable.json" --debug-single-level 2>&1)
+        OUTPUT=$(./apps/prover/target/release/reprove "rust/protocol/cairo/target/dev/${step}.executable.json" --debug-single-level 2>&1)
         PROVES[$i]=$(echo "$OUTPUT" | grep "^prove_ms=" | cut -d= -f2)
         PROOF_SIZES[$i]=$(echo "$OUTPUT" | grep "^proof_zstd_bytes=" | cut -d= -f2)
         PEAK_MEMS[$i]=$(echo "$OUTPUT" | grep "^peak_rss_kb=" | cut -d= -f2)

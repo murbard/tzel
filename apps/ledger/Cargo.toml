@@ -1,0 +1,17 @@
+[package]
+name = "tzel-ledger-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sp-ledger"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tzel-backend = { package = "tzel-backend-rust", path = "../../backends/rust" }

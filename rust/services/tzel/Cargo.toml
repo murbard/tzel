@@ -1,15 +1,11 @@
 [package]
-name = "tzel-cli"
+name = "tzel-services"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "sp-ledger"
-path = "src/bin/sp_ledger.rs"
-
-[[bin]]
-name = "sp-client"
-path = "src/bin/sp_client.rs"
+[lib]
+name = "tzel_services"
+path = "src/lib.rs"
 
 [[bin]]
 name = "gen-test-vectors"

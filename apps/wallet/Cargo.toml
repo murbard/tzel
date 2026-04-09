@@ -1,0 +1,22 @@
+[package]
+name = "tzel-wallet-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sp-client"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+ml-kem = { version = "0.3.0-rc.2", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tzel-backend = { package = "tzel-backend-rust", path = "../../backends/rust" }
+ureq = { version = "3", features = ["json"] }
+
+[dev-dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }

@@ -340,7 +340,7 @@ let () =
        Generate them from the Rust implementation:\n\
        \n\
        1. From the repo root, run:\n\
-          cargo run --manifest-path rust/cli/Cargo.toml --bin gen-test-vectors -- --output specs/ocaml_vectors/protocol_v1.generated.json\n\
+          cargo run -p tzel-services --bin gen-test-vectors -- --output specs/ocaml_vectors/protocol_v1.generated.json\n\
        2. Compare or copy that file to %s\n\
        3. Re-run: dune exec test/test_vectors.exe\n\
        \n\

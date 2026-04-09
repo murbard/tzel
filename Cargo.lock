@@ -468,9 +468,9 @@ dependencies = [
 
 [[package]]
 name = "fastrand"
-version = "2.4.0"
+version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a043dc74da1e37d6afe657061213aa6f425f855399a11d3463c6ecccc4dfda1f"
+checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "find-msvc-tools"
@@ -1651,9 +1651,9 @@ dependencies = [
 
 [[package]]
 name = "tokio"
-version = "1.51.0"
+version = "1.51.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bd1c4c0fc4a7ab90fc15ef6daaa3ec3b893f004f915f2392557ed23237820cd"
+checksum = "f66bf9585cda4b724d3e78ab34b73fb2bbaba9011b9bfdf69dc836382ea13b8c"
 dependencies = [
  "bytes",
  "libc",
@@ -1732,7 +1732,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 
 [[package]]
-name = "tzel-cli"
+name = "tzel-backend-rust"
+version = "0.1.0"
+dependencies = [
+ "tzel-services",
+]
+
+[[package]]
+name = "tzel-demo"
+version = "0.2.0"
+dependencies = [
+ "blake2s_simd",
+ "chacha20poly1305",
+ "hex",
+ "ml-kem",
+ "rand",
+]
+
+[[package]]
+name = "tzel-ledger-app"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tzel-backend-rust",
+]
+
+[[package]]
+name = "tzel-services"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -1748,6 +1779,22 @@ dependencies = [
  "tempfile",
  "tezos_data_encoding",
  "tokio",
+ "ureq",
+]
+
+[[package]]
+name = "tzel-wallet-app"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "clap",
+ "hex",
+ "ml-kem",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tzel-backend-rust",
  "ureq",
 ]
 

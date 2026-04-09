@@ -1,9 +1,9 @@
 use clap::{Parser, Subcommand};
 use ml_kem::KeyExport;
 use serde::{Deserialize, Serialize};
-use tzel_cli::*;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use tzel_backend::*;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Wallet file
@@ -349,7 +349,7 @@ struct Cli {
     reprove_bin: String,
 
     /// Path to directory containing compiled .executable.json files
-    #[arg(long, default_value = "target/dev")]
+    #[arg(long, default_value = "rust/protocol/cairo/target/dev")]
     executables_dir: String,
 
     #[command(subcommand)]
@@ -992,7 +992,7 @@ mod tests {
         let pc = ProveConfig {
             skip_proof: false,
             reprove_bin: "/definitely/missing/reprove".into(),
-            executables_dir: "target/dev".into(),
+            executables_dir: "rust/protocol/cairo/target/dev".into(),
         };
         let err = cmd_transfer(
             wallet_path_str,
@@ -1041,7 +1041,7 @@ mod tests {
         let pc = ProveConfig {
             skip_proof: false,
             reprove_bin: "/definitely/missing/reprove".into(),
-            executables_dir: "target/dev".into(),
+            executables_dir: "rust/protocol/cairo/target/dev".into(),
         };
         let err = cmd_unshield(wallet_path_str, &ledger_url, 30, "alice", &pc).unwrap_err();
         shutdown_tx.send(()).ok();

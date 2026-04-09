@@ -8,6 +8,6 @@ ocaml/vendor/mlkem-native/test/build/libmlkem1024.a
 ocaml/vendor/mlkem-native/test/build/mlkem512/
 ocaml/vendor/mlkem-native/test/build/mlkem768/
 ocaml/vendor/mlkem-native/test/build/mlkem1024/
-rust/cli/alice.json
-rust/cli/bob.json
-rust/cli/mutants.out*/
+alice.json
+bob.json
+mutants.out*/
