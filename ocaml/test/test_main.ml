@@ -307,6 +307,28 @@ let test_wots_decompose_roundtrip () =
       (Tzel.Wots.verify sig_vals sh pk)
   done
 
+let test_wots_signature_binds_to_authenticated_auth_leaf () =
+  let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 123) in
+  let ask_j = Tzel.Keys.derive_ask keys 0 in
+  let key_idx = 7 in
+  let seed = Tzel.Keys.derive_wots_seed ask_j key_idx in
+  let sighash = Tzel.Hash.hash_tag "bind-wots-auth-leaf" in
+  let sig_vals = Tzel.Wots.sign seed sighash in
+  let digits = Tzel.Wots.decompose_sighash sighash in
+  let recovered_pk = Array.init Tzel.Wots.n_chains (fun i ->
+    let remaining = Tzel.Wots.chain_max - digits.(i) in
+    Tzel.Wots.chain_hash sig_vals.(i) remaining) in
+  let recovered_leaf = Tzel.Wots.fold_pk recovered_pk in
+  let (root, leaves) = Tzel.Keys.build_auth_tree ask_j in
+  Alcotest.(check bool) "recovered leaf matches expected leaf" true
+    (Tzel.Felt.equal recovered_leaf leaves.(key_idx));
+  let path = Tzel.Merkle.auth_path ~depth:Tzel.Keys.auth_depth (Array.to_list leaves) key_idx in
+  Alcotest.(check bool) "recovered leaf path verifies" true
+    (Tzel.Merkle.verify_path ~depth:Tzel.Keys.auth_depth recovered_leaf key_idx path root);
+  let wrong_leaf = leaves.(key_idx + 1) in
+  Alcotest.(check bool) "wrong leaf path rejected" false
+    (Tzel.Merkle.verify_path ~depth:Tzel.Keys.auth_depth wrong_leaf key_idx path root)
+
 (* ══════════════════════════════════════════════════════════════════════
    Merkle
    ══════════════════════════════════════════════════════════════════════ *)
@@ -1595,6 +1617,7 @@ let () =
       Alcotest.test_case "wrong key" `Quick test_wots_wrong_key;
       Alcotest.test_case "keygen deterministic" `Quick test_wots_keygen_deterministic;
       Alcotest.test_case "decompose roundtrip" `Quick test_wots_decompose_roundtrip;
+      Alcotest.test_case "auth leaf binding" `Quick test_wots_signature_binds_to_authenticated_auth_leaf;
     ];
     "merkle", [
       Alcotest.test_case "zero root" `Quick test_merkle_zero_root;

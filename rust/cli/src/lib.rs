@@ -3701,6 +3701,68 @@ mod tests {
         }
     }
 
+    /// Regression: the authenticated auth-tree leaf must be the fold of the
+    /// WOTS+ public key recovered from the signature itself.
+    #[test]
+    fn test_regression_wots_signature_binds_to_authenticated_auth_leaf() {
+        let ask_j = [0x66; 32];
+        let key_idx = 7u32;
+        let msg = hash(b"bind recovered wots pk to auth leaf");
+
+        let (sig, _, digits) = wots_sign(&ask_j, key_idx, &msg);
+
+        let recovered_pk: Vec<F> = (0..WOTS_CHAINS)
+            .map(|j| {
+                let remaining = WOTS_W - 1 - digits[j] as usize;
+                let mut current = sig[j];
+                for _ in 0..remaining {
+                    current = hash1_wots(&current);
+                }
+                current
+            })
+            .collect();
+
+        let recovered_leaf = wots_pk_to_leaf(&recovered_pk);
+        let (auth_root, leaves) = build_auth_tree(&ask_j);
+        let expected_leaf = leaves[key_idx as usize];
+        assert_eq!(
+            recovered_leaf, expected_leaf,
+            "the recovered WOTS+ endpoints must fold to the authenticated auth-tree leaf"
+        );
+
+        let path = auth_tree_path(&leaves, key_idx as usize);
+        let mut current = recovered_leaf;
+        let mut idx = key_idx as usize;
+        for sib in &path {
+            current = if idx & 1 == 1 {
+                hash_merkle(sib, &current)
+            } else {
+                hash_merkle(&current, sib)
+            };
+            idx /= 2;
+        }
+        assert_eq!(
+            current, auth_root,
+            "the Merkle path must authenticate the leaf folded from the recovered WOTS+ key"
+        );
+
+        let wrong_leaf = leaves[key_idx as usize + 1];
+        let mut wrong_current = wrong_leaf;
+        let mut wrong_idx = key_idx as usize;
+        for sib in &path {
+            wrong_current = if wrong_idx & 1 == 1 {
+                hash_merkle(sib, &wrong_current)
+            } else {
+                hash_merkle(&wrong_current, sib)
+            };
+            wrong_idx /= 2;
+        }
+        assert_ne!(
+            wrong_current, auth_root,
+            "a different auth leaf must not verify against the same index/path"
+        );
+    }
+
     /// Group 4: auth_tree_path must produce valid Merkle paths.
     /// Kills: all 7 auth_tree_path mutations (XOR, bounds, division)
     #[test]

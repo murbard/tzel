@@ -69,14 +69,14 @@ Exact deterministic ML-KEM derivation for interoperability:
 
 ### Auth Key Tree
 
-Each address `j` has a Merkle tree of K one-time WOTS+ public keys (K = 2^AUTH_DEPTH, default AUTH_DEPTH = 10, giving 1024 keys per address). The scheme is a Winternitz-style one-time signature inspired by WOTS+ (RFC 8391 / XMSS), instantiated with BLAKE2s and w=4 (133 hash chains: 128 message + 5 checksum). It uses project-specific domain-separated hash functions (`wotsSP__` for chain hashing, `pkfdSP__` for public key folding) rather than the exact XMSS WOTS+ parameterization — the security argument is equivalent (one-time unforgeability from second-preimage resistance of the hash function) but the construction is self-contained. The tree is constructed at address generation time:
+Each address `j` has a Merkle tree of K one-time WOTS+ public keys (K = 2^AUTH_DEPTH, default AUTH_DEPTH = 10, giving 1024 keys per address). The scheme is a Winternitz-style one-time signature inspired by WOTS+ (RFC 8391 / XMSS), instantiated with BLAKE2s and w=4 (133 hash chains: 128 message + 5 checksum). It uses project-specific domain-separated hash functions (`wotsSP__` for chain hashing, `pkfdSP__` for public key folding) rather than the exact XMSS WOTS+ parameterization, so it should be reviewed as a custom WOTS-like construction rather than treated as standardized XMSS/WOTS+. The tree is constructed at address generation time:
 
 1. For each index i in 0..K: `seed_i = H(H(TAG_AUTH_KEY, ask_j), i_felt)`
 2. `pk_i = WOTS+.KeyGen(seed_i)` — 133 chain endpoints derived from seed via BLAKE2s hash chains
 3. `leaf_i = fold(pk_0, pk_1, ..., pk_132)` — sequential left-fold of the 133 chain endpoints using `H_pkfold`
 4. `auth_root_j = MerkleRoot(leaf_0, ..., leaf_{K-1})` — binary Merkle tree using `H_merkle` (see Canonical Encodings for tree structure)
 
-The `auth_root_j` is included in the payment address and bound into commitments via `owner_tag`. Each key is used at most once. When spending, the STARK proves the chosen `pk_i` is a leaf in the tree and verifies the WOTS+ signature inside the circuit. No auth leaf, public key, or signature appears in the public outputs — the STARK proof itself proves spend authorization.
+The `auth_root_j` is included in the payment address and bound into commitments via `owner_tag`. Each key is used at most once. When spending, the STARK verifies the WOTS+ signature inside the circuit, recovers the 133 chain endpoints `pk_0..pk_132`, folds those recovered endpoints into `auth_leaf_i = fold(pk_0, ..., pk_132)`, and proves Merkle membership of that exact `auth_leaf_i` in the auth tree. No auth leaf, public key, or signature appears in the public outputs — the STARK proof itself proves spend authorization.
 
 After exhausting all K keys for an address, generate a new address (increment j).
 
@@ -99,10 +99,12 @@ This ensures the commitment cryptographically binds to the nullifier key materia
 |------------|-----------|--------|
 | **Detection** | `dk_d_j` for one address, or `detect_root` for all addresses | Flag candidate transactions (with tunable false positives) |
 | **Incoming view** | `incoming_seed` | Derive all `d_j`, `dk_v_j`, and `dk_d_j`; decrypt all incoming memos |
-| **Full view** | `(nk, incoming_seed)` | Above + compute nullifiers + track spent/unspent |
+| **Full view** | `(nk, incoming_seed)` | Above + compute nullifiers + track spent/unspent for notes whose address metadata is known |
 | **Spend** | `(nk, ask_base, incoming_seed)` | Above + authorize transactions |
 
 Detection ⊂ incoming view ⊂ full view ⊂ spend. Each level strictly adds capability.
+
+`incoming_seed` and `nk` alone do NOT reconstruct `auth_root_j`, so incoming-view and full-view holders cannot fully validate note spendability from keys alone. Independent note validation requires locally stored address metadata (or exported address records) containing at least `(d_j, auth_root_j, nk_tag_j)` for the recipient addresses being monitored.
 
 ## Payment Address
 
@@ -118,7 +120,7 @@ address_j = (d_j, auth_root_j, nk_tag_j, ek_v_j, ek_d_j)
 - `ek_v_j` — ML-KEM encapsulation key (~1184 bytes): sender encrypts memos with this
 - `ek_d_j` — ML-KEM encapsulation key (~1184 bytes): sender creates detection clues with this
 
-Multiple addresses can be generated from one account (varying j). Each address has unrelated `d_j` values. ML-KEM ciphertexts are randomized per encapsulation, so observers cannot link two transactions to the same recipient.
+Multiple addresses can be generated from one account (varying j). Each address has unrelated `d_j` values. ML-KEM ciphertexts are randomized per encapsulation, so there is no deterministic ciphertext linkage between two notes sent to the same address. Stronger recipient unlinkability should be treated as relying on additional key-anonymity assumptions of the chosen KEM.
 
 For circuit purposes, `d_j`, `auth_root_j`, and `nk_tag_j` matter. The ML-KEM keys are application-layer.
 
@@ -179,8 +181,9 @@ WOTS+ signature verification happens inside the STARK. No auth leaves, public ke
    - `cm_i = H_commit(d_j_i, v_i, rcm_i, owner_tag_i)`
    - Merkle membership of `cm_i` at position `pos_i` against `root` (commitment tree)
    - `nf_i = H_nf(nk_spend_i, H_nf(cm_i, pos_i))`
-   - Merkle membership of `auth_leaf_i` at position `key_idx_i` against `auth_root_i` (auth key tree)
    - WOTS+ signature verification: the circuit computes the sighash from the public outputs, decomposes it into 128 base-4 digits + 5 checksum digits, then for each of the 133 chains verifies `H_wots^{w-1-digit}(sig_j) == pk_j`. The digits are NOT witness data — they are deterministically derived inside the circuit.
+   - `auth_leaf_i = fold(pk_0, ..., pk_132)` from those recovered chain endpoints
+   - Merkle membership of that exact `auth_leaf_i` at position `key_idx_i` against `auth_root_i` (auth key tree)
 2. All nullifiers pairwise distinct
 3. For both outputs:
    - `owner_tag_out = H_owner(auth_root_out, nk_tag_out)` where `auth_root_out` and `nk_tag_out` are private inputs from the recipient's payment address
@@ -267,7 +270,7 @@ sighash = fold(0x02, auth_domain, root, nf_0, ..., nf_{N-1}, v_pub, recipient_id
 
 The circuit-type tag prevents cross-circuit replay (a transfer signature cannot be used for an unshield). `auth_domain` prevents replay across mirrored deployments, forks, or verifier migrations that would otherwise share the same Merkle root history. Nullifier uniqueness still prevents replay of an already-consumed authorization on the same deployment.
 
-**Still out of scope:** `expiry` and per-transaction `nonce` are not currently included in the sighash. They remain higher-level anti-withholding / anti-latency controls, not part of the base spend authorization proof.
+**Still out of scope:** `expiry` and per-transaction `nonce` are not currently included in the sighash. As a result, a valid authorization can remain usable until one of its nullifiers is consumed. These remain higher-level anti-withholding / anti-latency controls, not part of the base spend authorization proof.
 
 ### Change output handling (unshield)
 
@@ -298,6 +301,17 @@ encrypted_data   = ChaCha20-Poly1305(key=H(ss_v), nonce=0, plaintext=(v || rseed
 ```
 
 The detection server (with `dk_d_j`) decapsulates `ct_d`, recomputes `tag_u16`, and compares it to the posted little-endian `tag` field. True matches always succeed. Non-matches succeed with probability 2^(-k) (false positives from ML-KEM's implicit rejection).
+
+## Wallet Note Acceptance
+
+Detection and successful memo decryption are only candidate filters. A wallet MUST accept an incoming note as belonging to one of its addresses only if it can match the note against locally known address metadata and recompute the commitment exactly:
+
+1. Select a local address record containing `(d_j, auth_root_j, nk_tag_j)` for the candidate recipient address.
+2. Decrypt the note to obtain `(v, rseed, memo)`.
+3. Recompute `rcm = H(H(TAG_RCM), rseed)`.
+4. Recompute `owner_tag = H_owner(auth_root_j, nk_tag_j)`.
+5. Recompute `cm_expected = H_commit(d_j, v, rcm, owner_tag)`.
+6. Accept the note only if `cm_expected == cm` from chain data. Otherwise reject it as malformed, non-local, or unspendable.
 
 ## User Memo
 

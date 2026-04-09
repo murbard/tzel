@@ -19,7 +19,7 @@ This document is informative, not normative. The canonical protocol rules and en
 - **Transaction shape and timing are public:** observers still learn transaction type, ordering, and whether there is a change note.
 - **Delegated provers can link same-address spends:** the prover sees per-address values such as `nk_spend_j` and `auth_root_j`. If the same service proves multiple spends from the same address, it can link them.
 - **Detection tags are only a filtering aid:** the false-positive rate `2^(-k)` is not, by itself, a meaningful privacy guarantee.
-- **No outgoing viewing in the current protocol:** full-view capability means incoming viewing plus nullifier/spent-state tracking. There is no outgoing-view ciphertext in the current scheme.
+- **No outgoing viewing in the current protocol:** full-view capability means incoming viewing plus nullifier/spent-state tracking for notes whose address metadata is known. There is no outgoing-view ciphertext in the current scheme.
 
 ## Honest-Sender and Ciphertext Caveats
 
@@ -27,6 +27,7 @@ This document is informative, not normative. The canonical protocol rules and en
 - **Viewing ciphertext correctness is not proven in-circuit:** the proof binds ciphertext bytes, not that `ct_v` / `encrypted_data` decrypt to the same `(v, rseed, memo)` used in the commitment.
 - **Recipient address fields are not self-authenticating to the sender:** shield and transfer outputs can be created with malformed `auth_root` / `nk_tag`, producing unspendable notes. This is sender self-griefing, not theft.
 - **Memo integrity is transport integrity, not semantic correctness:** `memo_ct_hash` prevents relayer mutation of posted note ciphertext fields, but does not prove that the sender encrypted the intended plaintext.
+- **Wallets must recompute commitments before showing funds as received:** detection and decryption alone are not enough; note acceptance should be based on exact recomputation of `cm` from local address metadata and decrypted plaintext.
 
 ## Wallet and One-Time-Key Safety
 
