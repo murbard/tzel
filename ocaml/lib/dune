@@ -1,0 +1,6 @@
+(library
+ (name tzel)
+ (foreign_stubs (language c) (names blake2s_stubs mlkem_stubs))
+ (c_library_flags
+  -lmlkem768)
+ (libraries mirage-crypto hex cstruct yojson))

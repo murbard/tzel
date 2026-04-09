@@ -1,1 +1,13 @@
-target
+target/
+ocaml/_build/
+ocaml/vendor/mlkem-native/_build/
+ocaml/vendor/mlkem-native/test/build/config.mk
+ocaml/vendor/mlkem-native/test/build/libmlkem.a
+ocaml/vendor/mlkem-native/test/build/libmlkem512.a
+ocaml/vendor/mlkem-native/test/build/libmlkem1024.a
+ocaml/vendor/mlkem-native/test/build/mlkem512/
+ocaml/vendor/mlkem-native/test/build/mlkem768/
+ocaml/vendor/mlkem-native/test/build/mlkem1024/
+rust/cli/alice.json
+rust/cli/bob.json
+rust/cli/mutants.out*/

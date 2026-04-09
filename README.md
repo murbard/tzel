@@ -1,10 +1,10 @@
 # StarkPrivacy
 
-![StarkPrivacy](hero.jpeg)
+![StarkPrivacy](docs/hero.jpeg)
 
 **Post-quantum private transactions with STARK proofs.**
 
-> **WARNING: This project is under active development. Neither the cryptographic scheme nor the implementation should be assumed secure. Do not use for real value. The protocol design is evolving — see spec.md for the current state.**
+> **WARNING: This project is under active development. Neither the cryptographic scheme nor the implementation should be assumed secure. Do not use for real value. The protocol design is evolving — see `specs/spec.md` for the current state.**
 
 Privacy on blockchains today relies on elliptic curve cryptography that quantum computers will break. StarkPrivacy replaces every elliptic curve with post-quantum alternatives — BLAKE2s hashing, ML-KEM-768 lattice-based encryption, WOTS+ (w=4) spend authorization verified inside the STARK, and STARKs — while keeping proofs small (~295 KB) and verification instant (~35 ms).
 
@@ -30,9 +30,9 @@ A UTXO-based private transaction system where:
 
 ```bash
 # Build everything
-cd cli && cargo build --release
+cd rust/cli && cargo build --release
 cd ../reprover && cargo build --release
-cd ..
+cd .. && scarb build
 
 # Run the ledger with proof verification (production mode)
 # If you launch it from elsewhere, also pass --executables-dir /abs/path/to/target/dev
@@ -46,8 +46,8 @@ cli/target/release/sp-client scan -l http://localhost:8080
 cli/target/release/sp-client balance
 
 # Run the STARK proofs (requires ~13 GB RAM)
-scarb build
 ./bench.sh
+cd ..
 ```
 
 > **WARNING:** The ledger now refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `target/dev`). `--trust-me-bro` is never appropriate for real value.
@@ -124,37 +124,29 @@ nf = H_nf(nk_spend, H_nf(cm, pos))      -- nullifier (prevents double-spend)
 ## Project structure
 
 ```
-src/                    Cairo circuits (constraint verification only)
-  blake_hash.cairo      BLAKE2s with 10 personalized IVs
-  merkle.cairo          Merkle tree + auth tree verification
-  shield.cairo          Shield circuit (0->1)
-  transfer.cairo        Transfer circuit (N->2) with WOTS+ verification
-  unshield.cairo        Unshield circuit (N->change+withdrawal) with WOTS+
-  run_shield.cairo      Parameterized shield entry point
-  run_transfer.cairo    Parameterized transfer entry point
-  run_unshield.cairo    Parameterized unshield entry point
-
-reprover/               Two-level recursive STARK prover (Rust)
-
-cli/                    CLI client + HTTP ledger
-  src/bin/sp_ledger.rs  HTTP ledger server
-  src/bin/sp_client.rs  CLI wallet
-  src/lib.rs            Shared crypto
-
-spec.md                 Protocol specification
-bench.sh                Benchmark script
+docs/                   Site assets
+specs/                  Protocol spec and shared test vectors
+  spec.md               Protocol specification
+  test_vectors/         Canonical wire/reference vectors
+  ocaml_vectors/        Cross-implementation vector docs and fixtures
+rust/                   Rust/Cairo reference implementation
+  src/                  Cairo circuits
+  reprover/             Two-level recursive STARK prover
+  cli/                  CLI client + HTTP ledger
+  bench.sh              Benchmark script
+ocaml/                  Independent OCaml implementation
 ```
 
 ## Running benchmarks
 
 ```bash
-./bench.sh                # Recursive proofs (ZK, ~295 KB)
-./bench.sh --depth 16     # Faster testing with smaller Merkle tree
+cd rust && ./bench.sh                # Recursive proofs (ZK, ~295 KB)
+cd rust && ./bench.sh --depth 16     # Faster testing with smaller Merkle tree
 ```
 
 ## Known limitations
 
-See spec.md for a complete list. Key items:
+See `specs/spec.md` for a complete list. Key items:
 
 - **Active development** -- protocol and implementation are not audited for production use
 - **Reference ledger is localhost-only** -- `sp-ledger` is a demo/reference verifier for the protocol checks, not a real authenticated public-balance server

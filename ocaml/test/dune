@@ -1,0 +1,14 @@
+(test
+ (name test_main)
+ (modules test_main)
+ (libraries tzel alcotest hex mirage-crypto))
+
+(executable
+ (name test_vectors)
+ (modules test_vectors)
+ (libraries tzel alcotest hex yojson))
+
+(executable
+ (name gen_vectors)
+ (modules gen_vectors)
+ (libraries tzel hex yojson))

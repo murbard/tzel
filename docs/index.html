@@ -588,9 +588,10 @@
           TzEL
         </a>
         <div class="nav-links">
+          <a href="#why">Why PQ</a>
           <a href="#features">Features</a>
-          <a href="https://github.com/murbard/starkprivacy/blob/main/spec.md" target="_blank" rel="noreferrer">Spec</a>
-          <a href="https://github.com/murbard/starkprivacy" class="btn btn-primary" target="_blank" rel="noreferrer">GitHub</a>
+          <a href="https://github.com/murbard/tzel/blob/main/specs/spec.md" target="_blank" rel="noreferrer">Spec</a>
+          <a href="https://github.com/murbard/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">GitHub</a>
         </div>
       </div>
     </nav>
@@ -603,11 +604,53 @@
           Private transactions for Tezos with no elliptic curves anywhere in the stack. Every cryptographic choice is built to survive a quantum computer.
         </p>
         <div class="hero-actions">
-          <a href="https://github.com/murbard/starkprivacy" class="btn btn-primary" target="_blank" rel="noreferrer">View on GitHub</a>
-          <a href="https://github.com/murbard/starkprivacy/blob/main/spec.md" class="btn btn-outline" target="_blank" rel="noreferrer">Read the spec</a>
+          <a href="https://github.com/murbard/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">View on GitHub</a>
+          <a href="https://github.com/murbard/tzel/blob/main/specs/spec.md" class="btn btn-outline" target="_blank" rel="noreferrer">Read the spec</a>
         </div>
       </div>
     </section>
+
+    <!-- ════ Why Post-Quantum ════ -->
+    <div class="features" id="why">
+      <div class="feature">
+        <div>
+          <h3>Why post-quantum?</h3>
+          <p>Quantum computers capable of breaking elliptic curve cryptography are no longer a theoretical concern. Google's Willow chip crossed the quantum error correction threshold in 2024. NIST finalized post-quantum cryptography standards the same year. The NSA requires all national security systems to migrate to post-quantum algorithms by 2035.</p>
+          <p>Every deployed privacy protocol&mdash;Zcash, Tornado Cash, Aztec, Penumbra&mdash;relies on elliptic curves for note encryption, key agreement, or signatures. When those curves break, the transaction graphs will be fully exposed retroactively.</p>
+        </div>
+        <div class="feature-visual">
+          <span class="hl">2024</span>&nbsp; NIST finalizes PQC standards<br>
+          <span class="hl">2024</span>&nbsp; Google Willow: error correction threshold<br>
+          <span class="hl">2035</span>&nbsp; NSA CNSA 2.0 migration deadline<br>
+          <span class="hl">203x</span>&nbsp; ~1/3 of experts: CRQC >50% likely<br>
+          <br>
+          <span class="dim">Mosca's theorem: if migration time +</span><br>
+          <span class="dim">data shelf life > time to CRQC,</span><br>
+          <span class="dim">you are <span class="hl">already too late</span>.</span>
+        </div>
+      </div>
+
+      <div class="feature">
+        <div>
+          <h3>Why now?</h3>
+          <p>Adversaries are already collecting encrypted blockchain data for future decryption. The NSA, CISA, and FBI have <a href="https://www.cisa.gov/quantum" style="color: var(--blue-light); text-decoration: underline;" target="_blank" rel="noreferrer">jointly warned</a> about this "harvest now, decrypt later" strategy.</p>
+          <p>For financial privacy, the shelf life of transaction data is effectively infinite. Shielded notes on systems using elliptic-curve Diffie-Hellman&mdash;like Zcash Orchard's Pallas-curve DH for note encryption&mdash;will have their encrypted memos and note values exposed once a quantum computer solves the discrete log. Address reuse compounds the damage: shared diversified keys let an attacker correlate transactions and partially reconstruct the payment graph.</p>
+          <p>The time to deploy post-quantum privacy is before the data is harvested, not after the quantum computer arrives.</p>
+        </div>
+        <div class="feature-visual">
+          <span class="dim">today:</span><br>
+          &nbsp;&nbsp;adversary records <span class="hl">encrypted tx data</span><br>
+          <br>
+          <span class="dim">quantum era:</span><br>
+          &nbsp;&nbsp;break EC &rarr; recover DH shared secrets<br>
+          &nbsp;&nbsp;&rarr; decrypt note values and memos<br>
+          &nbsp;&nbsp;&rarr; <span class="hl">link addresses, correlate payments</span><br>
+          <br>
+          <span class="dim">with TzEL:</span><br>
+          &nbsp;&nbsp;no EC anywhere &rarr; <span class="hl">nothing to decrypt</span>
+        </div>
+      </div>
+    </div>
 
     <section class="numbers">
       <div class="numbers-inner">
@@ -665,8 +708,8 @@
       <div class="feature">
         <div>
           <h3>No elliptic curves.<br>Anywhere.</h3>
-          <p>Every privacy system deployed today relies on elliptic curve cryptography that a sufficiently large quantum computer will break. The "harvest now, decrypt later" threat makes this urgent even before such hardware exists.</p>
-          <p>TzEL replaces the entire stack: BLAKE2s for hashing, ML-KEM-768 (NIST-standardized lattice KEM) for encryption, hash-based one-time signatures for spend authorization, and STARKs for proofs. Fund safety comes from the hash-based spend path and STARK proofs; note confidentiality and recipient privacy additionally rely on ML-KEM and authenticated encryption.</p>
+          <p>TzEL doesn't patch curves with a post-quantum layer&mdash;it eliminates them entirely. BLAKE2s for hashing, ML-KEM-768 for encryption, hash-based one-time signatures for spend authorization, and STARKs for proofs.</p>
+          <p>Fund safety relies on hash collision resistance and STARK soundness. Note confidentiality relies on ML-KEM (NIST FIPS 203) and authenticated encryption. No component depends on the hardness of discrete log or factoring.</p>
         </div>
         <div class="feature-visual">
           <span class="dim">commitment</span>&nbsp; = <span class="hl">BLAKE2s</span>(d, v, rcm, tag)<br>
@@ -720,14 +763,14 @@
         <h2>Built in the open</h2>
         <p>TzEL is under active development. The protocol spec, Cairo circuits, Rust wallet, and STARK prover are all open source.</p>
         <div class="cta-actions">
-          <a href="https://github.com/murbard/starkprivacy" class="btn btn-primary" target="_blank" rel="noreferrer">GitHub Repository</a>
-          <a href="https://github.com/murbard/starkprivacy/blob/main/spec.md" class="btn btn-outline" target="_blank" rel="noreferrer">Protocol Specification</a>
+          <a href="https://github.com/murbard/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">GitHub Repository</a>
+          <a href="https://github.com/murbard/tzel/blob/main/specs/spec.md" class="btn btn-outline" target="_blank" rel="noreferrer">Protocol Specification</a>
         </div>
       </div>
     </section>
 
     <footer>
-      <p>TzEL &mdash; Tezos Encrypted Ledger &mdash; <a href="https://github.com/murbard/starkprivacy" target="_blank" rel="noreferrer">github.com/murbard/starkprivacy</a></p>
+      <p>TzEL &mdash; Tezos Encrypted Ledger &mdash; <a href="https://github.com/murbard/tzel" target="_blank" rel="noreferrer">github.com/murbard/tzel</a></p>
     </footer>
   </div>
 </body>
