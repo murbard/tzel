@@ -633,9 +633,9 @@
       <div class="feature">
         <div>
           <h3>Why now?</h3>
-          <p>Adversaries are already collecting encrypted blockchain data for future decryption. The NSA, CISA, and FBI have <a href="https://www.cisa.gov/quantum" style="color: var(--blue-light); text-decoration: underline;" target="_blank" rel="noreferrer">jointly warned</a> about this "harvest now, decrypt later" strategy.</p>
-          <p>For financial privacy, the shelf life of transaction data is effectively infinite. Shielded notes on systems using elliptic-curve Diffie-Hellman&mdash;like Zcash Orchard's Pallas-curve DH for note encryption&mdash;will have their encrypted memos and note values exposed once a quantum computer solves the discrete log. Address reuse compounds the damage: shared diversified keys let an attacker correlate transactions and partially reconstruct the payment graph.</p>
-          <p>The time to deploy post-quantum privacy is before the data is harvested, not after the quantum computer arrives.</p>
+          <p>Adversaries can collect encrypted blockchain data today and hold it for future decryption, a "harvest now, decrypt later" threat U.S. agencies have already warned about.</p>
+          <p>For financial privacy, that risk does not expire. If quantum computers break the cryptography protecting Zcash, anyone who knows your shielded address could later recover sensitive details from payments sent to you, including amounts and memos. Zcash's own spec and post-quantum work treat known addresses as the key privacy boundary.</p>
+          <p>Reusing or publishing an address makes the damage worse by letting attackers connect more of your incoming payment history over time. The time to deploy post-quantum privacy is before the data is harvested, not after the breakthrough.</p>
         </div>
         <div class="feature-visual">
           <span class="dim">today:</span><br>

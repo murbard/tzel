@@ -2,6 +2,8 @@
 
 **WARNING: This protocol is under active development. Neither the design nor the implementation should be assumed secure. Do not use for real value.**
 
+This document is the normative protocol and encoding specification. Security and operational commentary is collected in `specs/security.md`. Design rationale is collected in `specs/rationale.md`.
+
 ## Overview
 
 A UTXO-based private transaction system with:
@@ -52,7 +54,7 @@ master_sk
 
 The current protocol does NOT include an outgoing viewing key or a sender-recovery ciphertext. Full-view capability means "incoming viewing plus nullifier / spent-state tracking", not "recover sent notes".
 
-Exact deterministic ML-KEM derivation in the current implementation:
+Exact deterministic ML-KEM derivation for interoperability:
 
 1. Encode address index `j` as `j_felt`: a 32-byte little-endian felt with the low 4 bytes set to `u32_le(j)` and the remaining 28 bytes zero.
 2. `view_root = H(TAG_VIEW, incoming_seed)`
@@ -63,7 +65,7 @@ Exact deterministic ML-KEM derivation in the current implementation:
 7. `detect_h1 = H(TAG_MLKEM_D, detect_root)`
 8. `detect_h2 = H(detect_h1, j_felt)`
 9. `seed_d_j = detect_h2 || H(TAG_MLKEM_D2, detect_h2)` (64 bytes total)
-10. `(ek_v_j, dk_v_j)` and `(ek_d_j, dk_d_j)` are derived deterministically from those 64-byte seeds using the reference ML-KEM-768 seed-to-keypair routine (`DecapsulationKey::from_seed` in this codebase). Interoperable implementations MUST match that routine exactly.
+10. `(ek_v_j, dk_v_j)` and `(ek_d_j, dk_d_j)` are derived deterministically from those 64-byte seeds. Interoperable implementations MUST match the shared vectors in `specs/ocaml_vectors/protocol_v1.json`.
 
 ### Auth Key Tree
 
@@ -142,53 +144,28 @@ nf = H_nf(nk_spend, H_nf(cm, pos))
 
 This prevents an attacker from creating two identical commitments (same d_j, v, rcm, owner_tag) that resolve to a single nullifier. With position in the nullifier, each tree insertion produces a unique nullifier even for duplicate commitments.
 
-### Why Owner Tags
-
-Without owner tags, the commitment `cm = H(d_j, v, rcm)` would not bind to the nullifier key. An attacker could:
-
-1. Observe `cm` on-chain
-2. Choose an arbitrary `nk'`
-3. Compute `nf' = H(nk', cm)` — a fresh, unused nullifier
-4. Produce a valid proof showing `nf'` has never been spent
-
-This allows unlimited double-spending from a single note. The owner tag fix binds `nk_spend -> nk_tag -> owner_tag -> cm`, creating a unique chain from the nullifier key to the commitment.
-
 ## Transaction Types
 
 ### Shield (public -> private)
 
 **Public outputs:** `[v_pub, cm_new, sender_id, memo_ct_hash]`
 
-Note: `auth_root` does NOT appear in the public outputs. It is a private input used only to compute `owner_tag`.
-
-`sender_id` is the canonical felt encoding of the submitted public sender account identifier. In the current reference ledger:
-
-```text
-sender_id = H(UTF8(sender_string))
-```
-
-using unpersonalized BLAKE2s-256 truncated to 251 bits. The string itself is not part of the proof public outputs.
+`sender_id` is defined in [Public Account Identifier Encoding](#public-account-identifier-encoding). `auth_root` does NOT appear in the public outputs; it is a private input used only to compute `owner_tag`.
 
 **Circuit constraints:**
 1. `rcm = H(H(TAG_RCM), rseed)`
 2. `owner_tag = H_owner(auth_root, nk_tag)` where both `auth_root` and `nk_tag` are private inputs from the recipient's payment address
 3. `cm_new = H_commit(d_j, v_pub, rcm, owner_tag)`
 
-Note: the circuit cannot verify that `auth_root` or `nk_tag` are correctly derived because the sender does not have the recipient's secrets. Incorrect values create an unspendable note — the deposited tokens are permanently locked. This is a sender-griefing risk: a malicious or buggy sender can burn their deposit by using incorrect recipient address components. The spending circuits (transfer/unshield) enforce the full derivation chain when the note is later spent.
-
 `memo_ct_hash` is computed client-side as `H(ct_d || tag || ct_v || encrypted_data)` — covering ALL on-chain note data — and passed into the circuit as a public input.
 
-**Contract / ledger checks:** proof valid, `H(UTF8(submitted_sender_string)) == sender_id`, `H(posted_memo_calldata) == memo_ct_hash`.
+**Contract / ledger checks:** proof valid, sender binding per [Shield sender binding](#shield-sender-binding), `H(posted_memo_calldata) == memo_ct_hash`.
 
 **State changes:** deduct `v_pub` from sender, append `cm_new` to T.
-
-The reference CLI ledger uses submitted sender strings as public balance-account identifiers. This is a localhost demo / reference implementation of the consensus checks, not a real authenticated public-balance service. A real chain deployment would typically replace this with chain-native caller authentication, but the byte encoding and verifier check MUST then be specified exactly.
 
 ### Transfer (N->2, where 1 <= N <= 16)
 
 Consumes N private notes and creates exactly 2 new private notes. Handles splits (N=1), standard transfers (N=2), and consolidations (N>2) with a single circuit. N is a runtime parameter, not a program parameter — the program hash is the same for all N.
-
-**N is not private.** The number of published nullifiers reveals the input count. This is inherent to per-input nullifier publication.
 
 **Public outputs:** `[auth_domain, root, nf_0..nf_{N-1}, cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2]`
 
@@ -208,7 +185,6 @@ WOTS+ signature verification happens inside the STARK. No auth leaves, public ke
 3. For both outputs:
    - `owner_tag_out = H_owner(auth_root_out, nk_tag_out)` where `auth_root_out` and `nk_tag_out` are private inputs from the recipient's payment address
    - `cm_out = H_commit(d_j_out, v_out, rcm_out, owner_tag_out)`
-   - Note: same caveat as shield — incorrect `auth_root_out` or `nk_tag_out` creates an unspendable output (self-griefing by the spender)
 4. `sum(v_inputs) = v_1 + v_2` (in u128)
 5. All values are u64 (implicit range check)
 
@@ -220,13 +196,7 @@ Consumes N private notes, releases `v_pub` to a public address, and optionally c
 
 **Public outputs:** `[auth_domain, root, nf_0..nf_{N-1}, v_pub, recipient_id, cm_change, memo_ct_hash_change]`
 
-`recipient_id` is the canonical felt encoding of the submitted public recipient account identifier. In the current reference ledger:
-
-```text
-recipient_id = H(UTF8(recipient_string))
-```
-
-using unpersonalized BLAKE2s-256 truncated to 251 bits.
+`recipient_id` is defined in [Public Account Identifier Encoding](#public-account-identifier-encoding).
 
 `cm_change` and `memo_ct_hash_change` are 0 if no change output.
 
@@ -239,11 +209,7 @@ using unpersonalized BLAKE2s-256 truncated to 251 bits.
 4. If no change: all change witness data constrained to zero (`v_change`, `d_j_change`, `rseed_change`, `auth_root_change`, `nk_tag_change`, `memo_ct_hash_change` = 0) to eliminate prover malleability
 5. `sum(v_inputs) = v_pub + v_change`
 
-**Contract / ledger checks:** proof valid. Verify `H(UTF8(submitted_recipient_string)) == recipient_id`, credit `v_pub` to that recipient account, append `cm_change` to T (if nonzero). No signature verification needed — the STARK proof proves spend authorization.
-
-### Why N->2 eliminates dummy notes
-
-With N=1 supported natively, there is no second input slot to fill. The only "dummies" are zero-value *outputs* (when change is exactly zero), which are fresh commitments created on the fly — no pre-shielding required.
+**Contract / ledger checks:** proof valid. Verify recipient binding per [Public Account Identifier Encoding](#public-account-identifier-encoding), credit `v_pub` to that recipient account, append `cm_change` to T (if nonzero). No signature verification needed — the STARK proof proves spend authorization.
 
 ## Contract Consensus Rules
 
@@ -275,7 +241,7 @@ For each output note, the contract MUST verify `H(posted_note_calldata) == memo_
 
 ### Shield sender binding
 
-For shield transactions, the verifier environment MUST bind the submitted public sender account to the proved `sender_id`. In the current reference ledger this means verifying `H(UTF8(submitted_sender_string)) == sender_id`. A smart-contract deployment may instead bind `sender_id` to `msg.sender`, but the encoding rule MUST be exact.
+For shield transactions, the verifier environment MUST bind the submitted public sender account to the proved `sender_id` using the exact rule defined in [Public Account Identifier Encoding](#public-account-identifier-encoding).
 
 ### Spend authorization (all spending transactions)
 
@@ -315,18 +281,9 @@ The contract appends commitments to the tree in sequential order (each new commi
 
 1. User constructs the transaction, computing the WOTS+ signature over the sighash with `sk_i` for each input.
 2. User gives the prover per-input: `(nk_spend_j, auth_root_j, wots_sig_i, auth_tree_path_i, d_j, v, rseed, commitment_tree_path, pos)`, plus output data including `auth_root` and `nk_tag` for output notes.
-3. Prover generates the STARK proof (expensive, ~30-50 seconds). The WOTS+ signature is verified inside the circuit.
+3. Prover generates the STARK proof. The WOTS+ signature is verified inside the circuit.
 4. Prover returns proof to user. Public outputs contain only `[auth_domain, root, nullifiers, commitments, memo hashes]` — no auth leaves, public keys, or signatures.
 5. Transaction (proof + note data) submitted on-chain. No separate signatures or public keys needed.
-
-The prover sees `nk_spend_j` (per-address nullifier key) and the WOTS+ signature, but NOT `ask_j` or any WOTS+ secret key. The prover:
-
-- **Cannot redirect funds** — the WOTS+ signature is bound to specific output commitments via the sighash. A prover who substitutes different outputs cannot produce a valid proof because the signature verification inside the STARK would fail.
-- **Cannot forge a signature** — doesn't have `sk_i`
-- **Cannot link spends on-chain** — no auth leaves, public keys, or signatures appear in public outputs, so on-chain observers cannot link spends. However, the delegated prover itself sees `nk_spend_j` and `auth_root_j`, which are per-address values. If the same address is reused for multiple notes and the same proving service handles later spends, the prover can link those spends to the same address context. Unlinkability against the prover depends on address rotation and prover diversity.
-- **Cannot spend other notes** — doesn't have witness data for notes not involved in this transaction
-
-Both self-prove and delegated modes produce identical on-chain outputs.
 
 ## Detection (Fuzzy Message Detection)
 
@@ -341,10 +298,6 @@ encrypted_data   = ChaCha20-Poly1305(key=H(ss_v), nonce=0, plaintext=(v || rseed
 ```
 
 The detection server (with `dk_d_j`) decapsulates `ct_d`, recomputes `tag_u16`, and compares it to the posted little-endian `tag` field. True matches always succeed. Non-matches succeed with probability 2^(-k) (false positives from ML-KEM's implicit rejection).
-
-Detection assumes honest senders. A malicious sender can bypass detection by submitting bogus `ct_d`. The recipient falls back to scanning with `dk_v`.
-
-Precision `k` should NOT be claimed to provide "plausible deniability" without modeling network throughput, user activity, and time aggregation. The false positive rate 2^(-k) is a technical parameter, not a privacy guarantee.
 
 ## User Memo
 
@@ -363,11 +316,6 @@ The memo is end-to-end encrypted — only the recipient (with `dk_v`) can read i
 Each circuit includes a `memo_ct_hash` per output note in its public outputs. This is a hash of ALL on-chain note data (`H(ct_d || tag || ct_v || encrypted_data)`), computed **client-side** before proving. The circuit does not compute it — it simply passes it through as a public output. Including the detection ciphertext and tag prevents a relayer from swapping detection data to redirect note discovery.
 
 The on-chain contract verifies `H(posted_calldata) == memo_ct_hash` for each output note. If a malicious relayer or sequencer swaps the encrypted memo data in transit, the hash won't match and the contract rejects the transaction.
-
-This prevents:
-
-- **Memo spoofing**: a relayer replacing "Payment for invoice #42" with "Send your seed phrase to evil.com"
-- **Selective censorship**: a relayer stripping memo data while keeping the proof valid
 
 ## On-Chain Note Data
 
@@ -597,30 +545,3 @@ where:
 - `H_memo` uses the `memoSP__` personalization, truncated to 251 bits
 
 The on-chain contract verifies that hashing the posted note data (exactly these four fields in this order) produces the `memo_ct_hash` from the proof's public outputs. The commitment (`cm`) is NOT included in this hash — it is verified separately via the commitment binding check.
-
-## Security Properties
-
-- **Balance:** u64 values, u128 arithmetic, exact equality. No overflow or wraparound.
-- **Double-spend:** Nullifier set on-chain (contract-enforced globally, circuit-enforced per-tx). Position-dependent `nf = H(nk_spend, H(cm, pos))` ensures unique nullifiers even for duplicate commitments.
-- **Nullifier binding:** `nk_spend -> nk_tag -> owner_tag -> cm` chain. The commitment cryptographically binds to the nullifier key material via second-preimage resistance of `H_commit`.
-- **Spend authority:** The STARK proof proves both knowledge of `nk_spend` and a valid WOTS+ signature over the sighash. The WOTS+ signature is verified inside the circuit. No external signature verification is needed.
-- **Spend unlinkability:** WOTS+ signature verification and auth tree membership are entirely inside the STARK. No auth leaves, public keys, or signatures appear in the public outputs. The sender who created the note knows `auth_root` but cannot extract any information from on-chain data to link back to it.
-- **Privacy:** Commitments are hiding (randomness `rcm`). Nullifiers unlinkable to commitments (different hash domains, `nk_spend` is private). Per-address diversification prevents cross-address linking.
-- **Post-quantum:** BLAKE2s (hash), ML-KEM-768 (memos/detection), WOTS+ w=4 (spend authorization, verified in-STARK), STARKs (proofs). No elliptic curves. No lattice-based signatures.
-- **Zero-knowledge:** Two-level recursive proofs. Circuit layer has ZK blinding. Single-level mode is debug-only (not ZK).
-
-## Known Limitations
-
-- **WOTS+ key reuse compromises funds:** Each WOTS+ key MUST be used at most once. Reusing a one-time key across two transactions reveals enough hash chain preimages to allow an attacker to forge signatures and steal funds. This is fundamentally different from ML-DSA (which is many-time secure) — WOTS+ key reuse is a critical security failure, not merely a linkability issue. Users MUST rotate to a new key index for every spend and generate a new address before exhausting all K keys.
-- **One-time key exhaustion:** Each address has K = 2^AUTH_DEPTH one-time WOTS+ keys. After exhaustion, the address cannot be used for further spends. Users should rotate addresses before this limit.
-- **Auth tree generation cost:** Generating auth_root requires K WOTS+ key derivations at address creation time. With AUTH_DEPTH=10 (K=1024), this is fast (pure BLAKE2s hash chains). Higher depths increase this cost linearly.
-- **Detection is honest-sender:** Malicious sender can bypass detection. Recipient falls back to viewing key scanning.
-- **Prover learns nk_spend_j:** Can compute the nullifier for the specific note being spent. This is equivalent to public info (NF_set is on-chain). The prover does NOT learn `nk` (the account root) and cannot compute nullifiers for other addresses.
-- **ML-KEM key anonymity (ANO-CCA):** We rely on Kyber's key anonymity property, proven separately from IND-CCA2. Should be cited explicitly in production.
-- **Detection statistics:** False positive rate 2^(-k) does not automatically provide plausible deniability. Depends on network throughput and user activity.
-- **N is not private:** The number of published nullifiers reveals the input count.
-- **No outgoing viewing in the current protocol:** The protocol does not currently carry an outgoing-view ciphertext or an `ovk`-based recovery path. Full-view capability tracks incoming notes plus nullifiers / spent state only.
-- **Malformed viewing ciphertexts (honest-sender):** The circuit proves commitments and memo hashes, but does NOT prove that `ct_v` / `encrypted_data` actually decrypt to the same `(v, rseed, memo)` used for the commitment. A malicious sender can create a valid on-chain note that the recipient cannot decrypt or that decrypts to inconsistent values. This is analogous to the detection bypass — honest-sender behavior is assumed. The memo-hash check binds ciphertext bytes (preventing relay tampering) but not semantic correctness of the encryption.
-- **Reference CLI ledger is not a public account system:** `sp-ledger` is a localhost demo / reference implementation of the proof-verification and state-transition checks. Its string-based public "accounts" are placeholders for a real verifier environment, not a secure multi-user API.
-- **Wallet state is security-critical for WOTS+ safety:** The wallet tracks per-address WOTS+ key indices locally. Unlike multi-use signature schemes, the chain cannot enforce one-time use of hidden auth leaves without revealing metadata. This means wallet state consistency across backups, concurrent devices, and failed submissions is part of the security boundary. A wallet restored from a stale backup may reuse a WOTS+ key that was already consumed, leading to catastrophic key compromise. Implementations MUST serialize wallet state durably before submitting transactions.
-- **Delegated prover can link same-address spends:** The prover sees `nk_spend_j` and `auth_root_j`, which are per-address values. If the same proving service handles multiple spends from the same address, it can link them. On-chain unlinkability is preserved regardless. See Delegated Proving section for details.

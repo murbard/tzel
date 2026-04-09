@@ -129,6 +129,8 @@ nf = H_nf(nk_spend, H_nf(cm, pos))      -- nullifier (prevents double-spend)
 docs/                   Site assets
 specs/                  Protocol spec and shared test vectors
   spec.md               Protocol specification
+  security.md           Security notes and operational caveats
+  rationale.md          Design rationale
   test_vectors/         Canonical wire/reference vectors
   ocaml_vectors/        Cross-implementation vector docs and fixtures
 rust/                   Rust/Cairo reference implementation
@@ -148,7 +150,7 @@ cd rust && ./bench.sh --depth 16
 
 ## Known limitations
 
-See `specs/spec.md` for a complete list. Key items:
+See `specs/security.md` for the full security notes and operational caveats. Key items:
 
 - **Active development** -- protocol and implementation are not audited for production use
 - **Reference ledger is localhost-only** -- `sp-ledger` is a demo/reference verifier for the protocol checks, not a real authenticated public-balance server
