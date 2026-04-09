@@ -1,10 +1,10 @@
 [package]
-name = "starkprivacy-reprover"
+name = "tzel-reprover"
 version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "starkprivacy_reprover"
+name = "tzel_reprover"
 path = "src/lib.rs"
 
 [[bin]]

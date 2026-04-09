@@ -1,4 +1,4 @@
-(* Transaction types for StarkPrivacy v2:
+(* Transaction types for TzEL v2:
    - Shield (public -> private)
    - Transfer (N->2 private)
    - Unshield (N->withdrawal + optional change) *)

@@ -1,4 +1,4 @@
-# StarkPrivacy v2: Post-Quantum Private Transaction Spec
+# TzEL v2: Post-Quantum Private Transaction Spec
 
 **WARNING: This protocol is under active development. Neither the design nor the implementation should be assumed secure. Do not use for real value.**
 

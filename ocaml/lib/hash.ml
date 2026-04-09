@@ -1,4 +1,4 @@
-(* Domain-separated hash functions for the StarkPrivacy protocol.
+(* Domain-separated hash functions for the TzEL protocol.
    All use BLAKE2s-256, truncated to 251 bits (felt252).
 
    Domain tags are FIXED felt252 constants with ASCII bytes packed into

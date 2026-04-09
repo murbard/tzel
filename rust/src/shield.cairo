@@ -12,7 +12,7 @@
 /// Neither appears in public outputs — they are private inputs.
 /// Shield requires no spend authorization (sender authenticated by msg.sender).
 
-use starkprivacy::blake_hash as hash;
+use tzel::blake_hash as hash;
 
 pub fn verify(
     v_pub: u64,

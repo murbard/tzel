@@ -1,4 +1,4 @@
-(* Key hierarchy for StarkPrivacy v2.
+(* Key hierarchy for TzEL v2.
    Domain tags are fixed ASCII-packed felt constants (not hashed strings).
 
    master_sk

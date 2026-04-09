@@ -1,7 +1,7 @@
-# StarkPrivacy v2 — Cross-Implementation Test Vector Specification
+# TzEL v2 — Cross-Implementation Test Vector Specification
 
 **Version:** 1  
-**Purpose:** Any independent implementation of the StarkPrivacy v2 protocol can generate and consume these vectors to verify byte-exact compatibility with the reference implementation.
+**Purpose:** Any independent implementation of the TzEL v2 protocol can generate and consume these vectors to verify byte-exact compatibility with the reference implementation.
 
 ## Overview
 

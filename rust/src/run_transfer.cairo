@@ -15,8 +15,8 @@
 ///   Then output 1: cm_1, d_j_1, v_1, rseed_1, auth_root_1, nk_tag_1, memo_ct_hash_1
 ///   Then output 2: cm_2, d_j_2, v_2, rseed_2, auth_root_2, nk_tag_2, memo_ct_hash_2
 
-use starkprivacy::transfer;
-use starkprivacy::merkle;
+use tzel::transfer;
+use tzel::merkle;
 
 const WOTS_CHAINS: u32 = 133;
 

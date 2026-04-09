@@ -1,4 +1,4 @@
-# StarkPrivacy v2: Design Rationale
+# TzEL v2: Design Rationale
 
 This document is informative, not normative. The canonical protocol rules and encodings are in `specs/spec.md`.
 

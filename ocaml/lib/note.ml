@@ -1,4 +1,4 @@
-(* Note structure for StarkPrivacy v2.
+(* Note structure for TzEL v2.
    rseed       — random per-note seed
    rcm         = H(H("rcm"), rseed)
    owner_tag   = H_owner(auth_root, nk_tag)

@@ -1,4 +1,4 @@
-//! Two-level recursive proof generation for StarkPrivacy.
+//! Two-level recursive proof generation for TzEL.
 //!
 //! # Architecture
 //!

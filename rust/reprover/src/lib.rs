@@ -1,4 +1,4 @@
-//! StarkPrivacy reprover library — proving and verification APIs.
+//! TzEL reprover library — proving and verification APIs.
 //!
 //! Exposes:
 //! - `prove(executable_path)` → proof bytes + public outputs

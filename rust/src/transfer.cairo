@@ -9,8 +9,8 @@
 ///   base-4 digits + checksum, and verified against the WOTS+ chains.
 ///   This binds each spend authorization to this specific transaction.
 
-use starkprivacy::blake_hash as hash;
-use starkprivacy::merkle;
+use tzel::blake_hash as hash;
+use tzel::merkle;
 
 const MAX_INPUTS: u32 = 16;
 const WOTS_W: u32 = 4;

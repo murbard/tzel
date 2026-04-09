@@ -15,9 +15,9 @@ struct Args {
 fn main() -> Result<(), String> {
     let args = Args::parse();
     let json = if args.canonical_wire {
-        starkprivacy_cli::canonical_wire::generate_canonical_wire_v1_json()
+        tzel_cli::canonical_wire::generate_canonical_wire_v1_json()
     } else {
-        starkprivacy_cli::protocol_vectors::generate_protocol_v1_json()
+        tzel_cli::protocol_vectors::generate_protocol_v1_json()
     };
     if let Some(output) = args.output {
         std::fs::write(&output, json)

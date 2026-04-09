@@ -1,6 +1,6 @@
-/// StarkPrivacy v2 demo — post-quantum ledger + wallet.
+/// TzEL v2 demo — post-quantum ledger + wallet.
 ///
-/// This program demonstrates the full StarkPrivacy v2 protocol without a
+/// This program demonstrates the full TzEL v2 protocol without a
 /// blockchain or STARK proofs. It simulates:
 ///
 ///   - **Commitment tree T**: append-only Merkle tree of note commitments
@@ -701,7 +701,7 @@ fn main() {
     let mut alice = Wallet::new();
     let mut bob = Wallet::new();
 
-    println!("=== StarkPrivacy v2 (PQ, ML-KEM-768, diversified addresses) ===\n");
+    println!("=== TzEL v2 (PQ, ML-KEM-768, diversified addresses) ===\n");
 
     // 1. Fund Alice publicly.
     chain.fund("alice", 2000);

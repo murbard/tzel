@@ -1,4 +1,4 @@
-//! StarkPrivacy proof generator.
+//! TzEL proof generator.
 //!
 //! Modes:
 //!   reprove <executable.json>                       — generate ZK proof, write bundle to --output
@@ -10,8 +10,8 @@ use std::time::Instant;
 
 use anyhow::Result;
 use clap::Parser;
-use starkprivacy_reprover::custom_circuit::ProofBundle;
-use starkprivacy_reprover::{
+use tzel_reprover::custom_circuit::ProofBundle;
+use tzel_reprover::{
     compute_executable_program_hash, prove_single_level, prove_with_args_file,
 };
 use tracing_subscriber::fmt;
@@ -19,7 +19,7 @@ use tracing_subscriber::fmt;
 #[derive(Parser)]
 #[command(
     name = "reprove",
-    about = "Generate privacy proofs for StarkPrivacy executables"
+    about = "Generate privacy proofs for TzEL executables"
 )]
 struct Cli {
     /// Path to a .executable.json file

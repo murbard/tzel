@@ -14,7 +14,7 @@
 /// historical root, so a proof against a stale root is fine — double-spend
 /// is prevented by the global nullifier set, not by root freshness.
 
-use starkprivacy::blake_hash::hash2;
+use tzel::blake_hash::hash2;
 
 /// Fixed depth of the commitment Merkle tree.
 ///

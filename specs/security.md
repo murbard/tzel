@@ -1,4 +1,4 @@
-# StarkPrivacy v2: Security Notes
+# TzEL v2: Security Notes
 
 This document is informative, not normative. The canonical protocol rules and encodings are in `specs/spec.md`.
 

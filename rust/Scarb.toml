@@ -1,19 +1,19 @@
 [package]
-name = "starkprivacy"
+name = "tzel"
 version = "0.2.0"
 edition = "2025_12"
 
 [[target.executable]]
 name = "run_shield"
-function = "starkprivacy::run_shield::main"
+function = "tzel::run_shield::main"
 
 [[target.executable]]
 name = "run_transfer"
-function = "starkprivacy::run_transfer::main"
+function = "tzel::run_transfer::main"
 
 [[target.executable]]
 name = "run_unshield"
-function = "starkprivacy::run_unshield::main"
+function = "tzel::run_unshield::main"
 
 [cairo]
 enable-gas = false

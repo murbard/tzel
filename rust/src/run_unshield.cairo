@@ -15,8 +15,8 @@
 ///   Then per input (N times): WOTS_CHAINS pk values
 ///   Then change: has_change, d_j, v, rseed, auth_root, nk_tag, memo_ct_hash
 
-use starkprivacy::unshield;
-use starkprivacy::merkle;
+use tzel::unshield;
+use tzel::merkle;
 
 const WOTS_CHAINS: u32 = 133;
 

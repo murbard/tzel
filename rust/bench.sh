@@ -17,7 +17,7 @@ case $DEPTH in
     *) echo "ERROR: unsupported depth $DEPTH (use 16, 32, or 48)"; exit 1 ;;
 esac
 
-echo "=== StarkPrivacy Proof Benchmark (depth=$DEPTH) ==="
+echo "=== TzEL Proof Benchmark (depth=$DEPTH) ==="
 echo ""
 
 # Build Cairo executables

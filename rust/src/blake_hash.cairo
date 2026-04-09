@@ -1,4 +1,4 @@
-/// BLAKE2s-256 hash primitives for StarkPrivacy v2.
+/// BLAKE2s-256 hash primitives for TzEL v2.
 ///
 /// # Key hierarchy
 ///

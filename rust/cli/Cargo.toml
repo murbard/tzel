@@ -1,5 +1,5 @@
 [package]
-name = "starkprivacy-cli"
+name = "tzel-cli"
 version = "0.1.0"
 edition = "2021"
 

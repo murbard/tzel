@@ -7,7 +7,7 @@
 
 use ml_kem::{ml_kem_768, KeyExport};
 use serde::Serialize;
-use starkprivacy_cli::*;
+use tzel_cli::*;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use ureq::{http, RequestExt};

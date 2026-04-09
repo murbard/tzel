@@ -2,7 +2,7 @@
 /// Arguments (flattened felt252 array):
 ///   [v_pub, cm_new, sender, memo_ct_hash, auth_root, nk_tag, d_j, rseed]
 
-use starkprivacy::shield;
+use tzel::shield;
 
 #[executable]
 fn main(args: Array<felt252>) -> Array<felt252> {

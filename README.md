@@ -1,12 +1,12 @@
-# StarkPrivacy
+# TzEL
 
-![StarkPrivacy](docs/hero.jpeg)
+![TzEL](docs/hero.jpeg)
 
 **Post-quantum private transactions with STARK proofs.**
 
 > **WARNING: This project is under active development. Neither the cryptographic scheme nor the implementation should be assumed secure. Do not use for real value. The protocol design is evolving — see `specs/spec.md` for the current state.**
 
-Privacy on blockchains today relies on elliptic curve cryptography that quantum computers will break. StarkPrivacy replaces every elliptic curve with post-quantum alternatives — BLAKE2s hashing, ML-KEM-768 lattice-based encryption, Winternitz-style one-time spend authorization verified inside the STARK, and recursive STARK proofs — with current reference proofs around 300 KB and verification around 35 ms.
+Privacy on blockchains today relies on elliptic curve cryptography that quantum computers will break. TzEL replaces every elliptic curve with post-quantum alternatives — BLAKE2s hashing, ML-KEM-768 lattice-based encryption, Winternitz-style one-time spend authorization verified inside the STARK, and recursive STARK proofs — with current reference proofs around 300 KB and verification around 35 ms.
 
 ### Features
 

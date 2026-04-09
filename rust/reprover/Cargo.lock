@@ -3652,41 +3652,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "starkprivacy-reprover"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "cairo-air",
- "cairo-program-runner-lib",
- "cairo-vm",
- "circuit-air",
- "circuit-cairo-air",
- "circuit-common",
- "circuit-prover",
- "circuit-serialize",
- "circuits",
- "circuits-stark-verifier",
- "clap",
- "hex",
- "itertools 0.12.1",
- "privacy-circuit-verify",
- "privacy-prove",
- "serde",
- "serde_json",
- "starknet-types-core",
- "stwo",
- "stwo-cairo-adapter",
- "stwo-cairo-common",
- "stwo-cairo-prover",
- "stwo-cairo-serialize",
- "stwo-constraint-framework",
- "tempfile",
- "tracing",
- "tracing-subscriber",
- "zstd",
-]
-
-[[package]]
 name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4223,6 +4188,41 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "tzel-reprover"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cairo-air",
+ "cairo-program-runner-lib",
+ "cairo-vm",
+ "circuit-air",
+ "circuit-cairo-air",
+ "circuit-common",
+ "circuit-prover",
+ "circuit-serialize",
+ "circuits",
+ "circuits-stark-verifier",
+ "clap",
+ "hex",
+ "itertools 0.12.1",
+ "privacy-circuit-verify",
+ "privacy-prove",
+ "serde",
+ "serde_json",
+ "starknet-types-core",
+ "stwo",
+ "stwo-cairo-adapter",
+ "stwo-cairo-common",
+ "stwo-cairo-prover",
+ "stwo-cairo-serialize",
+ "stwo-constraint-framework",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "zstd",
 ]
 
 [[package]]

@@ -1,4 +1,4 @@
-//! StarkPrivacy shared library — crypto, types, Merkle tree, API types.
+//! TzEL shared library — crypto, types, Merkle tree, API types.
 
 pub mod canonical_wire;
 pub mod protocol_vectors;
@@ -197,7 +197,7 @@ pub fn sighash_fold(a: &F, b: &F) -> F {
 /// Development default for spend-authorization domain binding.
 /// Production deployments should override this with a unique per-deployment value.
 pub fn default_auth_domain() -> F {
-    hash(b"starkprivacy-auth-domain-local-dev-v1")
+    hash(b"tzel-auth-domain-local-dev-v1")
 }
 
 /// Compute transfer sighash from public outputs.
@@ -943,7 +943,7 @@ pub struct BootloaderTaskOutput<'a> {
     pub public_outputs: &'a [String],
 }
 
-/// Parse the privacy bootloader output preimage for the common StarkPrivacy case:
+/// Parse the privacy bootloader output preimage for the common TzEL case:
 /// exactly one authenticated Cairo task.
 pub fn parse_single_task_output_preimage(
     output_preimage: &[String],
@@ -990,7 +990,7 @@ pub fn parse_single_task_output_preimage(
 }
 
 /// Validate that the verified bootloader output preimage corresponds to the
-/// expected StarkPrivacy circuit executable, not just any Cairo task.
+/// expected TzEL circuit executable, not just any Cairo task.
 pub fn validate_single_task_program_hash<'a>(
     output_preimage: &'a [String],
     expected_program_hash: &str,

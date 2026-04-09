@@ -6,8 +6,8 @@
 /// # Spend authorization
 ///   WOTS+ w=4 signature verification inside the STARK, bound to the sighash.
 
-use starkprivacy::blake_hash as hash;
-use starkprivacy::merkle;
+use tzel::blake_hash as hash;
+use tzel::merkle;
 
 const MAX_INPUTS: u32 = 16;
 const WOTS_W: u32 = 4;

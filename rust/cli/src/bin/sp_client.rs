@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use ml_kem::KeyExport;
 use serde::{Deserialize, Serialize};
-use starkprivacy_cli::*;
+use tzel_cli::*;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -333,7 +333,7 @@ fn ensure_path_matches_root(
 // ═══════════════════════════════════════════════════════════════════════
 
 #[derive(Parser)]
-#[command(name = "sp-client", about = "StarkPrivacy CLI wallet")]
+#[command(name = "sp-client", about = "TzEL CLI wallet")]
 struct Cli {
     #[arg(short, long, default_value = "wallet.json")]
     wallet: String,

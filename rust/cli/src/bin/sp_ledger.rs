@@ -5,7 +5,7 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use starkprivacy_cli::*;
+use tzel_cli::*;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
