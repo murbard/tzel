@@ -30,7 +30,7 @@ type circuit_type =
 
 (* Proof bundle returned by the prover *)
 type proof_bundle = {
-  proof_hex : string;
+  proof_bytes : string;
   output_preimage : Felt.t list;
 }
 
@@ -88,7 +88,6 @@ type unshield_witness = {
 (* JSON serialization for witness exchange *)
 
 let felt_to_json f = `String (Felt.to_hex f)
-
 let felt_array_to_json arr =
   `List (Array.to_list (Array.map felt_to_json arr))
 
@@ -152,7 +151,7 @@ let unshield_witness_to_json w =
 let parse_proof_bundle json_str =
   let json = Yojson.Basic.from_string json_str in
   let open Yojson.Basic.Util in
-  let proof_hex = json |> member "proof" |> to_string in
+  let proof_bytes = json |> member "proof_bytes" |> to_string in
   let preimage_list = json |> member "output_preimage" |> to_list in
   let output_preimage = List.map (fun j ->
     let s = to_string j in
@@ -160,7 +159,7 @@ let parse_proof_bundle json_str =
       then String.sub s 2 (String.length s - 2) else s in
     Felt.of_hex s
   ) preimage_list in
-  { proof_hex; output_preimage }
+  { proof_bytes; output_preimage }
 
 (* ── Bootloader output verification ──
    The bootloader output_preimage contains:
@@ -219,7 +218,7 @@ let verify_proof config circuit_type bundle =
   (* Step 1: STARK verification via Rust binary *)
   let tmp = Filename.temp_file "tzel-proof-" ".json" in
   let json = `Assoc [
-    "proof", `String bundle.proof_hex;
+    "proof_bytes", `String bundle.proof_bytes;
     "output_preimage", `List (List.map (fun f ->
       `String ("0x" ^ Felt.to_hex f)) bundle.output_preimage);
   ] in

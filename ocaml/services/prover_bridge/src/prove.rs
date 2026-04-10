@@ -8,7 +8,7 @@
 //!
 //! The output is a JSON file:
 //! {
-//!   "proof": "<hex-encoded zstd-compressed proof>",
+//!   "proof_bytes": "<hex-encoded zstd-compressed proof>",
 //!   "output_preimage": ["0x...", ...]
 //! }
 
@@ -41,7 +41,7 @@ struct Args {
 #[derive(serde::Serialize)]
 struct ProofBundle {
     /// Hex-encoded zstd-compressed proof bytes
-    proof: String,
+    proof_bytes: String,
     /// Output preimage felts (hex strings)
     output_preimage: Vec<String>,
 }
@@ -66,7 +66,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Serialize the output
     let bundle = ProofBundle {
-        proof: hex::encode(&proof_output.proof),
+        proof_bytes: hex::encode(&proof_output.proof),
         output_preimage: proof_output
             .output_preimage
             .iter()

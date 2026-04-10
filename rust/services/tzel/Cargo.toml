@@ -16,6 +16,7 @@ name = "gen-interop-scenario"
 path = "src/bin/gen_interop_scenario.rs"
 
 [dependencies]
+tzel-core = { path = "../../protocol/tzel-core" }
 blake2s_simd = "1.0"
 rand = "0.9"
 hex = "0.4"

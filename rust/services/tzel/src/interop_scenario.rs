@@ -1,5 +1,5 @@
 use crate::*;
-use ml_kem::KeyExport;
+use ml_kem::{ml_kem_768, KeyExport};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]

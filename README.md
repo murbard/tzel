@@ -131,7 +131,10 @@ apps/                   Thin shells (wallet, ledger, prover, demo)
 backends/               Backend adapters used by the shells
   rust/                 Current adapter to the Rust libraries
 rust/                   Rust implementation libraries
+  protocol/tzel-core/   Shared deterministic protocol/state layer
   protocol/cairo/       Cairo circuits and executable build
+  protocol/rollup-kernel/
+                         Tezos smart-rollup kernel scaffold
   services/             Rust libraries used by the shells and tests
 ocaml/                  Independent OCaml implementation
   protocol/             Pure protocol modules
@@ -143,6 +146,31 @@ ocaml/                  Independent OCaml implementation
 ```bash
 ./apps/prover/bench.sh
 ./apps/prover/bench.sh --depth 16
+```
+
+## Rollup kernel MVP
+
+The shared deterministic Rust layer now lives in `rust/protocol/tzel-core/`.
+Both the HTTP ledger path and the rollup-kernel MVP are meant to call that same
+logic rather than fork state-transition code.
+
+The first Tezos smart-rollup kernel scaffold lives in
+`rust/protocol/rollup-kernel/`.
+
+It currently:
+- reads raw inbox messages from the WASM host
+- persists basic durable state for inbox stats and the last message seen
+- decodes Tezos Data Encoding inbox messages into shared TzEL request types
+- treats `transfer` as the only fully internal rollup transaction, with `fund`/`shield`/`unshield` handling bridge ingress and egress around it
+- applies the shared transition logic from `tzel-core`
+- persists path-addressed durable state for notes, bridge balances, roots, nullifiers, and the commitment-tree frontier
+- verifies proofs through the shared verifier path without linking prover code
+
+Build it with:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo build -p tzel-rollup-kernel --target wasm32-unknown-unknown --release
 ```
 
 ## Known limitations

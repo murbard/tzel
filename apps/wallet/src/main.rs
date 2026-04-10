@@ -531,6 +531,16 @@ fn generate_proof(
     circuit: &str,
     args: &[String],
 ) -> Result<Proof, String> {
+    #[derive(Deserialize)]
+    struct ProofBundleJson {
+        #[serde(with = "hex_bytes")]
+        proof_bytes: Vec<u8>,
+        #[serde(with = "hex_f_vec")]
+        output_preimage: Vec<F>,
+        #[serde(default)]
+        verify_meta: Option<serde_json::Value>,
+    }
+
     let executable = format!("{}/{}.executable.json", executables_dir, circuit);
     let args_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {}", e))?;
     let args_json = serde_json::to_string(&args).map_err(|e| format!("json: {}", e))?;
@@ -561,33 +571,20 @@ fn generate_proof(
     // Parse the proof bundle
     let bundle_json =
         std::fs::read_to_string(proof_file.path()).map_err(|e| format!("read proof: {}", e))?;
-    let bundle: serde_json::Value =
+    let bundle: ProofBundleJson =
         serde_json::from_str(&bundle_json).map_err(|e| format!("parse proof: {}", e))?;
 
-    let proof_hex = bundle["proof_hex"]
-        .as_str()
-        .ok_or("missing proof_hex")?
-        .to_string();
-    let output_preimage: Vec<String> = bundle["output_preimage"]
-        .as_array()
-        .ok_or("missing output_preimage")?
-        .iter()
-        .map(|v| v.as_str().unwrap_or("0").to_string())
-        .collect();
-
-    let proof_kb = proof_hex.len() / 2 / 1024;
+    let proof_kb = bundle.proof_bytes.len() / 1024;
     eprintln!(
         "Proof generated: {} KB, {} public outputs",
         proof_kb,
-        output_preimage.len()
+        bundle.output_preimage.len()
     );
 
-    let verify_meta = bundle.get("verify_meta").cloned();
-
     Ok(Proof::Stark {
-        proof_hex,
-        output_preimage,
-        verify_meta,
+        proof_bytes: bundle.proof_bytes,
+        output_preimage: bundle.output_preimage,
+        verify_meta: bundle.verify_meta,
     })
 }
 

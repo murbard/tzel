@@ -1,1050 +1,12 @@
-//! TzEL shared library — crypto, types, Merkle tree, API types.
+//! TzEL shared library — verifier helpers, vectors, and host-side glue.
 
 pub mod canonical_wire;
 pub mod interop_scenario;
 pub mod protocol_vectors;
 
-use blake2s_simd::Params;
-use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
-use ml_kem::kem::{Encapsulate, TryDecapsulate};
-use ml_kem::ml_kem_768;
-use rand::Rng as _;
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+pub use tzel_core::*;
+
 use std::path::{Path, PathBuf};
-
-// ═══════════════════════════════════════════════════════════════════════
-// Core types
-// ═══════════════════════════════════════════════════════════════════════
-
-pub type F = [u8; 32];
-pub const ZERO: F = [0u8; 32];
-pub const DETECT_K: usize = 10;
-pub const ML_KEM768_CIPHERTEXT_BYTES: usize = 1088;
-pub const ENCRYPTED_NOTE_BYTES: usize = 8 + 32 + MEMO_SIZE + 16;
-
-/// Generate a random valid felt252 (251-bit value).
-pub fn random_felt() -> F {
-    let mut rng = rand::rng();
-    let mut f: F = rng.random();
-    f[31] &= 0x07; // truncate to 251 bits
-    f
-}
-pub const MEMO_SIZE: usize = 1024;
-/// Must match TREE_DEPTH in merkle.cairo (default Scarb feature: depth48).
-pub const DEPTH: usize = 48;
-
-// ═══════════════════════════════════════════════════════════════════════
-// Serde helpers — hex encoding for F and Vec<u8>
-// ═══════════════════════════════════════════════════════════════════════
-
-pub mod hex_f {
-    use super::F;
-    use serde::{self, Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(f: &F, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&hex::encode(f))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<F, D::Error> {
-        let s = String::deserialize(d)?;
-        let bytes = hex::decode(&s).map_err(serde::de::Error::custom)?;
-        if bytes.len() != 32 {
-            return Err(serde::de::Error::custom("expected 32 bytes"));
-        }
-        let mut f = [0u8; 32];
-        f.copy_from_slice(&bytes);
-        Ok(f)
-    }
-}
-
-pub mod hex_f_vec {
-    use super::F;
-    use serde::{self, Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(v: &Vec<F>, s: S) -> Result<S::Ok, S::Error> {
-        let hexes: Vec<String> = v.iter().map(|f| hex::encode(f)).collect();
-        hexes.serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<F>, D::Error> {
-        let hexes: Vec<String> = Vec::deserialize(d)?;
-        hexes
-            .iter()
-            .map(|s| {
-                let bytes = hex::decode(s).map_err(serde::de::Error::custom)?;
-                if bytes.len() != 32 {
-                    return Err(serde::de::Error::custom("expected 32 bytes"));
-                }
-                let mut f = [0u8; 32];
-                f.copy_from_slice(&bytes);
-                Ok(f)
-            })
-            .collect()
-    }
-}
-
-pub mod hex_bytes {
-    use serde::{self, Deserialize, Deserializer, Serializer};
-
-    pub fn serialize<S: Serializer>(b: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&hex::encode(b))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-        let s = String::deserialize(d)?;
-        hex::decode(&s).map_err(serde::de::Error::custom)
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// BLAKE2s hashing — personalized, 251-bit truncated
-// ═══════════════════════════════════════════════════════════════════════
-
-pub(crate) fn blake2s(personal: &[u8; 8], data: &[u8]) -> F {
-    let digest = Params::new().hash_length(32).personal(personal).hash(data);
-    let mut out = ZERO;
-    out.copy_from_slice(digest.as_bytes());
-    out[31] &= 0x07;
-    out
-}
-
-pub(crate) fn blake2s_generic(data: &[u8]) -> F {
-    let digest = Params::new().hash_length(32).hash(data);
-    let mut out = ZERO;
-    out.copy_from_slice(digest.as_bytes());
-    out[31] &= 0x07;
-    out
-}
-
-pub fn hash(data: &[u8]) -> F {
-    blake2s_generic(data)
-}
-
-pub fn hash_two(a: &F, b: &F) -> F {
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(a);
-    buf[32..].copy_from_slice(b);
-    hash(&buf)
-}
-
-pub fn hash_merkle(a: &F, b: &F) -> F {
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(a);
-    buf[32..].copy_from_slice(b);
-    blake2s(b"mrklSP__", &buf)
-}
-
-fn hash_commit_raw(data: &[u8]) -> F {
-    blake2s(b"cmmtSP__", data)
-}
-
-pub fn derive_rcm(rseed: &F) -> F {
-    let mut tag = ZERO;
-    tag[0] = 0x6D;
-    tag[1] = 0x63;
-    tag[2] = 0x72;
-    hash_two(&hash(&tag), rseed)
-}
-
-pub fn derive_nk_spend(nk: &F, d_j: &F) -> F {
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(nk);
-    buf[32..].copy_from_slice(d_j);
-    blake2s(b"nkspSP__", &buf)
-}
-
-pub fn derive_nk_tag(nk_spend: &F) -> F {
-    blake2s(b"nktgSP__", nk_spend)
-}
-
-pub fn owner_tag(auth_root: &F, nk_tag: &F) -> F {
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(auth_root);
-    buf[32..].copy_from_slice(nk_tag);
-    blake2s(b"ownrSP__", &buf)
-}
-
-pub fn commit(d_j: &F, v: u64, rcm: &F, otag: &F) -> F {
-    let mut buf = [0u8; 128];
-    buf[..32].copy_from_slice(d_j);
-    buf[32..40].copy_from_slice(&v.to_le_bytes());
-    buf[64..96].copy_from_slice(rcm);
-    buf[96..128].copy_from_slice(otag);
-    hash_commit_raw(&buf)
-}
-
-pub fn nullifier(nk_spend: &F, cm: &F, pos: u64) -> F {
-    let mut buf1 = [0u8; 64];
-    buf1[..32].copy_from_slice(cm);
-    let mut pos_f = ZERO;
-    pos_f[..8].copy_from_slice(&pos.to_le_bytes());
-    buf1[32..].copy_from_slice(&pos_f);
-    let cm_pos = blake2s(b"nulfSP__", &buf1);
-    let mut buf2 = [0u8; 64];
-    buf2[..32].copy_from_slice(nk_spend);
-    buf2[32..].copy_from_slice(&cm_pos);
-    blake2s(b"nulfSP__", &buf2)
-}
-
-/// Sighash fold: H_sighash(a, b) using "sighSP__" personalization.
-pub fn sighash_fold(a: &F, b: &F) -> F {
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(a);
-    buf[32..].copy_from_slice(b);
-    blake2s(b"sighSP__", &buf)
-}
-
-/// Development default for spend-authorization domain binding.
-/// Production deployments should override this with a unique per-deployment value.
-pub fn default_auth_domain() -> F {
-    hash(b"tzel-auth-domain-local-dev-v1")
-}
-
-/// Compute transfer sighash from public outputs.
-pub fn transfer_sighash(
-    auth_domain: &F,
-    root: &F,
-    nullifiers: &[F],
-    cm_1: &F,
-    cm_2: &F,
-    mh_1: &F,
-    mh_2: &F,
-) -> F {
-    // Circuit-type tag 0x01 for transfer
-    let mut type_tag = ZERO;
-    type_tag[0] = 0x01;
-    let mut sh = sighash_fold(&type_tag, auth_domain);
-    sh = sighash_fold(&sh, root);
-    for nf in nullifiers {
-        sh = sighash_fold(&sh, nf);
-    }
-    sh = sighash_fold(&sh, cm_1);
-    sh = sighash_fold(&sh, cm_2);
-    sh = sighash_fold(&sh, mh_1);
-    sh = sighash_fold(&sh, mh_2);
-    sh
-}
-
-/// Compute unshield sighash from public outputs.
-pub fn unshield_sighash(
-    auth_domain: &F,
-    root: &F,
-    nullifiers: &[F],
-    v_pub: u64,
-    recipient: &F,
-    cm_change: &F,
-    mh_change: &F,
-) -> F {
-    // Circuit-type tag 0x02 for unshield
-    let mut type_tag = ZERO;
-    type_tag[0] = 0x02;
-    let mut sh = sighash_fold(&type_tag, auth_domain);
-    sh = sighash_fold(&sh, root);
-    for nf in nullifiers {
-        sh = sighash_fold(&sh, nf);
-    }
-    let mut v_felt = ZERO;
-    v_felt[..8].copy_from_slice(&v_pub.to_le_bytes());
-    sh = sighash_fold(&sh, &v_felt);
-    sh = sighash_fold(&sh, recipient);
-    sh = sighash_fold(&sh, cm_change);
-    sh = sighash_fold(&sh, mh_change);
-    sh
-}
-
-/// Hash of all encrypted note data — binds the full on-chain note to the proof.
-/// Covers detection ciphertext, tag, viewing ciphertext, and encrypted payload.
-/// A relayer cannot swap any component without invalidating the hash.
-pub fn memo_ct_hash(enc: &EncryptedNote) -> F {
-    let mut buf =
-        Vec::with_capacity(enc.ct_d.len() + 2 + enc.ct_v.len() + enc.encrypted_data.len());
-    buf.extend_from_slice(&enc.ct_d);
-    buf.extend_from_slice(&enc.tag.to_le_bytes());
-    buf.extend_from_slice(&enc.ct_v);
-    buf.extend_from_slice(&enc.encrypted_data);
-    blake2s(b"memoSP__", &buf)
-}
-
-pub fn short(f: &F) -> String {
-    hex::encode(&f[..4])
-}
-
-/// Convert F (LE bytes) to decimal string matching Cairo's felt252 representation.
-pub fn felt_to_dec(f: &F) -> String {
-    // Interpret as little-endian u256, convert to decimal
-    let mut val = [0u8; 32];
-    val.copy_from_slice(f);
-    // Build u256 from LE bytes
-    let lo = u128::from_le_bytes(val[..16].try_into().unwrap());
-    let hi = u128::from_le_bytes(val[16..].try_into().unwrap());
-    if hi == 0 {
-        lo.to_string()
-    } else {
-        // For values that don't fit in u128, use long division on LE bytes
-        let mut be = [0u8; 32];
-        for i in 0..32 {
-            be[i] = val[31 - i];
-        }
-        let hex_str = hex::encode(be);
-        let trimmed = hex_str.trim_start_matches('0');
-        if trimmed.is_empty() {
-            return "0".to_string();
-        }
-        // Parse hex to decimal using u256-capable parsing
-        // Since we don't have a bigint crate, compute hi*2^128 + lo manually
-        // Actually, the output_preimage from the reprover already contains decimal strings
-        // We just need to match them. Let's use a simpler approach.
-        let mut result = Vec::new();
-        let mut bytes = val.to_vec();
-        // Long division by 10 on LE bytes
-        loop {
-            let mut rem = 0u32;
-            let mut all_zero = true;
-            for i in (0..bytes.len()).rev() {
-                let cur = rem * 256 + bytes[i] as u32;
-                bytes[i] = (cur / 10) as u8;
-                rem = cur % 10;
-                if bytes[i] != 0 {
-                    all_zero = false;
-                }
-            }
-            result.push((b'0' + rem as u8) as char);
-            if all_zero {
-                break;
-            }
-        }
-        result.reverse();
-        result.into_iter().collect()
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Key derivation
-// ═══════════════════════════════════════════════════════════════════════
-
-fn felt_tag(s: &[u8]) -> F {
-    let mut val = 0u128;
-    for &b in s {
-        val = (val << 8) | b as u128;
-    }
-    let mut f = ZERO;
-    let le = val.to_le_bytes();
-    f[..16].copy_from_slice(&le);
-    f
-}
-
-pub fn tag_dsk() -> F {
-    felt_tag(b"dsk")
-}
-
-#[derive(Clone)]
-pub struct Account {
-    pub nk: F,
-    pub ask_base: F,
-    pub incoming_seed: F,
-}
-
-pub fn derive_account(master_sk: &F) -> Account {
-    let spend_seed = hash_two(&felt_tag(b"spend"), master_sk);
-    Account {
-        nk: hash_two(&felt_tag(b"nk"), &spend_seed),
-        ask_base: hash_two(&felt_tag(b"ask"), &spend_seed),
-        incoming_seed: hash_two(&felt_tag(b"incoming"), master_sk),
-    }
-}
-
-pub fn derive_address(incoming_seed: &F, j: u32) -> F {
-    let dsk = hash_two(&tag_dsk(), incoming_seed);
-    let mut idx = ZERO;
-    idx[..4].copy_from_slice(&j.to_le_bytes());
-    hash_two(&dsk, &idx)
-}
-
-pub fn derive_ask(ask_base: &F, j: u32) -> F {
-    let mut idx = ZERO;
-    idx[..4].copy_from_slice(&j.to_le_bytes());
-    hash_two(ask_base, &idx)
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Auth key tree — Merkle tree of WOTS+ w=4 one-time signing keys
-// ═══════════════════════════════════════════════════════════════════════
-
-pub const AUTH_DEPTH: usize = 10;
-pub const AUTH_TREE_SIZE: usize = 1 << AUTH_DEPTH; // 1024
-pub const WOTS_W: usize = 4;
-pub const WOTS_CHAINS: usize = 133; // 128 msg + 5 checksum
-
-/// Derive the WOTS+ secret key seed for one-time key index i.
-pub fn auth_key_seed(ask_j: &F, i: u32) -> F {
-    let tag = hash_two(&felt_tag(b"auth-key"), ask_j);
-    let mut idx = ZERO;
-    idx[..4].copy_from_slice(&i.to_le_bytes());
-    hash_two(&tag, &idx)
-}
-
-/// WOTS+ secret key for chain j of key index i.
-fn wots_sk_chain(ask_j: &F, key_idx: u32, chain_idx: u32) -> F {
-    let seed = auth_key_seed(ask_j, key_idx);
-    let mut cidx = ZERO;
-    cidx[..4].copy_from_slice(&chain_idx.to_le_bytes());
-    hash_two(&seed, &cidx)
-}
-
-/// WOTS+ chain hash using dedicated "wotsSP__" personalization.
-pub(crate) fn hash1_wots(data: &F) -> F {
-    blake2s(b"wotsSP__", data)
-}
-
-/// WOTS+ PK fold using dedicated "pkfdSP__" personalization.
-pub(crate) fn hash2_pkfold(a: &F, b: &F) -> F {
-    let mut buf = [0u8; 64];
-    buf[..32].copy_from_slice(a);
-    buf[32..].copy_from_slice(b);
-    blake2s(b"pkfdSP__", &buf)
-}
-
-pub(crate) fn hash_chain(x: &F, n: usize) -> F {
-    let mut v = *x;
-    for _ in 0..n {
-        v = hash1_wots(&v);
-    }
-    v
-}
-
-/// WOTS+ public key for key index i: 133 chain endpoints.
-pub fn wots_pk(ask_j: &F, key_idx: u32) -> Vec<F> {
-    (0..WOTS_CHAINS as u32)
-        .map(|j| hash_chain(&wots_sk_chain(ask_j, key_idx, j), WOTS_W - 1))
-        .collect()
-}
-
-/// Fold WOTS+ pk chains into a single leaf hash.
-pub fn wots_pk_to_leaf(pk: &[F]) -> F {
-    let mut leaf = pk[0];
-    for i in 1..pk.len() {
-        leaf = hash2_pkfold(&leaf, &pk[i]);
-    }
-    leaf
-}
-
-/// Derive the auth leaf hash for key index i (WOTS+ pk folded to 32 bytes).
-pub fn auth_leaf_hash(ask_j: &F, i: u32) -> F {
-    let pk = wots_pk(ask_j, i);
-    wots_pk_to_leaf(&pk)
-}
-
-/// Build the full auth tree for address j. Returns (auth_root, leaf_hashes).
-pub fn build_auth_tree(ask_j: &F) -> (F, Vec<F>) {
-    let leaves: Vec<F> = (0..AUTH_TREE_SIZE as u32)
-        .map(|i| auth_leaf_hash(ask_j, i))
-        .collect();
-    let root = auth_tree_root(&leaves);
-    (root, leaves)
-}
-
-/// WOTS+ sign: given a message hash, produce signature chains and digits.
-pub fn wots_sign(ask_j: &F, key_idx: u32, msg_hash: &F) -> (Vec<F>, Vec<F>, Vec<u32>) {
-    let log_w = 2; // log2(4)
-
-    // Extract base-4 digits from message hash
-    let mut digits: Vec<usize> = Vec::new();
-    for byte in msg_hash.iter() {
-        let mut b = *byte;
-        for _ in 0..4 {
-            // 8 / log_w
-            digits.push((b & 3) as usize);
-            b >>= log_w;
-        }
-    }
-    // Checksum
-    let checksum: usize = digits.iter().map(|d| WOTS_W - 1 - d).sum();
-    let mut cs = checksum;
-    for _ in 0..5 {
-        // checksum chains
-        digits.push(cs & 3);
-        cs >>= 2;
-    }
-    digits.truncate(WOTS_CHAINS);
-
-    // Sign: sig[j] = H^{digit[j]}(sk[j])
-    let sig: Vec<F> = (0..WOTS_CHAINS)
-        .map(|j| hash_chain(&wots_sk_chain(ask_j, key_idx, j as u32), digits[j]))
-        .collect();
-
-    // PK: pk[j] = H^{w-1}(sk[j])
-    let pk: Vec<F> = (0..WOTS_CHAINS)
-        .map(|j| hash_chain(&wots_sk_chain(ask_j, key_idx, j as u32), WOTS_W - 1))
-        .collect();
-
-    let digits_u32: Vec<u32> = digits.iter().map(|&d| d as u32).collect();
-    (sig, pk, digits_u32)
-}
-
-/// Compute the Merkle root of an auth tree from its leaves.
-fn auth_tree_root(leaves: &[F]) -> F {
-    let mut zh = vec![ZERO];
-    for i in 0..AUTH_DEPTH {
-        zh.push(hash_merkle(&zh[i], &zh[i]));
-    }
-    auth_compute_level(0, leaves, &zh)
-}
-
-fn auth_compute_level(depth: usize, level: &[F], zh: &[F]) -> F {
-    if depth == AUTH_DEPTH {
-        return if level.is_empty() {
-            zh[AUTH_DEPTH]
-        } else {
-            level[0]
-        };
-    }
-    let mut next = vec![];
-    let mut i = 0;
-    loop {
-        let left = if i < level.len() { level[i] } else { zh[depth] };
-        let right = if i + 1 < level.len() {
-            level[i + 1]
-        } else {
-            zh[depth]
-        };
-        next.push(hash_merkle(&left, &right));
-        i += 2;
-        if i >= level.len() && !next.is_empty() {
-            break;
-        }
-    }
-    auth_compute_level(depth + 1, &next, zh)
-}
-
-/// Extract the auth path (AUTH_DEPTH siblings) for a leaf.
-pub fn auth_tree_path(leaves: &[F], index: usize) -> Vec<F> {
-    let mut zh = vec![ZERO];
-    for i in 0..AUTH_DEPTH {
-        zh.push(hash_merkle(&zh[i], &zh[i]));
-    }
-    let mut level = leaves.to_vec();
-    let mut siblings = vec![];
-    let mut idx = index;
-    for d in 0..AUTH_DEPTH {
-        let sib_idx = idx ^ 1;
-        siblings.push(if sib_idx < level.len() {
-            level[sib_idx]
-        } else {
-            zh[d]
-        });
-        let mut next = vec![];
-        let mut i = 0;
-        loop {
-            let left = if i < level.len() { level[i] } else { zh[d] };
-            let right = if i + 1 < level.len() {
-                level[i + 1]
-            } else {
-                zh[d]
-            };
-            next.push(hash_merkle(&left, &right));
-            i += 2;
-            if i >= level.len() {
-                break;
-            }
-        }
-        level = next;
-        idx /= 2;
-    }
-    siblings
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// ML-KEM-768 encryption + detection
-// ═══════════════════════════════════════════════════════════════════════
-
-pub type Ek = ml_kem_768::EncapsulationKey;
-pub type Dk = ml_kem_768::DecapsulationKey;
-
-pub fn kem_keygen_from_seed(seed: &[u8; 64]) -> (Ek, Dk) {
-    let seed_arr = ml_kem::array::Array::from(*seed);
-    let dk = ml_kem_768::DecapsulationKey::from_seed(seed_arr);
-    let ek = dk.encapsulation_key().clone();
-    (ek, dk)
-}
-
-/// Derive the incoming viewing root from incoming_seed.
-pub fn derive_view_root(incoming_seed: &F) -> F {
-    hash_two(&felt_tag(b"view"), incoming_seed)
-}
-
-/// Derive the detection root from incoming_seed.
-/// Holders of detect_root can derive detection keys only, not viewing keys.
-pub fn derive_detect_root(incoming_seed: &F) -> F {
-    let view_root = derive_view_root(incoming_seed);
-    hash_two(&felt_tag(b"detect"), &view_root)
-}
-
-/// Derive per-address ML-KEM viewing keypair from incoming_seed and address index j.
-/// Each address gets unique ek_v_j / dk_v_j so that addresses are unlinkable.
-pub fn derive_kem_view_seed(incoming_seed: &F, j: u32) -> [u8; 64] {
-    let view_seed = derive_view_root(incoming_seed);
-    let mut idx = ZERO;
-    idx[..4].copy_from_slice(&j.to_le_bytes());
-    let h1 = hash_two(&felt_tag(b"mlkem-v"), &view_seed);
-    let h2 = hash_two(&h1, &idx);
-    let mut out = [0u8; 64];
-    out[..32].copy_from_slice(&h2);
-    // Second half: hash again with different domain for full 64 bytes
-    let h3 = hash_two(&felt_tag(b"mlkem-v2"), &h2);
-    out[32..].copy_from_slice(&h3);
-    out
-}
-
-/// Derive per-address ML-KEM detection keypair from incoming_seed and address index j.
-/// Each address gets unique ek_d_j / dk_d_j so that addresses are unlinkable.
-pub fn derive_kem_detect_seed(incoming_seed: &F, j: u32) -> [u8; 64] {
-    let det_seed = derive_detect_root(incoming_seed);
-    let mut idx = ZERO;
-    idx[..4].copy_from_slice(&j.to_le_bytes());
-    let h1 = hash_two(&felt_tag(b"mlkem-d"), &det_seed);
-    let h2 = hash_two(&h1, &idx);
-    let mut out = [0u8; 64];
-    out[..32].copy_from_slice(&h2);
-    let h3 = hash_two(&felt_tag(b"mlkem-d2"), &h2);
-    out[32..].copy_from_slice(&h3);
-    out
-}
-
-/// Derive per-address ML-KEM key pairs (view + detect) from incoming_seed and address index.
-pub fn derive_kem_keys(incoming_seed: &F, j: u32) -> (Ek, Dk, Ek, Dk) {
-    let sv = derive_kem_view_seed(incoming_seed, j);
-    let sd = derive_kem_detect_seed(incoming_seed, j);
-    let (ek_v, dk_v) = kem_keygen_from_seed(&sv);
-    let (ek_d, dk_d) = kem_keygen_from_seed(&sd);
-    (ek_v, dk_v, ek_d, dk_d)
-}
-
-/// Derive detection-only ML-KEM keypair from a detection root and address index.
-pub fn derive_kem_detect_keys_from_root(detect_root: &F, j: u32) -> (Ek, Dk) {
-    let mut idx = ZERO;
-    idx[..4].copy_from_slice(&j.to_le_bytes());
-    let h1 = hash_two(&felt_tag(b"mlkem-d"), detect_root);
-    let h2 = hash_two(&h1, &idx);
-    let mut out = [0u8; 64];
-    out[..32].copy_from_slice(&h2);
-    let h3 = hash_two(&felt_tag(b"mlkem-d2"), &h2);
-    out[32..].copy_from_slice(&h3);
-    kem_keygen_from_seed(&out)
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct EncryptedNote {
-    #[serde(with = "hex_bytes")]
-    pub ct_d: Vec<u8>,
-    pub tag: u16,
-    #[serde(with = "hex_bytes")]
-    pub ct_v: Vec<u8>,
-    #[serde(with = "hex_bytes")]
-    pub encrypted_data: Vec<u8>,
-}
-
-impl EncryptedNote {
-    pub fn validate(&self) -> Result<(), String> {
-        if self.ct_d.len() != ML_KEM768_CIPHERTEXT_BYTES {
-            return Err(format!(
-                "bad ct_d length: got {} bytes, expected {}",
-                self.ct_d.len(),
-                ML_KEM768_CIPHERTEXT_BYTES
-            ));
-        }
-        if self.ct_v.len() != ML_KEM768_CIPHERTEXT_BYTES {
-            return Err(format!(
-                "bad ct_v length: got {} bytes, expected {}",
-                self.ct_v.len(),
-                ML_KEM768_CIPHERTEXT_BYTES
-            ));
-        }
-        if self.encrypted_data.len() != ENCRYPTED_NOTE_BYTES {
-            return Err(format!(
-                "bad encrypted_data length: got {} bytes, expected {}",
-                self.encrypted_data.len(),
-                ENCRYPTED_NOTE_BYTES
-            ));
-        }
-        if (self.tag as usize) >= (1 << DETECT_K) {
-            return Err(format!(
-                "bad detection tag: got {}, expected low {} bits only",
-                self.tag, DETECT_K
-            ));
-        }
-        Ok(())
-    }
-}
-
-pub fn encrypt_note(
-    v: u64,
-    rseed: &F,
-    user_memo: Option<&[u8]>,
-    ek_v: &Ek,
-    ek_d: &Ek,
-) -> EncryptedNote {
-    let (ct_d, ss_d): (ml_kem_768::Ciphertext, _) = ek_d.encapsulate();
-    let tag_hash = hash(ss_d.as_slice());
-    let tag = u16::from_le_bytes([tag_hash[0], tag_hash[1]]) & ((1 << DETECT_K) - 1);
-
-    let mut plaintext = Vec::with_capacity(8 + 32 + MEMO_SIZE);
-    plaintext.extend_from_slice(&v.to_le_bytes());
-    plaintext.extend_from_slice(rseed);
-    let mut memo_padded = vec![0u8; MEMO_SIZE];
-    match user_memo {
-        Some(m) => {
-            let len = m.len().min(MEMO_SIZE);
-            memo_padded[..len].copy_from_slice(&m[..len]);
-        }
-        None => {
-            memo_padded[0] = 0xF6;
-        }
-    }
-    plaintext.extend_from_slice(&memo_padded);
-
-    let (ct_v, ss_v): (ml_kem_768::Ciphertext, _) = ek_v.encapsulate();
-    let key = hash(ss_v.as_slice());
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
-    let encrypted_data = cipher
-        .encrypt(Nonce::from_slice(&[0u8; 12]), plaintext.as_slice())
-        .unwrap();
-
-    EncryptedNote {
-        ct_d: ct_d.to_vec(),
-        tag,
-        ct_v: ct_v.to_vec(),
-        encrypted_data,
-    }
-}
-
-pub fn encrypt_note_deterministic(
-    v: u64,
-    rseed: &F,
-    user_memo: Option<&[u8]>,
-    ek_v: &Ek,
-    ek_d: &Ek,
-    detect_ephemeral: &[u8; 32],
-    view_ephemeral: &[u8; 32],
-) -> EncryptedNote {
-    let detect_m = ml_kem::array::Array::from(*detect_ephemeral);
-    let view_m = ml_kem::array::Array::from(*view_ephemeral);
-    let (ct_d, ss_d): (ml_kem_768::Ciphertext, _) = ek_d.encapsulate_deterministic(&detect_m);
-    let tag_hash = hash(ss_d.as_slice());
-    let tag = u16::from_le_bytes([tag_hash[0], tag_hash[1]]) & ((1 << DETECT_K) - 1);
-
-    let mut plaintext = Vec::with_capacity(8 + 32 + MEMO_SIZE);
-    plaintext.extend_from_slice(&v.to_le_bytes());
-    plaintext.extend_from_slice(rseed);
-    let mut memo_padded = vec![0u8; MEMO_SIZE];
-    match user_memo {
-        Some(m) => {
-            let len = m.len().min(MEMO_SIZE);
-            memo_padded[..len].copy_from_slice(&m[..len]);
-        }
-        None => {
-            memo_padded[0] = 0xF6;
-        }
-    }
-    plaintext.extend_from_slice(&memo_padded);
-
-    let (ct_v, ss_v): (ml_kem_768::Ciphertext, _) = ek_v.encapsulate_deterministic(&view_m);
-    let key = hash(ss_v.as_slice());
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
-    let encrypted_data = cipher
-        .encrypt(Nonce::from_slice(&[0u8; 12]), plaintext.as_slice())
-        .unwrap();
-
-    EncryptedNote {
-        ct_d: ct_d.to_vec(),
-        tag,
-        ct_v: ct_v.to_vec(),
-        encrypted_data,
-    }
-}
-
-pub fn detect(enc: &EncryptedNote, dk_d: &Dk) -> bool {
-    let Ok(ct) = ml_kem_768::Ciphertext::try_from(enc.ct_d.as_slice()) else {
-        return false;
-    };
-    // For correctly-sized ciphertexts the ml-kem API's decapsulation path is infallible.
-    let ss = dk_d.try_decapsulate(&ct).unwrap();
-    let tag_hash = hash(ss.as_slice());
-    let computed = u16::from_le_bytes([tag_hash[0], tag_hash[1]]) & ((1 << DETECT_K) - 1);
-    computed == enc.tag
-}
-
-pub fn decrypt_memo(enc: &EncryptedNote, dk_v: &Dk) -> Option<(u64, F, Vec<u8>)> {
-    let ct = ml_kem_768::Ciphertext::try_from(enc.ct_v.as_slice()).ok()?;
-    let ss = dk_v.try_decapsulate(&ct).ok()?;
-    let key = hash(ss.as_slice());
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
-    let pt = cipher
-        .decrypt(Nonce::from_slice(&[0u8; 12]), enc.encrypted_data.as_slice())
-        .ok()?;
-    if pt.len() != 8 + 32 + MEMO_SIZE {
-        return None;
-    }
-    let v = u64::from_le_bytes(pt[..8].try_into().unwrap());
-    let mut rseed = ZERO;
-    rseed.copy_from_slice(&pt[8..40]);
-    let user_memo = pt[40..].to_vec();
-    Some((v, rseed, user_memo))
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Merkle tree
-// ═══════════════════════════════════════════════════════════════════════
-
-pub struct MerkleTree {
-    pub leaves: Vec<F>,
-    zero_hashes: Vec<F>,
-}
-
-impl MerkleTree {
-    pub fn new() -> Self {
-        let mut z = vec![ZERO];
-        for i in 0..DEPTH {
-            z.push(hash_merkle(&z[i], &z[i]));
-        }
-        Self {
-            leaves: vec![],
-            zero_hashes: z,
-        }
-    }
-
-    pub fn append(&mut self, leaf: F) -> usize {
-        let i = self.leaves.len();
-        assert!(
-            i < (1u64 << DEPTH) as usize,
-            "Merkle tree full: 2^{} leaves",
-            DEPTH
-        );
-        self.leaves.push(leaf);
-        i
-    }
-
-    pub fn root(&self) -> F {
-        self.compute_level(0, &self.leaves)
-    }
-
-    fn compute_level(&self, depth: usize, level: &[F]) -> F {
-        if depth == DEPTH {
-            return if level.is_empty() {
-                self.zero_hashes[DEPTH]
-            } else {
-                level[0]
-            };
-        }
-        let mut next = vec![];
-        let mut i = 0;
-        loop {
-            let left = if i < level.len() {
-                level[i]
-            } else {
-                self.zero_hashes[depth]
-            };
-            let right = if i + 1 < level.len() {
-                level[i + 1]
-            } else {
-                self.zero_hashes[depth]
-            };
-            next.push(hash_merkle(&left, &right));
-            i += 2;
-            if i >= level.len() && !next.is_empty() {
-                break;
-            }
-        }
-        self.compute_level(depth + 1, &next)
-    }
-
-    pub fn auth_path(&self, index: usize) -> (Vec<F>, F) {
-        let mut level = self.leaves.clone();
-        let mut siblings = vec![];
-        let mut idx = index;
-        for d in 0..DEPTH {
-            let sib_idx = idx ^ 1;
-            siblings.push(if sib_idx < level.len() {
-                level[sib_idx]
-            } else {
-                self.zero_hashes[d]
-            });
-            let mut next = vec![];
-            let mut i = 0;
-            loop {
-                let left = if i < level.len() {
-                    level[i]
-                } else {
-                    self.zero_hashes[d]
-                };
-                let right = if i + 1 < level.len() {
-                    level[i + 1]
-                } else {
-                    self.zero_hashes[d]
-                };
-                next.push(hash_merkle(&left, &right));
-                i += 2;
-                if i >= level.len() {
-                    break;
-                }
-            }
-            level = next;
-            idx /= 2;
-        }
-        (siblings, level[0])
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Note (wallet-side)
-// ═══════════════════════════════════════════════════════════════════════
-
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Note {
-    #[serde(with = "hex_f")]
-    pub nk_spend: F,
-    #[serde(with = "hex_f")]
-    pub nk_tag: F,
-    #[serde(with = "hex_f")]
-    pub auth_root: F,
-    #[serde(with = "hex_f")]
-    pub d_j: F,
-    pub v: u64,
-    #[serde(with = "hex_f")]
-    pub rseed: F,
-    #[serde(with = "hex_f")]
-    pub cm: F,
-    pub index: usize,
-    pub addr_index: u32, // which address j this note belongs to
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Proof enum
-// ═══════════════════════════════════════════════════════════════════════
-
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum Proof {
-    TrustMeBro,
-    Stark {
-        /// Hex-encoded zstd-compressed circuit proof
-        proof_hex: String,
-        /// Public outputs (decimal felt strings) — the circuit commits to these
-        output_preimage: Vec<String>,
-        /// Verification metadata — everything needed for standalone ~50ms verification.
-        /// Serialized ProofConfig, CircuitConfig, CircuitPublicData.
-        #[serde(default)]
-        verify_meta: Option<serde_json::Value>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BootloaderTaskOutput<'a> {
-    pub program_hash: &'a str,
-    pub public_outputs: &'a [String],
-}
-
-/// Parse the privacy bootloader output preimage for the common TzEL case:
-/// exactly one authenticated Cairo task.
-pub fn parse_single_task_output_preimage(
-    output_preimage: &[String],
-) -> Result<BootloaderTaskOutput<'_>, String> {
-    if output_preimage.len() < 3 {
-        return Err("output_preimage too short for bootloader prefix".into());
-    }
-
-    let n_tasks: usize = output_preimage[0]
-        .parse()
-        .map_err(|_| "invalid bootloader task count".to_string())?;
-    if n_tasks != 1 {
-        return Err(format!(
-            "expected exactly 1 bootloader task, got {}",
-            n_tasks
-        ));
-    }
-
-    let task_output_size: usize = output_preimage[1]
-        .parse()
-        .map_err(|_| "invalid bootloader task output size".to_string())?;
-    if task_output_size < 2 {
-        return Err(format!(
-            "bootloader task output too short: {} < 2",
-            task_output_size
-        ));
-    }
-
-    let expected_total_len = 1usize
-        .checked_add(task_output_size)
-        .ok_or_else(|| "bootloader task output size overflow".to_string())?;
-    if output_preimage.len() != expected_total_len {
-        return Err(format!(
-            "output_preimage length mismatch: {} != {}",
-            output_preimage.len(),
-            expected_total_len
-        ));
-    }
-
-    Ok(BootloaderTaskOutput {
-        program_hash: &output_preimage[2],
-        public_outputs: &output_preimage[3..],
-    })
-}
-
-/// Validate that the verified bootloader output preimage corresponds to the
-/// expected TzEL circuit executable, not just any Cairo task.
-pub fn validate_single_task_program_hash<'a>(
-    output_preimage: &'a [String],
-    expected_program_hash: &str,
-) -> Result<&'a [String], String> {
-    let parsed = parse_single_task_output_preimage(output_preimage)?;
-    if parsed.program_hash != expected_program_hash {
-        return Err(format!(
-            "unexpected circuit program hash: got {}, expected {}",
-            parsed.program_hash, expected_program_hash
-        ));
-    }
-    Ok(parsed.public_outputs)
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProgramHashes {
-    pub shield: String,
-    pub transfer: String,
-    pub unshield: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CircuitKind {
-    Shield,
-    Transfer,
-    Unshield,
-}
-
-impl CircuitKind {
-    fn name(self) -> &'static str {
-        match self {
-            CircuitKind::Shield => "shield",
-            CircuitKind::Transfer => "transfer",
-            CircuitKind::Unshield => "unshield",
-        }
-    }
-
-    fn executable_filename(self) -> &'static str {
-        match self {
-            CircuitKind::Shield => "run_shield.executable.json",
-            CircuitKind::Transfer => "run_transfer.executable.json",
-            CircuitKind::Unshield => "run_unshield.executable.json",
-        }
-    }
-
-    fn expected_program_hash<'a>(self, hashes: &'a ProgramHashes) -> &'a str {
-        match self {
-            CircuitKind::Shield => &hashes.shield,
-            CircuitKind::Transfer => &hashes.transfer,
-            CircuitKind::Unshield => &hashes.unshield,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct LedgerProofVerifier {
@@ -1111,7 +73,7 @@ impl LedgerProofVerifier {
                 Ok(())
             }
             Proof::Stark {
-                proof_hex,
+                proof_bytes,
                 output_preimage,
                 verify_meta: _,
             } => {
@@ -1120,8 +82,6 @@ impl LedgerProofVerifier {
                         "Stark proofs rejected: ledger is not configured with --reprove-bin. Start the ledger with --reprove-bin for verified proofs or use --trust-me-bro for development.".into(),
                     );
                 }
-                let proof_bytes =
-                    hex::decode(proof_hex).map_err(|_| "bad proof hex".to_string())?;
                 if proof_bytes.is_empty() {
                     return Err("empty proof".into());
                 }
@@ -1136,7 +96,7 @@ impl LedgerProofVerifier {
 
 fn verify_stark_proof(reprove_bin: &str, proof: &Proof) -> Result<(), String> {
     let Proof::Stark {
-        proof_hex,
+        proof_bytes,
         output_preimage,
         verify_meta,
     } = proof
@@ -1149,13 +109,9 @@ fn verify_stark_proof(reprove_bin: &str, proof: &Proof) -> Result<(), String> {
     }
 
     let bundle_file = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {}", e))?;
-    let bundle = serde_json::json!({
-        "proof_hex": proof_hex,
-        "output_preimage": output_preimage,
-        "verify_meta": verify_meta,
-    });
-    std::fs::write(bundle_file.path(), serde_json::to_string(&bundle).unwrap())
-        .map_err(|e| format!("write bundle: {}", e))?;
+    let encoded = encode_verify_bundle_json(proof_bytes, output_preimage, verify_meta)
+        .map_err(|e| format!("encode bundle: {}", e))?;
+    std::fs::write(bundle_file.path(), encoded).map_err(|e| format!("write bundle: {}", e))?;
 
     let output = std::process::Command::new(reprove_bin)
         .arg("dummy")
@@ -1177,7 +133,28 @@ fn verify_stark_proof(reprove_bin: &str, proof: &Proof) -> Result<(), String> {
     Ok(())
 }
 
-fn compute_program_hash(reprove_bin: &str, executable: &Path) -> Result<String, String> {
+fn encode_verify_bundle_json(
+    proof_bytes: &Vec<u8>,
+    output_preimage: &Vec<F>,
+    verify_meta: &Option<serde_json::Value>,
+) -> Result<Vec<u8>, serde_json::Error> {
+    #[derive(serde::Serialize)]
+    struct VerifyBundle<'a> {
+        #[serde(with = "hex_bytes")]
+        proof_bytes: &'a Vec<u8>,
+        #[serde(with = "hex_f_vec")]
+        output_preimage: &'a Vec<F>,
+        verify_meta: &'a Option<serde_json::Value>,
+    }
+
+    serde_json::to_vec(&VerifyBundle {
+        proof_bytes,
+        output_preimage,
+        verify_meta,
+    })
+}
+
+fn compute_program_hash(reprove_bin: &str, executable: &Path) -> Result<F, String> {
     let output = std::process::Command::new(reprove_bin)
         .arg(executable)
         .arg("--program-hash")
@@ -1208,7 +185,22 @@ fn compute_program_hash(reprove_bin: &str, executable: &Path) -> Result<String, 
             executable.display()
         ));
     }
-    Ok(stdout)
+    let bytes = hex::decode(&stdout).map_err(|_| {
+        format!(
+            "reprover returned non-hex program hash for {}",
+            executable.display()
+        )
+    })?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "reprover returned {} program-hash bytes for {}, expected 32",
+            bytes.len(),
+            executable.display()
+        ));
+    }
+    let mut felt = [0u8; 32];
+    felt.copy_from_slice(&bytes);
+    Ok(felt)
 }
 
 fn load_program_hashes(reprove_bin: &str, executables_dir: &str) -> Result<ProgramHashes, String> {
@@ -1255,491 +247,6 @@ fn validate_stark_circuit(
             )
         })
 }
-
-// ═══════════════════════════════════════════════════════════════════════
-// API types
-// ═══════════════════════════════════════════════════════════════════════
-
-#[derive(Serialize, Deserialize)]
-pub struct FundReq {
-    pub addr: String,
-    pub amount: u64,
-}
-
-/// Payment address — everything a sender needs to create a note for the recipient.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct PaymentAddress {
-    #[serde(with = "hex_f")]
-    pub d_j: F,
-    #[serde(with = "hex_f")]
-    pub auth_root: F,
-    #[serde(with = "hex_f")]
-    pub nk_tag: F,
-    #[serde(with = "hex_bytes")]
-    pub ek_v: Vec<u8>,
-    #[serde(with = "hex_bytes")]
-    pub ek_d: Vec<u8>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ShieldReq {
-    pub sender: String,
-    pub v: u64,
-    pub address: PaymentAddress,
-    pub memo: Option<String>,
-    pub proof: Proof,
-    /// When using real proofs, the client provides its own commitment and encrypted note.
-    /// The ledger uses these instead of generating its own.
-    #[serde(default, with = "hex_f")]
-    pub client_cm: F,
-    #[serde(default)]
-    pub client_enc: Option<EncryptedNote>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ShieldResp {
-    #[serde(with = "hex_f")]
-    pub cm: F,
-    pub index: usize,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct TransferReq {
-    #[serde(with = "hex_f")]
-    pub root: F,
-    #[serde(with = "hex_f_vec")]
-    pub nullifiers: Vec<F>,
-    #[serde(with = "hex_f")]
-    pub cm_1: F,
-    #[serde(with = "hex_f")]
-    pub cm_2: F,
-    pub enc_1: EncryptedNote,
-    pub enc_2: EncryptedNote,
-    pub proof: Proof,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TransferResp {
-    pub index_1: usize,
-    pub index_2: usize,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct UnshieldReq {
-    #[serde(with = "hex_f")]
-    pub root: F,
-    #[serde(with = "hex_f_vec")]
-    pub nullifiers: Vec<F>,
-    pub v_pub: u64,
-    pub recipient: String,
-    #[serde(with = "hex_f")]
-    pub cm_change: F,
-    pub enc_change: Option<EncryptedNote>,
-    pub proof: Proof,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct UnshieldResp {
-    pub change_index: Option<usize>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct NoteMemo {
-    pub index: usize,
-    #[serde(with = "hex_f")]
-    pub cm: F,
-    pub enc: EncryptedNote,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct NotesFeedResp {
-    pub notes: Vec<NoteMemo>,
-    pub next_cursor: usize,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct TreeInfoResp {
-    #[serde(with = "hex_f")]
-    pub root: F,
-    pub size: usize,
-    pub depth: usize,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct MerklePathResp {
-    #[serde(with = "hex_f_vec")]
-    pub siblings: Vec<F>,
-    #[serde(with = "hex_f")]
-    pub root: F,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct NullifiersResp {
-    #[serde(with = "hex_f_vec")]
-    pub nullifiers: Vec<F>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct BalanceResp {
-    pub balances: HashMap<String, u64>,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct ConfigResp {
-    #[serde(with = "hex_f")]
-    pub auth_domain: F,
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Ledger state
-// ═══════════════════════════════════════════════════════════════════════
-
-pub struct Ledger {
-    pub auth_domain: F,
-    pub tree: MerkleTree,
-    pub nullifiers: HashSet<F>,
-    pub balances: HashMap<String, u64>,
-    pub valid_roots: HashSet<F>,
-    pub memos: Vec<(F, EncryptedNote)>,
-}
-
-impl Ledger {
-    pub fn new() -> Self {
-        Self::with_auth_domain(default_auth_domain())
-    }
-
-    pub fn with_auth_domain(auth_domain: F) -> Self {
-        let tree = MerkleTree::new();
-        let mut roots = HashSet::new();
-        roots.insert(tree.root());
-        Self {
-            auth_domain,
-            tree,
-            nullifiers: HashSet::new(),
-            balances: HashMap::new(),
-            valid_roots: roots,
-            memos: vec![],
-        }
-    }
-
-    fn snapshot_root(&mut self) {
-        self.valid_roots.insert(self.tree.root());
-    }
-
-    fn post_note(&mut self, cm: F, enc: EncryptedNote) {
-        self.memos.push((cm, enc));
-    }
-
-    pub fn fund(&mut self, addr: &str, amount: u64) -> Result<(), String> {
-        let bal = self.balances.entry(addr.into()).or_default();
-        *bal = bal
-            .checked_add(amount)
-            .ok_or_else(|| "public balance overflow".to_string())?;
-        Ok(())
-    }
-
-    pub fn shield(&mut self, req: &ShieldReq) -> Result<ShieldResp, String> {
-        let bal = self.balances.get(&req.sender).copied().unwrap_or(0);
-        if bal < req.v {
-            return Err("insufficient balance".into());
-        }
-        if let Some(ref enc) = req.client_enc {
-            enc.validate()
-                .map_err(|e| format!("invalid client encrypted note: {}", e))?;
-        }
-
-        // Validate output_preimage for Stark proofs
-        match &req.proof {
-            Proof::TrustMeBro => {}
-            Proof::Stark {
-                proof_hex: _,
-                output_preimage,
-                verify_meta: _,
-            } => {
-                // Shield outputs: [v_pub, cm_new, sender, memo_ct_hash]
-                if req.client_cm == ZERO {
-                    return Err(
-                        "Stark proof requires client_cm (cannot use server-generated cm)".into(),
-                    );
-                }
-                if req.client_enc.is_none() {
-                    return Err(
-                        "Stark proof requires client_enc (cannot use server-generated note)".into(),
-                    );
-                }
-                if output_preimage.len() < 4 {
-                    return Err("shield output_preimage too short".into());
-                }
-                let tail_start = output_preimage.len() - 4;
-                let tail = &output_preimage[tail_start..];
-                if tail[0] != req.v.to_string() {
-                    return Err("proof v_pub mismatch".into());
-                }
-                if tail[1] != felt_to_dec(&req.client_cm) {
-                    return Err("proof cm mismatch".into());
-                }
-                // Validate sender binding (prevents front-running)
-                let sender_dec = felt_to_dec(&hash(req.sender.as_bytes()));
-                if tail[2] != sender_dec {
-                    return Err("proof sender mismatch".into());
-                }
-                // Validate memo hash (prevents memo spoofing)
-                if let Some(ref enc) = req.client_enc {
-                    let mh = memo_ct_hash(enc);
-                    if tail[3] != felt_to_dec(&mh) {
-                        return Err("proof memo_ct_hash mismatch".into());
-                    }
-                }
-            }
-        }
-
-        // If the client provided a commitment and encrypted note (real proof mode),
-        // use those. Otherwise generate them server-side (TrustMeBro mode).
-        let (cm, enc) = if req.client_cm != ZERO && req.client_enc.is_some() {
-            (req.client_cm, req.client_enc.clone().unwrap())
-        } else {
-            let ek_v = ml_kem_768::EncapsulationKey::new(
-                req.address
-                    .ek_v
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| "bad ek_v length")?,
-            )
-            .map_err(|_| "invalid ek_v")?;
-            let ek_d = ml_kem_768::EncapsulationKey::new(
-                req.address
-                    .ek_d
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| "bad ek_d length")?,
-            )
-            .map_err(|_| "invalid ek_d")?;
-            let rseed = random_felt();
-            let rcm = derive_rcm(&rseed);
-            let otag = owner_tag(&req.address.auth_root, &req.address.nk_tag);
-            let cm = commit(&req.address.d_j, req.v, &rcm, &otag);
-            let memo_bytes = req.memo.as_ref().map(|s| s.as_bytes());
-            (cm, encrypt_note(req.v, &rseed, memo_bytes, &ek_v, &ek_d))
-        };
-
-        *self.balances.get_mut(&req.sender).unwrap() -= req.v;
-        let index = self.tree.append(cm);
-        self.snapshot_root();
-        self.post_note(cm, enc);
-
-        Ok(ShieldResp { cm, index })
-    }
-
-    pub fn transfer(&mut self, req: &TransferReq) -> Result<TransferResp, String> {
-        let n = req.nullifiers.len();
-        if n == 0 || n > 16 {
-            return Err("bad nullifier count".into());
-        }
-        req.enc_1
-            .validate()
-            .map_err(|e| format!("invalid output note 1: {}", e))?;
-        req.enc_2
-            .validate()
-            .map_err(|e| format!("invalid output note 2: {}", e))?;
-        if !self.valid_roots.contains(&req.root) {
-            return Err("invalid root".into());
-        }
-        for nf in &req.nullifiers {
-            if self.nullifiers.contains(nf) {
-                return Err(format!("nullifier {} already spent", short(nf)));
-            }
-        }
-        for i in 0..n {
-            for j in i + 1..n {
-                if req.nullifiers[i] == req.nullifiers[j] {
-                    return Err("duplicate nullifier".into());
-                }
-            }
-        }
-
-        match &req.proof {
-            Proof::TrustMeBro => {}
-            Proof::Stark {
-                proof_hex: _,
-                output_preimage,
-                verify_meta: _,
-            } => {
-                // Validate output_preimage tail matches the transfer's public outputs.
-                // The bootloader wraps with header fields; our program outputs are at the tail.
-                // Transfer outputs:
-                // [auth_domain, root, nf_0..nf_N, cm_1, cm_2, mh_1, mh_2]
-                let n = req.nullifiers.len();
-                let expected_tail_len = 2 + n + 4; // auth_domain + root + N nf + cm_1 + cm_2 + mh_1 + mh_2
-                if output_preimage.len() < expected_tail_len {
-                    return Err(format!(
-                        "output_preimage too short: {} < {}",
-                        output_preimage.len(),
-                        expected_tail_len
-                    ));
-                }
-                let tail_start = output_preimage.len() - expected_tail_len;
-                let tail = &output_preimage[tail_start..];
-
-                // Validate positionally
-                let auth_domain_dec = felt_to_dec(&self.auth_domain);
-                let root_dec = felt_to_dec(&req.root);
-                if tail[0] != auth_domain_dec {
-                    return Err("proof auth_domain mismatch".into());
-                }
-                if tail[1] != root_dec {
-                    return Err(format!("proof root mismatch"));
-                }
-                for (i, nf) in req.nullifiers.iter().enumerate() {
-                    if tail[2 + i] != felt_to_dec(nf) {
-                        return Err(format!("proof nullifier {} mismatch", i));
-                    }
-                }
-                let cm1_pos = 2 + n;
-                if tail[cm1_pos] != felt_to_dec(&req.cm_1) {
-                    return Err("proof cm_1 mismatch".into());
-                }
-                if tail[cm1_pos + 1] != felt_to_dec(&req.cm_2) {
-                    return Err("proof cm_2 mismatch".into());
-                }
-                // Validate memo hashes — prevents memo substitution attacks
-                let mh_1 = memo_ct_hash(&req.enc_1);
-                let mh_2 = memo_ct_hash(&req.enc_2);
-                if tail[cm1_pos + 2] != felt_to_dec(&mh_1) {
-                    return Err("proof memo_ct_hash_1 mismatch — encrypted note tampered".into());
-                }
-                if tail[cm1_pos + 3] != felt_to_dec(&mh_2) {
-                    return Err("proof memo_ct_hash_2 mismatch — encrypted note tampered".into());
-                }
-            }
-        }
-
-        let index_1 = self.tree.append(req.cm_1);
-        let index_2 = self.tree.append(req.cm_2);
-        for nf in &req.nullifiers {
-            self.nullifiers.insert(*nf);
-        }
-        self.post_note(req.cm_1, req.enc_1.clone());
-        self.post_note(req.cm_2, req.enc_2.clone());
-        self.snapshot_root();
-
-        Ok(TransferResp { index_1, index_2 })
-    }
-
-    pub fn unshield(&mut self, req: &UnshieldReq) -> Result<UnshieldResp, String> {
-        let n = req.nullifiers.len();
-        if n == 0 || n > 16 {
-            return Err("bad nullifier count".into());
-        }
-        match (req.cm_change == ZERO, req.enc_change.as_ref()) {
-            (true, Some(_)) => {
-                return Err("change note data provided with zero cm_change".into());
-            }
-            (false, Some(enc)) => {
-                enc.validate()
-                    .map_err(|e| format!("invalid change note: {}", e))?;
-            }
-            _ => {}
-        }
-        if !self.valid_roots.contains(&req.root) {
-            return Err("invalid root".into());
-        }
-        for nf in &req.nullifiers {
-            if self.nullifiers.contains(nf) {
-                return Err(format!("nullifier {} already spent", short(nf)));
-            }
-        }
-        for i in 0..n {
-            for j in i + 1..n {
-                if req.nullifiers[i] == req.nullifiers[j] {
-                    return Err("duplicate nullifier".into());
-                }
-            }
-        }
-
-        match &req.proof {
-            Proof::TrustMeBro => {}
-            Proof::Stark {
-                proof_hex: _,
-                output_preimage,
-                verify_meta: _,
-            } => {
-                // Unshield outputs:
-                // [auth_domain, root, nf_0..nf_N, v_pub, recipient, cm_change, mh_change]
-                let n = req.nullifiers.len();
-                let expected_tail_len = 2 + n + 4; // auth_domain + root + N nf + v_pub + recipient + cm_change + mh_change
-                if output_preimage.len() < expected_tail_len {
-                    return Err(format!("output_preimage too short"));
-                }
-                let tail_start = output_preimage.len() - expected_tail_len;
-                let tail = &output_preimage[tail_start..];
-
-                if tail[0] != felt_to_dec(&self.auth_domain) {
-                    return Err("proof auth_domain mismatch".into());
-                }
-                if tail[1] != felt_to_dec(&req.root) {
-                    return Err("proof root mismatch".into());
-                }
-                for (i, nf) in req.nullifiers.iter().enumerate() {
-                    if tail[2 + i] != felt_to_dec(nf) {
-                        return Err(format!("proof nullifier {} mismatch", i));
-                    }
-                }
-                if tail[2 + n] != req.v_pub.to_string() {
-                    return Err("proof v_pub mismatch".into());
-                }
-                // Validate recipient, cm_change, memo_ct_hash_change
-                let recipient_dec = felt_to_dec(&hash(req.recipient.as_bytes()));
-                if tail[3 + n] != recipient_dec {
-                    return Err("proof recipient mismatch".into());
-                }
-                if tail[4 + n] != felt_to_dec(&req.cm_change) {
-                    return Err("proof cm_change mismatch".into());
-                }
-                // Validate memo_ct_hash_change
-                if let Some(ref enc) = req.enc_change {
-                    let mh = memo_ct_hash(enc);
-                    if tail[5 + n] != felt_to_dec(&mh) {
-                        return Err("proof memo_ct_hash_change mismatch".into());
-                    }
-                } else if tail[5 + n] != "0" {
-                    return Err("proof memo_ct_hash_change should be 0 when no change".into());
-                }
-            }
-        }
-
-        let next_balance = self
-            .balances
-            .get(&req.recipient)
-            .copied()
-            .unwrap_or(0)
-            .checked_add(req.v_pub)
-            .ok_or_else(|| "public balance overflow".to_string())?;
-
-        let change_index = if req.cm_change != ZERO {
-            let enc = req
-                .enc_change
-                .as_ref()
-                .ok_or("change cm without encrypted note")?;
-            let idx = self.tree.append(req.cm_change);
-            self.post_note(req.cm_change, enc.clone());
-            Some(idx)
-        } else {
-            None
-        };
-
-        for nf in &req.nullifiers {
-            self.nullifiers.insert(*nf);
-        }
-        self.balances.insert(req.recipient.clone(), next_balance);
-        self.snapshot_root();
-
-        Ok(UnshieldResp { change_index })
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Tests — cross-implementation verification against Cairo
-// ═══════════════════════════════════════════════════════════════════════
 
 #[cfg(test)]
 mod tests {
@@ -1825,6 +332,28 @@ mod tests {
             "df1ad56380610c948266f0e81ed555bb9152b99bfedff0c328c577277b944501",
             "nf"
         );
+    }
+
+    #[test]
+    fn test_verify_bundle_json_uses_explicit_byte_strings() {
+        let proof_bytes = vec![0xAB, 0xCD];
+        let output_preimage = vec![u(7), u(9)];
+        let verify_meta = Some(serde_json::json!({"ok": true}));
+
+        let encoded = encode_verify_bundle_json(&proof_bytes, &output_preimage, &verify_meta)
+            .expect("bundle encoding should succeed");
+        let json: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("encoded bundle should be valid JSON");
+
+        assert_eq!(json["proof_bytes"], serde_json::json!("abcd"));
+        assert_eq!(
+            json["output_preimage"],
+            serde_json::json!([
+                hex::encode(u(7)),
+                hex::encode(u(9)),
+            ])
+        );
+        assert_eq!(json["verify_meta"], serde_json::json!({"ok": true}));
     }
 
     /// Verify that auth_leaf_hash using WOTS+ key derivation produces a valid
@@ -1949,23 +478,20 @@ mod tests {
     // output_preimage and verifies the ledger rejects it.
     // ═══════════════════════════════════════════════════════════════════
 
+    fn u(v: u64) -> F {
+        u64_to_felt(v)
+    }
+
     /// Helper: build a fake Stark proof with a given output_preimage.
-    /// The proof_hex is garbage — only the output_preimage matters for
+    /// The proof bytes are garbage — only the output_preimage matters for
     /// these tests (we're testing the ledger's validation, not STARK crypto).
-    fn fake_stark(mut output_preimage: Vec<String>) -> Proof {
-        // Spend circuits now begin their program output tail with auth_domain.
-        // Older unit tests build the tail directly; inject the default domain so
-        // they continue targeting the intended field positions.
-        let auth_domain_dec = felt_to_dec(&default_auth_domain());
-        if output_preimage.len() >= 10 {
-            if output_preimage.get(4) != Some(&auth_domain_dec) {
-                output_preimage.insert(4, auth_domain_dec);
-            }
-        } else if output_preimage.len() >= 6 && output_preimage.first() != Some(&auth_domain_dec) {
-            output_preimage.insert(0, auth_domain_dec);
+    fn fake_stark(mut output_preimage: Vec<F>) -> Proof {
+        let auth_domain = default_auth_domain();
+        if output_preimage.len() >= 6 && output_preimage.first() != Some(&auth_domain) {
+            output_preimage.insert(0, auth_domain);
         }
         Proof::Stark {
-            proof_hex: "deadbeef".repeat(100), // non-empty garbage
+            proof_bytes: vec![0xDE; 128], // non-empty garbage
             output_preimage,
             verify_meta: None,
         }
@@ -2034,18 +560,7 @@ mod tests {
 
         // Build output_preimage as if the proof proved (root, nf, real_cm_1, cm_2, mh1, mh2)
         // but submit the request with fake_cm_1
-        let preimage = vec![
-            "1".into(),           // bootloader header
-            format!("{}", 5 + 1), // size
-            "0".into(),
-            "0".into(), // padding
-            felt_to_dec(&root),
-            felt_to_dec(&nf),
-            felt_to_dec(&real_cm_1), // proof proves THIS commitment
-            felt_to_dec(&cm_2),
-            felt_to_dec(&ZERO), // mh_1
-            felt_to_dec(&ZERO), // mh_2
-        ];
+        let preimage = vec![root, nf, real_cm_1, cm_2, ZERO, ZERO];
 
         let result = ledger.transfer(&TransferReq {
             root,
@@ -2082,18 +597,7 @@ mod tests {
         let (ek_atk, _) = kem_keygen_from_seed(&seed_atk);
         let fake_enc = encrypt_note(999, &random_felt(), None, &ek_atk, &ek_atk);
         // Output_preimage commits to mh_1 (real note's hash)
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(), // bootloader header
-            felt_to_dec(&root),
-            felt_to_dec(&nf),
-            felt_to_dec(&cm_1),
-            felt_to_dec(&cm_2),
-            felt_to_dec(&mh_1), // proof commits to REAL memo hash
-            felt_to_dec(&ZERO),
-        ];
+        let preimage = vec![root, nf, cm_1, cm_2, mh_1, ZERO];
 
         let result = ledger.transfer(&TransferReq {
             root,
@@ -2124,18 +628,7 @@ mod tests {
         let alice_recipient = hash(b"alice");
 
         // Proof commits to alice as recipient
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(), // bootloader header
-            felt_to_dec(&root),
-            felt_to_dec(&nf),
-            "1000".into(),                 // v_pub
-            felt_to_dec(&alice_recipient), // proof says ALICE
-            felt_to_dec(&ZERO),            // cm_change
-            felt_to_dec(&ZERO),            // mh_change
-        ];
+        let preimage = vec![root, nf, u(1000), alice_recipient, ZERO, ZERO];
 
         let result = ledger.unshield(&UnshieldReq {
             root,
@@ -2163,18 +656,7 @@ mod tests {
         let (mut ledger, _cm, nf, root, _enc) = setup_with_note();
 
         // Proof commits to v_pub=100
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            felt_to_dec(&root),
-            felt_to_dec(&nf),
-            "100".into(), // proof says 100
-            felt_to_dec(&hash(b"alice")),
-            felt_to_dec(&ZERO),
-            felt_to_dec(&ZERO),
-        ];
+        let preimage = vec![root, nf, u(100), hash(b"alice"), ZERO, ZERO];
 
         let result = ledger.unshield(&UnshieldReq {
             root,
@@ -2205,16 +687,7 @@ mod tests {
         let cm = random_felt();
 
         // Proof commits to v_pub=1
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            "1".into(), // proof says v=1
-            felt_to_dec(&cm),
-            felt_to_dec(&hash(b"alice")),
-            felt_to_dec(&ZERO),
-        ];
+        let preimage = vec![u(1), cm, hash(b"alice"), ZERO];
 
         let addr = PaymentAddress {
             d_j: random_felt(),
@@ -2260,18 +733,7 @@ mod tests {
         let mh = ZERO;
 
         // Proof commits to the REAL nullifier
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            felt_to_dec(&root),
-            felt_to_dec(&nf), // proof proves THIS nullifier
-            felt_to_dec(&cm_1),
-            felt_to_dec(&cm_2),
-            felt_to_dec(&mh),
-            felt_to_dec(&mh),
-        ];
+        let preimage = vec![root, nf, cm_1, cm_2, mh, mh];
 
         let result = ledger.transfer(&TransferReq {
             root,
@@ -2474,16 +936,7 @@ mod tests {
         let real_cm = random_felt();
         let fake_cm = random_felt();
 
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            "1000".into(),
-            felt_to_dec(&real_cm), // proof proves THIS cm
-            felt_to_dec(&ZERO),
-            felt_to_dec(&ZERO),
-        ];
+        let preimage = vec![u(1000), real_cm, ZERO, ZERO];
 
         let addr = PaymentAddress {
             d_j: random_felt(),
@@ -2521,18 +974,7 @@ mod tests {
         let mh = memo_ct_hash(&enc);
 
         // Proof commits to fake_root
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            felt_to_dec(&fake_root), // proof says THIS root
-            felt_to_dec(&nf),
-            felt_to_dec(&cm_1),
-            felt_to_dec(&cm_2),
-            felt_to_dec(&mh),
-            felt_to_dec(&mh),
-        ];
+        let preimage = vec![fake_root, nf, cm_1, cm_2, mh, mh];
 
         let r = ledger.transfer(&TransferReq {
             root, // request uses the REAL root
@@ -2556,19 +998,15 @@ mod tests {
         let mh = memo_ct_hash(&enc);
 
         let proof = Proof::Stark {
-            proof_hex: "deadbeef".repeat(100),
+            proof_bytes: vec![0xDE; 128],
             output_preimage: vec![
-                "1".into(),
-                "0".into(),
-                "0".into(),
-                "0".into(),
-                felt_to_dec(&bad_domain),
-                felt_to_dec(&root),
-                felt_to_dec(&nf),
-                felt_to_dec(&cm_1),
-                felt_to_dec(&cm_2),
-                felt_to_dec(&mh),
-                felt_to_dec(&mh),
+                bad_domain,
+                root,
+                nf,
+                cm_1,
+                cm_2,
+                mh,
+                mh,
             ],
             verify_meta: None,
         };
@@ -2596,18 +1034,7 @@ mod tests {
         let fake_cm_2 = random_felt();
         let mh = memo_ct_hash(&enc);
 
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            felt_to_dec(&root),
-            felt_to_dec(&nf),
-            felt_to_dec(&cm_1),
-            felt_to_dec(&real_cm_2), // proof proves THIS cm_2
-            felt_to_dec(&mh),
-            felt_to_dec(&mh),
-        ];
+        let preimage = vec![root, nf, cm_1, real_cm_2, mh, mh];
 
         let r = ledger.transfer(&TransferReq {
             root,
@@ -2630,18 +1057,7 @@ mod tests {
         let fake_root = random_felt();
         let recipient = hash(b"alice");
 
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            felt_to_dec(&fake_root), // proof says THIS root
-            felt_to_dec(&nf),
-            "1000".into(),
-            felt_to_dec(&recipient),
-            felt_to_dec(&ZERO),
-            felt_to_dec(&ZERO),
-        ];
+        let preimage = vec![fake_root, nf, u(1000), recipient, ZERO, ZERO];
 
         let r = ledger.unshield(&UnshieldReq {
             root, // request uses the REAL root
@@ -2666,18 +1082,7 @@ mod tests {
         let fake_cm_change = random_felt(); // attacker's commitment
         let recipient = hash(b"alice");
 
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            felt_to_dec(&root),
-            felt_to_dec(&nf),
-            "500".into(),
-            felt_to_dec(&recipient),
-            felt_to_dec(&real_cm_change), // proof commits to THIS change
-            felt_to_dec(&ZERO),
-        ];
+        let preimage = vec![root, nf, u(500), recipient, real_cm_change, ZERO];
 
         let result = ledger.unshield(&UnshieldReq {
             root,
@@ -2815,7 +1220,7 @@ mod tests {
             v: 1000,
             address: addr,
             memo: None,
-            proof: fake_stark(vec!["0".into(); 8]),
+            proof: fake_stark(vec![ZERO; 8]),
             client_cm: ZERO, // BUG: no client cm with Stark proof
             client_enc: None,
         });
@@ -2836,7 +1241,7 @@ mod tests {
         let _ = ledger.fund("attacker", 10000);
 
         let cm = random_felt();
-        let alice_sender = felt_to_dec(&hash(b"alice"));
+        let alice_sender = hash(b"alice");
         let enc = EncryptedNote {
             ct_d: vec![0; 1088],
             tag: 0,
@@ -2846,16 +1251,7 @@ mod tests {
         let mh = memo_ct_hash(&enc);
 
         // Proof commits to sender=alice
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            "1000".into(),
-            felt_to_dec(&cm),
-            alice_sender,
-            felt_to_dec(&mh),
-        ];
+        let preimage = vec![u(1000), cm, alice_sender, mh];
 
         let addr = PaymentAddress {
             d_j: random_felt(),
@@ -2888,7 +1284,7 @@ mod tests {
         let _ = ledger.fund("alice", 10000);
 
         let cm = random_felt();
-        let sender_dec = felt_to_dec(&hash(b"alice"));
+        let sender_dec = hash(b"alice");
 
         // Real encrypted note
         let seed: [u8; 64] = [0x33; 64];
@@ -2900,16 +1296,7 @@ mod tests {
         let fake_enc = encrypt_note(999, &random_felt(), Some(b"evil"), &ek, &ek);
 
         // Proof commits to the REAL memo hash
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            "1000".into(),
-            felt_to_dec(&cm),
-            sender_dec,
-            felt_to_dec(&real_mh),
-        ];
+        let preimage = vec![u(1000), cm, sender_dec, real_mh];
 
         let addr = PaymentAddress {
             d_j: random_felt(),
@@ -2940,18 +1327,7 @@ mod tests {
 
         let recipient = hash(b"alice");
         // Proof has nonzero mh_change but no enc_change
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            felt_to_dec(&root),
-            felt_to_dec(&nf),
-            "1000".into(),
-            felt_to_dec(&recipient),
-            felt_to_dec(&ZERO), // cm_change = 0
-            "12345".into(),     // mh_change should be 0 but isn't
-        ];
+        let preimage = vec![root, nf, u(1000), recipient, ZERO, u(12345)];
 
         let r = ledger.unshield(&UnshieldReq {
             root,
@@ -2978,16 +1354,12 @@ mod tests {
         let _ = ledger.fund("alice", 10000);
 
         let cm = random_felt();
-        let sender_dec = felt_to_dec(&hash(b"alice"));
+        let sender_dec = hash(b"alice");
         let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            "1000".into(),
-            felt_to_dec(&cm),
+            u(1000),
+            cm,
             sender_dec,
-            felt_to_dec(&ZERO),
+            ZERO,
         ];
 
         let addr = PaymentAddress {
@@ -3243,40 +1615,21 @@ mod tests {
         }
     }
 
-    /// felt_to_dec for large values (hi != 0 path).
-    /// Covers the long-division big-integer code path.
     #[test]
-    fn test_felt_to_dec_large_values() {
-        // Zero
-        assert_eq!(felt_to_dec(&ZERO), "0");
+    fn test_felt_integer_helpers() {
+        assert_eq!(felt_to_u64(&ZERO).unwrap(), 0);
 
-        // Small value (hi == 0 fast path)
         let mut small = ZERO;
         small[0] = 42;
-        assert_eq!(felt_to_dec(&small), "42");
+        assert_eq!(felt_to_u64(&small).unwrap(), 42);
 
-        // u64 max
         let mut u64max = ZERO;
         u64max[..8].copy_from_slice(&u64::MAX.to_le_bytes());
-        assert_eq!(felt_to_dec(&u64max), u64::MAX.to_string());
+        assert_eq!(felt_to_u64(&u64max).unwrap(), u64::MAX);
 
-        // Value requiring the big-integer path (hi != 0)
-        // 2^128 = value with byte[16] = 1, rest 0
-        let mut big = ZERO;
-        big[16] = 1;
-        let expected = "340282366920938463463374607431768211456"; // 2^128
-        assert_eq!(felt_to_dec(&big), expected);
-
-        // Near max felt252: 2^251 - 1 (all bits set in 251-bit range)
-        let mut max251 = [0xFF_u8; 32];
-        max251[31] = 0x07; // 251-bit truncation
-        let dec = felt_to_dec(&max251);
-        assert!(!dec.is_empty());
-        assert!(
-            dec.len() > 70,
-            "2^251-1 should have ~76 decimal digits, got {}",
-            dec.len()
-        );
+        let mut too_large = ZERO;
+        too_large[16] = 1;
+        assert!(felt_to_u64(&too_large).is_err());
     }
 
     /// Detect with malformed ciphertext returns false (not panic).
@@ -3438,18 +1791,7 @@ mod tests {
         let (ek, _) = kem_keygen_from_seed(&seed);
         let fake_enc_2 = encrypt_note(100, &random_felt(), None, &ek, &ek);
 
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            felt_to_dec(&root),
-            felt_to_dec(&nf),
-            felt_to_dec(&cm_1),
-            felt_to_dec(&cm_2),
-            felt_to_dec(&mh_1),
-            felt_to_dec(&real_mh_2), // proof has REAL mh_2
-        ];
+        let preimage = vec![root, nf, cm_1, cm_2, mh_1, real_mh_2];
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf],
@@ -3491,7 +1833,7 @@ mod tests {
             cm_2: random_felt(),
             enc_1: enc.clone(),
             enc_2: enc.clone(),
-            proof: fake_stark(vec!["1".into(), "2".into()]), // way too short
+            proof: fake_stark(vec![u(1), u(2)]), // way too short
         });
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("too short"));
@@ -3505,22 +1847,13 @@ mod tests {
         let _ = ledger.fund("alice", 10000);
 
         let cm = random_felt();
-        let sender_dec = felt_to_dec(&hash(b"alice"));
+        let sender_dec = hash(b"alice");
         let seed: [u8; 64] = [0x88; 64];
         let (ek, _) = kem_keygen_from_seed(&seed);
         let enc = encrypt_note(500, &random_felt(), None, &ek, &ek);
         let mh = memo_ct_hash(&enc);
 
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            "500".into(),
-            felt_to_dec(&cm),
-            sender_dec,
-            felt_to_dec(&mh),
-        ];
+        let preimage = vec![u(500), cm, sender_dec, mh];
         let addr = PaymentAddress {
             d_j: random_felt(),
             auth_root: random_felt(),
@@ -3854,19 +2187,14 @@ mod tests {
         let _ = ledger.fund("alice", 10000);
 
         let cm = random_felt();
-        let sender_dec = felt_to_dec(&hash(b"alice"));
+        let sender_dec = hash(b"alice");
         let seed: [u8; 64] = [0x99; 64];
         let (ek, _) = kem_keygen_from_seed(&seed);
         let enc = encrypt_note(1000, &random_felt(), None, &ek, &ek);
         let mh = memo_ct_hash(&enc);
 
         // Preimage with exactly 4 elements (minimum valid — no bootloader header)
-        let preimage_4 = vec![
-            "1000".into(),
-            felt_to_dec(&cm),
-            sender_dec.clone(),
-            felt_to_dec(&mh),
-        ];
+        let preimage_4 = vec![u(1000), cm, sender_dec, mh];
         let addr = PaymentAddress {
             d_j: random_felt(),
             auth_root: random_felt(),
@@ -3890,7 +2218,7 @@ mod tests {
         );
 
         // Preimage with 3 elements (too short)
-        let preimage_3 = vec!["1000".into(), felt_to_dec(&cm), sender_dec];
+        let preimage_3 = vec![u(1000), cm, sender_dec];
         let r = ledger.shield(&ShieldReq {
             sender: "alice".into(),
             v: 1000,
@@ -3944,16 +2272,7 @@ mod tests {
         let _ = ledger.fund("alice", 10000);
 
         let cm = random_felt();
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            "1000".into(),
-            felt_to_dec(&cm),
-            felt_to_dec(&ZERO),
-            felt_to_dec(&ZERO),
-        ];
+        let preimage = vec![u(1000), cm, ZERO, ZERO];
         let addr = PaymentAddress {
             d_j: random_felt(),
             auth_root: random_felt(),
@@ -4073,18 +2392,7 @@ mod tests {
         let mh_2 = memo_ct_hash(&enc);
 
         // N=1: tail layout is [root, nf, cm_1, cm_2, mh_1, mh_2] = 6 elements
-        let preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(), // bootloader header (4 elements)
-            felt_to_dec(&root),
-            felt_to_dec(&nf),
-            felt_to_dec(&cm_1),
-            felt_to_dec(&cm_2),
-            felt_to_dec(&mh_1),
-            felt_to_dec(&mh_2),
-        ];
+        let preimage = vec![root, nf, cm_1, cm_2, mh_1, mh_2];
 
         // This should succeed — all fields at correct positions
         let r = ledger.transfer(&TransferReq {
@@ -4103,18 +2411,7 @@ mod tests {
         );
 
         // Now test with preimage that has cm_1 and cm_2 SWAPPED in position
-        let bad_preimage = vec![
-            "1".into(),
-            "0".into(),
-            "0".into(),
-            "0".into(),
-            felt_to_dec(&root),
-            felt_to_dec(&nf),
-            felt_to_dec(&cm_2), // SWAPPED
-            felt_to_dec(&cm_1), // SWAPPED
-            felt_to_dec(&mh_1),
-            felt_to_dec(&mh_2),
-        ];
+        let bad_preimage = vec![root, nf, cm_2, cm_1, mh_1, mh_2];
         let r = ledger.transfer(&TransferReq {
             root,
             nullifiers: vec![nf],
@@ -4213,15 +2510,7 @@ mod tests {
 
         // Build EXACT-length preimage (no bootloader header padding)
         // This means preimage.len() == expected_tail_len, catching < vs <= mutant
-        let preimage = vec![
-            felt_to_dec(&root),
-            felt_to_dec(&nf_0),
-            felt_to_dec(&nf_1),
-            felt_to_dec(&out_cm_1),
-            felt_to_dec(&out_cm_2),
-            felt_to_dec(&mh_1),
-            felt_to_dec(&mh_2),
-        ];
+        let preimage = vec![root, nf_0, nf_1, out_cm_1, out_cm_2, mh_1, mh_2];
 
         let r = ledger.transfer(&TransferReq {
             root,
@@ -4268,15 +2557,7 @@ mod tests {
         let nf2_0 = nullifier(&nk_sp, &ledger2.tree.leaves[0], 0);
         let nf2_1 = nullifier(&nk_sp, &ledger2.tree.leaves[1], 1);
 
-        let bad_preimage = vec![
-            felt_to_dec(&root2),
-            felt_to_dec(&nf2_1), // SWAPPED
-            felt_to_dec(&nf2_0), // SWAPPED
-            felt_to_dec(&out_cm_1),
-            felt_to_dec(&out_cm_2),
-            felt_to_dec(&mh_1),
-            felt_to_dec(&mh_2),
-        ];
+        let bad_preimage = vec![root2, nf2_1, nf2_0, out_cm_1, out_cm_2, mh_1, mh_2];
         let r = ledger2.transfer(&TransferReq {
             root: root2,
             nullifiers: vec![nf2_0, nf2_1],
@@ -4437,31 +2718,31 @@ mod tests {
     #[test]
     fn test_parse_single_task_output_preimage() {
         let output_preimage = vec![
-            "1".to_string(),
-            "5".to_string(),
-            "12345".to_string(),
-            "11".to_string(),
-            "22".to_string(),
-            "33".to_string(),
+            u(1),
+            u(5),
+            u(12345),
+            u(11),
+            u(22),
+            u(33),
         ];
 
         let parsed = parse_single_task_output_preimage(&output_preimage).unwrap();
-        assert_eq!(parsed.program_hash, "12345");
+        assert_eq!(parsed.program_hash, &u(12345));
         assert_eq!(parsed.public_outputs, &output_preimage[3..]);
     }
 
     #[test]
     fn test_validate_single_task_program_hash_rejects_wrong_program() {
         let output_preimage = vec![
-            "1".to_string(),
-            "5".to_string(),
-            "12345".to_string(),
-            "11".to_string(),
-            "22".to_string(),
-            "33".to_string(),
+            u(1),
+            u(5),
+            u(12345),
+            u(11),
+            u(22),
+            u(33),
         ];
 
-        let err = validate_single_task_program_hash(&output_preimage, "99999").unwrap_err();
+        let err = validate_single_task_program_hash(&output_preimage, &u(99999)).unwrap_err();
         assert!(
             err.contains("unexpected circuit program hash"),
             "unexpected error: {}",
@@ -4469,16 +2750,16 @@ mod tests {
         );
     }
 
-    fn fake_stark_with_program_hash(program_hash: &str) -> Proof {
+    fn fake_stark_with_program_hash(program_hash: F) -> Proof {
         Proof::Stark {
-            proof_hex: "00".into(),
+            proof_bytes: vec![0],
             output_preimage: vec![
-                "1".into(),
-                "5".into(),
-                program_hash.into(),
-                "11".into(),
-                "22".into(),
-                "33".into(),
+                u(1),
+                u(5),
+                program_hash,
+                u(11),
+                u(22),
+                u(33),
             ],
             verify_meta: None,
         }
@@ -4486,11 +2767,11 @@ mod tests {
 
     #[test]
     fn test_ledger_proof_verifier_accepts_expected_program_hash() {
-        let proof = fake_stark_with_program_hash("12345");
+        let proof = fake_stark_with_program_hash(u(12345));
         let hashes = ProgramHashes {
-            shield: "111".into(),
-            transfer: "12345".into(),
-            unshield: "333".into(),
+            shield: u(111),
+            transfer: u(12345),
+            unshield: u(333),
         };
 
         let result = validate_stark_circuit(&proof, CircuitKind::Transfer, &hashes);
@@ -4499,11 +2780,11 @@ mod tests {
 
     #[test]
     fn test_ledger_proof_verifier_rejects_unexpected_program_hash() {
-        let proof = fake_stark_with_program_hash("12345");
+        let proof = fake_stark_with_program_hash(u(12345));
         let hashes = ProgramHashes {
-            shield: "111".into(),
-            transfer: "99999".into(),
-            unshield: "333".into(),
+            shield: u(111),
+            transfer: u(99999),
+            unshield: u(333),
         };
 
         let err = validate_stark_circuit(&proof, CircuitKind::Transfer, &hashes).unwrap_err();
@@ -4522,7 +2803,7 @@ mod tests {
     #[test]
     fn test_ledger_proof_verifier_rejects_stark_without_verified_mode() {
         let verifier = LedgerProofVerifier::trust_me_bro_only();
-        let proof = fake_stark_with_program_hash("12345");
+        let proof = fake_stark_with_program_hash(u(12345));
 
         let err = verifier
             .validate(&proof, CircuitKind::Transfer)
@@ -4537,12 +2818,12 @@ mod tests {
     #[test]
     fn test_parse_single_task_output_preimage_rejects_bad_length() {
         let output_preimage = vec![
-            "1".to_string(),
-            "7".to_string(),
-            "12345".to_string(),
-            "11".to_string(),
-            "22".to_string(),
-            "33".to_string(),
+            u(1),
+            u(7),
+            u(12345),
+            u(11),
+            u(22),
+            u(33),
         ];
 
         let err = parse_single_task_output_preimage(&output_preimage).unwrap_err();

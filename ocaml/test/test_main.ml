@@ -1352,9 +1352,9 @@ let test_ledger_check_nullifiers_empty () =
    ══════════════════════════════════════════════════════════════════════ *)
 
 let test_prover_parse_proof_bundle () =
-  let json = {|{"proof":"deadbeef","output_preimage":["0xaabbccdd00000000000000000000000000000000000000000000000000000000","0x1122334400000000000000000000000000000000000000000000000000000000"]}|} in
+  let json = {|{"proof_bytes":"deadbeef","output_preimage":["0xaabbccdd00000000000000000000000000000000000000000000000000000000","0x1122334400000000000000000000000000000000000000000000000000000000"]}|} in
   let bundle = Tzel.Prover.parse_proof_bundle json in
-  Alcotest.(check string) "proof hex" "deadbeef" bundle.proof_hex;
+  Alcotest.(check string) "proof bytes" "deadbeef" bundle.proof_bytes;
   Alcotest.(check int) "preimage len" 2 (List.length bundle.output_preimage)
 
 let test_prover_extract_program_hash () =

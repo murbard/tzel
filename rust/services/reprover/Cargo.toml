@@ -28,6 +28,7 @@ privacy-prove = { git = "https://github.com/starkware-libs/proving-utils", tag =
 privacy-circuit-verify = { git = "https://github.com/starkware-libs/proving-utils", tag = "v1.2.2" }
 
 serde = { version = "1.0", features = ["derive"] }
+tzel-core = { path = "../../protocol/tzel-core" }
 
 # stwo cairo (same revs as proving-utils v1.2.2)
 cairo-air = { git = "https://github.com/starkware-libs/stwo-cairo", rev = "467d5c6d" }

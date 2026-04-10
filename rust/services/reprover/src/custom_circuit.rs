@@ -78,6 +78,15 @@ use stwo::core::fields::m31::M31;
 use stwo::core::fields::qm31::QM31;
 use stwo::core::fri::FriConfig;
 use stwo::core::pcs::PcsConfig;
+use tzel_core::F as RawF;
+
+fn felt_to_raw(felt: &Felt) -> RawF {
+    felt.to_bytes_le()
+}
+
+fn raw_to_felt(raw: &RawF) -> Felt {
+    Felt::from_bytes_le(raw)
+}
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::utils::MaybeOwned;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
@@ -205,10 +214,12 @@ pub struct CustomProofOutput {
 /// Serialized as JSON for transport between prover and verifier.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct ProofBundle {
-    /// Hex-encoded zstd-compressed circuit proof
-    pub proof_hex: String,
-    /// Output preimage (public outputs as decimal felt strings)
-    pub output_preimage: Vec<String>,
+    /// Hex-encoded zstd-compressed circuit proof bytes.
+    #[serde(with = "tzel_core::hex_bytes")]
+    pub proof_bytes: Vec<u8>,
+    /// Output preimage (public outputs as raw felt252 values).
+    #[serde(with = "tzel_core::hex_f_vec")]
+    pub output_preimage: Vec<RawF>,
     /// Verification metadata — serialized ProofConfig, CircuitConfig, CircuitPublicData.
     /// Contains everything needed to deserialize and verify the circuit proof standalone.
     #[serde(default)]
@@ -252,21 +263,18 @@ pub struct VerifyMeta {
 impl ProofBundle {
     pub fn from_output(out: &CustomProofOutput) -> Self {
         Self {
-            proof_hex: hex::encode(&out.proof),
-            output_preimage: out.output_preimage.iter().map(|f| f.to_string()).collect(),
+            proof_bytes: out.proof.clone(),
+            output_preimage: out.output_preimage.iter().map(felt_to_raw).collect(),
             verify_meta: Some(out.verify_meta.clone()),
         }
     }
 
     pub fn proof_bytes(&self) -> Vec<u8> {
-        hex::decode(&self.proof_hex).expect("bad proof hex")
+        self.proof_bytes.clone()
     }
 
     pub fn output_preimage_felts(&self) -> Vec<Felt> {
-        self.output_preimage
-            .iter()
-            .map(|s| Felt::from_dec_str(s).expect("bad felt"))
-            .collect()
+        self.output_preimage.iter().map(raw_to_felt).collect()
     }
 
     /// Standalone verification: deserialize the circuit proof and verify it

@@ -5,5 +5,8 @@ members = [
   "apps/ledger",
   "apps/wallet",
   "backends/rust",
+  "rust/protocol/tzel-core",
+  "rust/protocol/rollup-kernel",
+  "rust/protocol/tzel-verifier",
   "rust/services/tzel",
 ]

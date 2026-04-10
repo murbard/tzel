@@ -29,7 +29,7 @@ struct Cli {
     #[arg(long, short)]
     output: Option<PathBuf>,
 
-    /// JSON file with witness arguments (array of decimal felt strings, length-prefixed)
+    /// JSON file with witness arguments (array of hex felt strings, length-prefixed)
     #[arg(long)]
     arguments_file: Option<PathBuf>,
 
@@ -82,7 +82,7 @@ fn main() -> Result<()> {
 
     if cli.program_hash {
         let program_hash = compute_executable_program_hash(&cli.executable)?;
-        println!("{}", program_hash);
+        println!("{}", hex::encode(program_hash.to_bytes_le()));
         return Ok(());
     }
 

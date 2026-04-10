@@ -6,13 +6,14 @@
 //! (shield, transfer, unshield).
 
 use ml_kem::{ml_kem_768, KeyExport};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tzel_services::*;
 use ureq::{http, RequestExt};
 
 const LEDGER_PORT: u16 = 19876;
+const PROVER_TOOLCHAIN: &str = "+nightly-2025-07-14";
 
 fn ledger_url() -> String {
     format!("http://localhost:{}", LEDGER_PORT)
@@ -28,20 +29,18 @@ fn workspace_root() -> std::path::PathBuf {
 
 fn ensure_app_bin(package: &str, bin: &str) -> String {
     let path = workspace_root().join("target/debug").join(bin);
-    if !path.exists() {
-        let out = Command::new("cargo")
-            .current_dir(workspace_root())
-            .args(["build", "-p", package, "--bin", bin])
-            .output()
-            .expect("failed to build app binary");
-        assert!(
-            out.status.success(),
-            "failed to build {}:\nstdout:\n{}\nstderr:\n{}",
-            bin,
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    let out = Command::new("cargo")
+        .current_dir(workspace_root())
+        .args(["build", "-p", package, "--bin", bin])
+        .output()
+        .expect("failed to build app binary");
+    assert!(
+        out.status.success(),
+        "failed to build {}:\nstdout:\n{}\nstderr:\n{}",
+        bin,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     path.to_str().unwrap().to_string()
 }
 
@@ -56,6 +55,17 @@ fn sp_ledger() -> String {
 /// Path to the reprove binary in the workspace target dir.
 fn reprove_bin() -> String {
     let path = workspace_root().join("apps/prover/target/release/reprove");
+    let out = Command::new("cargo")
+        .current_dir(workspace_root().join("apps/prover"))
+        .args([PROVER_TOOLCHAIN, "build", "--release", "--bin", "reprove"])
+        .output()
+        .expect("failed to build reprover binary");
+    assert!(
+        out.status.success(),
+        "failed to build reprove:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     path.to_str().unwrap().to_string()
 }
 
@@ -258,22 +268,24 @@ fn generate_shield_proof(
         String::from_utf8_lossy(&out.stderr)
     );
 
+    #[derive(Deserialize)]
+    struct ProofBundleJson {
+        #[serde(with = "hex_bytes")]
+        proof_bytes: Vec<u8>,
+        #[serde(with = "hex_f_vec")]
+        output_preimage: Vec<F>,
+        #[serde(default)]
+        verify_meta: Option<serde_json::Value>,
+    }
+
     let bundle_json = std::fs::read_to_string(proof_file.path()).unwrap();
-    let bundle: serde_json::Value = serde_json::from_str(&bundle_json).unwrap();
-    let proof_hex = bundle["proof_hex"].as_str().unwrap().to_string();
-    let output_preimage = bundle["output_preimage"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap().to_string())
-        .collect();
-    let verify_meta = bundle.get("verify_meta").cloned();
+    let bundle: ProofBundleJson = serde_json::from_str(&bundle_json).unwrap();
 
     (
         Proof::Stark {
-            proof_hex,
-            output_preimage,
-            verify_meta,
+            proof_bytes: bundle.proof_bytes,
+            output_preimage: bundle.output_preimage,
+            verify_meta: bundle.verify_meta,
         },
         cm,
         enc,
@@ -760,14 +772,14 @@ fn test_ledger_rejects_tampered_output_preimage() {
 
         let tampered_proof = match proof {
             Proof::Stark {
-                proof_hex,
+                proof_bytes,
                 mut output_preimage,
                 verify_meta,
             } => {
                 let tail_start = output_preimage.len() - 4;
-                output_preimage[tail_start + 1] = felt_to_dec(&tampered_cm);
+                output_preimage[tail_start + 1] = tampered_cm;
                 Proof::Stark {
-                    proof_hex,
+                    proof_bytes,
                     output_preimage,
                     verify_meta,
                 }

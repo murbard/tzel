@@ -30,7 +30,7 @@ struct Args {
 
 #[derive(serde::Deserialize)]
 struct ProofBundle {
-    proof: String,
+    proof_bytes: String,
     output_preimage: Vec<String>,
 }
 
@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let bundle: ProofBundle = serde_json::from_str(&json)?;
 
     // Decode
-    let proof_bytes = hex::decode(&bundle.proof)?;
+    let proof_bytes = hex::decode(&bundle.proof_bytes)?;
     let output_preimage: Vec<Felt> = bundle
         .output_preimage
         .iter()

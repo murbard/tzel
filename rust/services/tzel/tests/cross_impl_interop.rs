@@ -35,12 +35,12 @@ fn shield_req(step: &InteropShieldStep) -> ShieldReq {
         address: step.address.clone(),
         memo: None,
         proof: Proof::Stark {
-            proof_hex: String::new(),
+            proof_bytes: vec![1],
             output_preimage: vec![
-                step.v.to_string(),
-                felt_to_dec(&step.cm),
-                felt_to_dec(&hash(step.sender.as_bytes())),
-                felt_to_dec(&step.memo_ct_hash),
+                u64_to_felt(step.v),
+                step.cm,
+                hash(step.sender.as_bytes()),
+                step.memo_ct_hash,
             ],
             verify_meta: None,
         },
@@ -50,12 +50,12 @@ fn shield_req(step: &InteropShieldStep) -> ShieldReq {
 }
 
 fn transfer_req(step: &InteropTransferStep, auth_domain: &F) -> TransferReq {
-    let mut output_preimage = vec![felt_to_dec(auth_domain), felt_to_dec(&step.root)];
-    output_preimage.extend(step.nullifiers.iter().map(felt_to_dec));
-    output_preimage.push(felt_to_dec(&step.cm_1));
-    output_preimage.push(felt_to_dec(&step.cm_2));
-    output_preimage.push(felt_to_dec(&step.memo_ct_hash_1));
-    output_preimage.push(felt_to_dec(&step.memo_ct_hash_2));
+    let mut output_preimage = vec![*auth_domain, step.root];
+    output_preimage.extend(step.nullifiers.iter().copied());
+    output_preimage.push(step.cm_1);
+    output_preimage.push(step.cm_2);
+    output_preimage.push(step.memo_ct_hash_1);
+    output_preimage.push(step.memo_ct_hash_2);
     TransferReq {
         root: step.root,
         nullifiers: step.nullifiers.clone(),
@@ -64,7 +64,7 @@ fn transfer_req(step: &InteropTransferStep, auth_domain: &F) -> TransferReq {
         enc_1: step.enc_1.clone(),
         enc_2: step.enc_2.clone(),
         proof: Proof::Stark {
-            proof_hex: String::new(),
+            proof_bytes: vec![1],
             output_preimage,
             verify_meta: None,
         },
@@ -72,12 +72,12 @@ fn transfer_req(step: &InteropTransferStep, auth_domain: &F) -> TransferReq {
 }
 
 fn unshield_req(step: &InteropUnshieldStep, auth_domain: &F) -> UnshieldReq {
-    let mut output_preimage = vec![felt_to_dec(auth_domain), felt_to_dec(&step.root)];
-    output_preimage.extend(step.nullifiers.iter().map(felt_to_dec));
-    output_preimage.push(step.v_pub.to_string());
-    output_preimage.push(felt_to_dec(&hash(step.recipient.as_bytes())));
-    output_preimage.push(felt_to_dec(&step.cm_change));
-    output_preimage.push(felt_to_dec(&step.memo_ct_hash_change));
+    let mut output_preimage = vec![*auth_domain, step.root];
+    output_preimage.extend(step.nullifiers.iter().copied());
+    output_preimage.push(u64_to_felt(step.v_pub));
+    output_preimage.push(hash(step.recipient.as_bytes()));
+    output_preimage.push(step.cm_change);
+    output_preimage.push(step.memo_ct_hash_change);
     UnshieldReq {
         root: step.root,
         nullifiers: step.nullifiers.clone(),
@@ -86,7 +86,7 @@ fn unshield_req(step: &InteropUnshieldStep, auth_domain: &F) -> UnshieldReq {
         cm_change: step.cm_change,
         enc_change: step.enc_change.clone(),
         proof: Proof::Stark {
-            proof_hex: String::new(),
+            proof_bytes: vec![1],
             output_preimage,
             verify_meta: None,
         },
