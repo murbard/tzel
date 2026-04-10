@@ -770,11 +770,96 @@ fn unshield_resp_from_wire(wire: WireUnshieldResp) -> Result<UnshieldResp, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical_wire::ML_KEM768_ENCAPSULATION_KEY_BYTES;
     use crate::{
         build_auth_tree, derive_account, derive_address, derive_ask, derive_kem_keys,
-        derive_nk_spend, derive_nk_tag, ZERO,
+        derive_nk_spend, derive_nk_tag, DETECT_K, ZERO,
     };
     use ml_kem::KeyExport;
+    use proptest::prelude::*;
+
+    fn small_string(max_len: usize) -> impl Strategy<Value = String> {
+        prop::collection::vec(
+            prop_oneof![
+                Just('a'),
+                Just('b'),
+                Just('c'),
+                Just('x'),
+                Just('y'),
+                Just('z'),
+                Just('0'),
+                Just('1'),
+                Just('2'),
+                Just('-'),
+                Just('_'),
+                Just(' '),
+            ],
+            0..=max_len,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    fn arb_felt() -> impl Strategy<Value = F> {
+        prop::array::uniform32(any::<u8>())
+    }
+
+    fn arb_encrypted_note() -> impl Strategy<Value = EncryptedNote> {
+        (
+            prop::collection::vec(any::<u8>(), ML_KEM768_CIPHERTEXT_BYTES),
+            0u16..((1u16) << DETECT_K),
+            prop::collection::vec(any::<u8>(), ML_KEM768_CIPHERTEXT_BYTES),
+            prop::collection::vec(any::<u8>(), ENCRYPTED_NOTE_BYTES),
+        )
+            .prop_map(|(ct_d, tag, ct_v, encrypted_data)| EncryptedNote {
+                ct_d,
+                tag,
+                ct_v,
+                encrypted_data,
+            })
+    }
+
+    fn arb_payment_address() -> impl Strategy<Value = PaymentAddress> {
+        (
+            arb_felt(),
+            arb_felt(),
+            arb_felt(),
+            prop::collection::vec(any::<u8>(), ML_KEM768_ENCAPSULATION_KEY_BYTES),
+            prop::collection::vec(any::<u8>(), ML_KEM768_ENCAPSULATION_KEY_BYTES),
+        )
+            .prop_map(|(d_j, auth_root, nk_tag, ek_v, ek_d)| PaymentAddress {
+                d_j,
+                auth_root,
+                nk_tag,
+                ek_v,
+                ek_d,
+            })
+    }
+
+    fn arb_verify_meta() -> impl Strategy<Value = serde_json::Value> {
+        (
+            any::<u32>(),
+            small_string(16),
+            prop::collection::vec(any::<u16>(), 0..5),
+        )
+            .prop_map(|(n, label, arr)| serde_json::json!({
+                "n": n,
+                "label": label,
+                "arr": arr,
+            }))
+    }
+
+    fn arb_kernel_stark_proof() -> impl Strategy<Value = KernelStarkProof> {
+        (
+            prop::collection::vec(any::<u8>(), 0..128),
+            prop::collection::vec(arb_felt(), 0..8),
+            arb_verify_meta(),
+        )
+            .prop_map(|(proof_bytes, output_preimage, verify_meta)| KernelStarkProof {
+                proof_bytes,
+                output_preimage,
+                verify_meta,
+            })
+    }
 
     #[test]
     fn kernel_inbox_roundtrip_preserves_shield_request() {
@@ -1045,5 +1130,462 @@ mod tests {
             output_preimage: vec![[7u8; 32], [8u8; 32]],
             verify_meta: serde_json::json!({"proof_config": {"foo": 1}}),
         }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_kernel_shield_roundtrip_preserves_fields(
+            sender in small_string(32),
+            memo in prop::option::of(small_string(64)),
+            v in any::<u64>(),
+            address in arb_payment_address(),
+            proof in arb_kernel_stark_proof(),
+            client_cm in arb_felt(),
+            client_enc in prop::option::of(arb_encrypted_note()),
+        ) {
+            let message = KernelInboxMessage::Shield(KernelShieldReq {
+                sender: sender.clone(),
+                v,
+                address: address.clone(),
+                memo: memo.clone(),
+                proof: proof.clone(),
+                client_cm,
+                client_enc: client_enc.clone(),
+            });
+
+            let encoded = encode_kernel_inbox_message(&message).unwrap();
+            let decoded = decode_kernel_inbox_message(&encoded).unwrap();
+            let KernelInboxMessage::Shield(req) = decoded else {
+                panic!("decoded wrong kernel message variant");
+            };
+            prop_assert_eq!(req.sender, sender);
+            prop_assert_eq!(req.v, v);
+            prop_assert_eq!(req.memo, memo);
+            prop_assert_eq!(req.address.d_j, address.d_j);
+            prop_assert_eq!(req.address.auth_root, address.auth_root);
+            prop_assert_eq!(req.address.nk_tag, address.nk_tag);
+            prop_assert_eq!(req.address.ek_v, address.ek_v);
+            prop_assert_eq!(req.address.ek_d, address.ek_d);
+            prop_assert_eq!(req.client_cm, client_cm);
+            prop_assert_eq!(req.client_enc.is_some(), client_enc.is_some());
+            if let (Some(actual), Some(expected)) = (req.client_enc.as_ref(), client_enc.as_ref()) {
+                prop_assert_eq!(&actual.ct_d, &expected.ct_d);
+                prop_assert_eq!(actual.tag, expected.tag);
+                prop_assert_eq!(&actual.ct_v, &expected.ct_v);
+                prop_assert_eq!(&actual.encrypted_data, &expected.encrypted_data);
+            }
+            prop_assert_eq!(req.proof.proof_bytes, proof.proof_bytes);
+            prop_assert_eq!(req.proof.output_preimage, proof.output_preimage);
+            prop_assert_eq!(req.proof.verify_meta, proof.verify_meta);
+        }
+
+        #[test]
+        fn prop_kernel_transfer_roundtrip_preserves_fields(
+            root in arb_felt(),
+            nullifiers in prop::collection::vec(arb_felt(), 0..8),
+            cm_1 in arb_felt(),
+            cm_2 in arb_felt(),
+            enc_1 in arb_encrypted_note(),
+            enc_2 in arb_encrypted_note(),
+            proof in arb_kernel_stark_proof(),
+        ) {
+            let req = KernelTransferReq {
+                root,
+                nullifiers: nullifiers.clone(),
+                cm_1,
+                cm_2,
+                enc_1: enc_1.clone(),
+                enc_2: enc_2.clone(),
+                proof: proof.clone(),
+            };
+
+            let wire = kernel_transfer_req_to_wire(&req).unwrap();
+            let decoded = kernel_transfer_req_from_wire(wire).unwrap();
+            prop_assert_eq!(decoded.root, root);
+            prop_assert_eq!(decoded.nullifiers, nullifiers);
+            prop_assert_eq!(decoded.cm_1, cm_1);
+            prop_assert_eq!(decoded.cm_2, cm_2);
+            prop_assert_eq!(decoded.enc_1.ct_d, enc_1.ct_d);
+            prop_assert_eq!(decoded.enc_1.tag, enc_1.tag);
+            prop_assert_eq!(decoded.enc_1.ct_v, enc_1.ct_v);
+            prop_assert_eq!(decoded.enc_1.encrypted_data, enc_1.encrypted_data);
+            prop_assert_eq!(decoded.enc_2.ct_d, enc_2.ct_d);
+            prop_assert_eq!(decoded.enc_2.tag, enc_2.tag);
+            prop_assert_eq!(decoded.enc_2.ct_v, enc_2.ct_v);
+            prop_assert_eq!(decoded.enc_2.encrypted_data, enc_2.encrypted_data);
+            prop_assert_eq!(decoded.proof.proof_bytes, proof.proof_bytes);
+            prop_assert_eq!(decoded.proof.output_preimage, proof.output_preimage);
+            prop_assert_eq!(decoded.proof.verify_meta, proof.verify_meta);
+        }
+
+        #[test]
+        fn prop_kernel_unshield_roundtrip_preserves_fields(
+            root in arb_felt(),
+            nullifiers in prop::collection::vec(arb_felt(), 0..8),
+            v_pub in any::<u64>(),
+            recipient in small_string(32),
+            cm_change in arb_felt(),
+            enc_change in prop::option::of(arb_encrypted_note()),
+            proof in arb_kernel_stark_proof(),
+        ) {
+            let req = KernelUnshieldReq {
+                root,
+                nullifiers: nullifiers.clone(),
+                v_pub,
+                recipient: recipient.clone(),
+                cm_change,
+                enc_change: enc_change.clone(),
+                proof: proof.clone(),
+            };
+
+            let wire = kernel_unshield_req_to_wire(&req).unwrap();
+            let decoded = kernel_unshield_req_from_wire(wire).unwrap();
+            prop_assert_eq!(decoded.root, root);
+            prop_assert_eq!(decoded.nullifiers, nullifiers);
+            prop_assert_eq!(decoded.v_pub, v_pub);
+            prop_assert_eq!(decoded.recipient, recipient);
+            prop_assert_eq!(decoded.cm_change, cm_change);
+            prop_assert_eq!(decoded.enc_change.is_some(), enc_change.is_some());
+            if let (Some(actual), Some(expected)) = (decoded.enc_change.as_ref(), enc_change.as_ref()) {
+                prop_assert_eq!(&actual.ct_d, &expected.ct_d);
+                prop_assert_eq!(actual.tag, expected.tag);
+                prop_assert_eq!(&actual.ct_v, &expected.ct_v);
+                prop_assert_eq!(&actual.encrypted_data, &expected.encrypted_data);
+            }
+            prop_assert_eq!(decoded.proof.proof_bytes, proof.proof_bytes);
+            prop_assert_eq!(decoded.proof.output_preimage, proof.output_preimage);
+            prop_assert_eq!(decoded.proof.verify_meta, proof.verify_meta);
+        }
+
+        #[test]
+        fn prop_kernel_result_roundtrip_preserves_payload(
+            shield_cm in arb_felt(),
+            shield_index in 0u64..10_000,
+            transfer_index_1 in 0u64..10_000,
+            transfer_index_2 in 0u64..10_000,
+            change_index in prop::option::of(0u64..10_000),
+            message in small_string(64),
+        ) {
+            let cases = [
+                KernelResult::Configured,
+                KernelResult::Fund,
+                KernelResult::Shield(ShieldResp { cm: shield_cm, index: shield_index as usize }),
+                KernelResult::Transfer(TransferResp {
+                    index_1: transfer_index_1 as usize,
+                    index_2: transfer_index_2 as usize,
+                }),
+                KernelResult::Unshield(UnshieldResp {
+                    change_index: change_index.map(|x| x as usize),
+                }),
+                KernelResult::Error { message: message.clone() },
+            ];
+
+            for result in cases {
+                let encoded = encode_kernel_result(&result).unwrap();
+                let decoded = decode_kernel_result(&encoded).unwrap();
+                match (decoded, &result) {
+                    (KernelResult::Configured, KernelResult::Configured)
+                    | (KernelResult::Fund, KernelResult::Fund) => {}
+                    (KernelResult::Shield(actual), KernelResult::Shield(expected)) => {
+                        prop_assert_eq!(actual.cm, expected.cm);
+                        prop_assert_eq!(actual.index, expected.index);
+                    }
+                    (KernelResult::Transfer(actual), KernelResult::Transfer(expected)) => {
+                        prop_assert_eq!(actual.index_1, expected.index_1);
+                        prop_assert_eq!(actual.index_2, expected.index_2);
+                    }
+                    (KernelResult::Unshield(actual), KernelResult::Unshield(expected)) => {
+                        prop_assert_eq!(actual.change_index, expected.change_index);
+                    }
+                    (KernelResult::Error { message: actual }, KernelResult::Error { message: expected }) => {
+                        prop_assert_eq!(&actual, expected);
+                    }
+                    (actual, expected) => prop_assert!(false, "decoded result variant mismatch: {:?} vs {:?}", actual, expected),
+                }
+            }
+        }
+
+        #[test]
+        fn prop_kernel_verifier_config_roundtrip_preserves_fields(
+            auth_domain in arb_felt(),
+            shield in arb_felt(),
+            transfer in arb_felt(),
+            unshield in arb_felt(),
+        ) {
+            let config = KernelVerifierConfig {
+                auth_domain,
+                verified_program_hashes: ProgramHashes {
+                    shield,
+                    transfer,
+                    unshield,
+                },
+            };
+
+            let encoded = encode_kernel_verifier_config(&config).unwrap();
+            let decoded = decode_kernel_verifier_config(&encoded).unwrap();
+            prop_assert_eq!(decoded.auth_domain, auth_domain);
+            prop_assert_eq!(decoded.verified_program_hashes.shield, shield);
+            prop_assert_eq!(decoded.verified_program_hashes.transfer, transfer);
+            prop_assert_eq!(decoded.verified_program_hashes.unshield, unshield);
+        }
+
+        #[test]
+        fn prop_kernel_proof_to_host_preserves_stark_payload(
+            proof in arb_kernel_stark_proof(),
+        ) {
+            let host = kernel_proof_to_host(&proof);
+            let Proof::Stark {
+                proof_bytes,
+                output_preimage,
+                verify_meta,
+            } = host else {
+                prop_assert!(false, "kernel proof must convert to Proof::Stark");
+                unreachable!();
+            };
+            prop_assert_eq!(proof_bytes, proof.proof_bytes);
+            prop_assert_eq!(output_preimage, proof.output_preimage);
+            prop_assert_eq!(verify_meta, Some(proof.verify_meta));
+        }
+
+        #[test]
+        fn prop_kernel_requests_to_host_preserve_fields(
+            sender in small_string(32),
+            memo in prop::option::of(small_string(64)),
+            recipient in small_string(32),
+            root in arb_felt(),
+            nullifiers in prop::collection::vec(arb_felt(), 0..8),
+            cm_1 in arb_felt(),
+            cm_2 in arb_felt(),
+            cm_change in arb_felt(),
+            client_cm in arb_felt(),
+            value in any::<u64>(),
+            address in arb_payment_address(),
+            proof in arb_kernel_stark_proof(),
+            enc_1 in arb_encrypted_note(),
+            enc_2 in arb_encrypted_note(),
+            enc_change in prop::option::of(arb_encrypted_note()),
+            client_enc in prop::option::of(arb_encrypted_note()),
+        ) {
+            let shield = KernelShieldReq {
+                sender: sender.clone(),
+                v: value,
+                address: address.clone(),
+                memo: memo.clone(),
+                proof: proof.clone(),
+                client_cm,
+                client_enc: client_enc.clone(),
+            };
+            let shield_host = kernel_shield_req_to_host(&shield);
+            prop_assert_eq!(shield_host.sender, sender);
+            prop_assert_eq!(shield_host.v, value);
+            prop_assert_eq!(shield_host.address.d_j, address.d_j);
+            prop_assert_eq!(shield_host.memo, memo);
+            prop_assert_eq!(shield_host.client_cm, client_cm);
+            prop_assert_eq!(shield_host.client_enc.is_some(), client_enc.is_some());
+
+            let transfer = KernelTransferReq {
+                root,
+                nullifiers: nullifiers.clone(),
+                cm_1,
+                cm_2,
+                enc_1: enc_1.clone(),
+                enc_2: enc_2.clone(),
+                proof: proof.clone(),
+            };
+            let transfer_host = kernel_transfer_req_to_host(&transfer);
+            let transfer_nullifiers = transfer_host.nullifiers.clone();
+            prop_assert_eq!(transfer_host.root, root);
+            prop_assert_eq!(&transfer_nullifiers, &nullifiers);
+            prop_assert_eq!(transfer_host.cm_1, cm_1);
+            prop_assert_eq!(transfer_host.cm_2, cm_2);
+            prop_assert_eq!(transfer_host.enc_1.ct_d, enc_1.ct_d);
+            prop_assert_eq!(transfer_host.enc_2.ct_v, enc_2.ct_v);
+
+            let unshield = KernelUnshieldReq {
+                root,
+                nullifiers: transfer_nullifiers.clone(),
+                v_pub: value,
+                recipient: recipient.clone(),
+                cm_change,
+                enc_change: enc_change.clone(),
+                proof,
+            };
+            let unshield_host = kernel_unshield_req_to_host(&unshield);
+            prop_assert_eq!(unshield_host.root, root);
+            prop_assert_eq!(&unshield_host.nullifiers, &transfer_nullifiers);
+            prop_assert_eq!(unshield_host.v_pub, value);
+            prop_assert_eq!(unshield_host.recipient, recipient);
+            prop_assert_eq!(unshield_host.cm_change, cm_change);
+            prop_assert_eq!(unshield_host.enc_change.is_some(), enc_change.is_some());
+        }
+
+        #[test]
+        fn prop_transfer_payload_rejects_trailing_bytes(
+            req_root in arb_felt(),
+            nullifiers in prop::collection::vec(arb_felt(), 0..6),
+            cm_1 in arb_felt(),
+            cm_2 in arb_felt(),
+            enc_1 in arb_encrypted_note(),
+            enc_2 in arb_encrypted_note(),
+            proof in arb_kernel_stark_proof(),
+            trailing in prop::collection::vec(any::<u8>(), 1..8),
+        ) {
+            let req = KernelTransferReq {
+                root: req_root,
+                nullifiers,
+                cm_1,
+                cm_2,
+                enc_1,
+                enc_2,
+                proof,
+            };
+            let mut wire = kernel_transfer_req_to_wire(&req).unwrap();
+            wire.bytes.extend_from_slice(&trailing);
+            let err = kernel_transfer_req_from_wire(wire).unwrap_err();
+            prop_assert!(err.contains("trailing bytes"));
+        }
+
+        #[test]
+        fn prop_transfer_payload_rejects_truncation(
+            req_root in arb_felt(),
+            nullifiers in prop::collection::vec(arb_felt(), 0..6),
+            cm_1 in arb_felt(),
+            cm_2 in arb_felt(),
+            enc_1 in arb_encrypted_note(),
+            enc_2 in arb_encrypted_note(),
+            proof in arb_kernel_stark_proof(),
+            cut in 1usize..8,
+        ) {
+            let req = KernelTransferReq {
+                root: req_root,
+                nullifiers,
+                cm_1,
+                cm_2,
+                enc_1,
+                enc_2,
+                proof,
+            };
+            let mut wire = kernel_transfer_req_to_wire(&req).unwrap();
+            prop_assume!(wire.bytes.len() > cut);
+            wire.bytes.truncate(wire.bytes.len() - cut);
+            let err = kernel_transfer_req_from_wire(wire).unwrap_err();
+            prop_assert!(err.contains("read failed") || err.contains("trailing bytes"));
+        }
+
+        #[test]
+        fn prop_unshield_payload_rejects_trailing_bytes(
+            req_root in arb_felt(),
+            nullifiers in prop::collection::vec(arb_felt(), 0..6),
+            v_pub in any::<u64>(),
+            recipient in small_string(32),
+            cm_change in arb_felt(),
+            enc_change in prop::option::of(arb_encrypted_note()),
+            proof in arb_kernel_stark_proof(),
+            trailing in prop::collection::vec(any::<u8>(), 1..8),
+        ) {
+            let req = KernelUnshieldReq {
+                root: req_root,
+                nullifiers,
+                v_pub,
+                recipient,
+                cm_change,
+                enc_change,
+                proof,
+            };
+            let mut wire = kernel_unshield_req_to_wire(&req).unwrap();
+            wire.bytes.extend_from_slice(&trailing);
+            let err = kernel_unshield_req_from_wire(wire).unwrap_err();
+            prop_assert!(err.contains("trailing bytes"));
+        }
+
+        #[test]
+        fn prop_unshield_payload_rejects_truncation(
+            req_root in arb_felt(),
+            nullifiers in prop::collection::vec(arb_felt(), 0..6),
+            v_pub in any::<u64>(),
+            recipient in small_string(32),
+            cm_change in arb_felt(),
+            enc_change in prop::option::of(arb_encrypted_note()),
+            proof in arb_kernel_stark_proof(),
+            cut in 1usize..8,
+        ) {
+            let req = KernelUnshieldReq {
+                root: req_root,
+                nullifiers,
+                v_pub,
+                recipient,
+                cm_change,
+                enc_change,
+                proof,
+            };
+            let mut wire = kernel_unshield_req_to_wire(&req).unwrap();
+            prop_assume!(wire.bytes.len() > cut);
+            wire.bytes.truncate(wire.bytes.len() - cut);
+            let err = kernel_unshield_req_from_wire(wire).unwrap_err();
+            prop_assert!(err.contains("read failed") || err.contains("trailing bytes"));
+        }
+    }
+
+    #[test]
+    fn decode_kernel_inbox_message_rejects_wrong_version() {
+        let bytes = encode_tze(&WireKernelInboxEnvelope {
+            version: u16_to_wire(KERNEL_WIRE_VERSION + 1),
+            message: WireKernelInboxMessage::Fund(WireFundReq {
+                addr: "alice".into(),
+                amount: u64_to_wire(7),
+            }),
+        })
+        .unwrap();
+        let err = decode_kernel_inbox_message(&bytes).unwrap_err();
+        assert!(err.contains("unsupported kernel inbox wire version"));
+    }
+
+    #[test]
+    fn decode_kernel_result_rejects_wrong_version() {
+        let bytes = encode_tze(&WireKernelResultEnvelope {
+            version: u16_to_wire(KERNEL_WIRE_VERSION + 1),
+            result: WireKernelResult::Fund,
+        })
+        .unwrap();
+        let err = decode_kernel_result(&bytes).unwrap_err();
+        assert!(err.contains("unsupported kernel result wire version"));
+    }
+
+    #[test]
+    fn kernel_proof_to_wire_rejects_oversized_output_preimage() {
+        let proof = KernelStarkProof {
+            proof_bytes: vec![1, 2, 3],
+            output_preimage: vec![[9u8; 32]; MAX_OUTPUT_PREIMAGE_ITEMS + 1],
+            verify_meta: serde_json::json!({"ok":true}),
+        };
+        let err = kernel_proof_to_wire(&proof).unwrap_err();
+        assert!(err.contains("output_preimage too long for kernel wire"));
+    }
+
+    #[test]
+    fn kernel_proof_from_wire_rejects_invalid_verify_meta_json() {
+        let err = kernel_proof_from_wire(WireStarkProof {
+            proof_bytes: vec![1, 2, 3],
+            output_preimage: WireOutputPreimage {
+                items: vec![felt_to_wire(&ZERO)],
+            },
+            verify_meta: WireVerifyMetaJson {
+                bytes: b"{not-json".to_vec(),
+            },
+        })
+        .unwrap_err();
+        assert!(err.contains("verify_meta JSON parse failed"));
+    }
+
+    #[test]
+    fn encoded_note_to_wire_rejects_invalid_note() {
+        let err = encoded_note_to_wire(&EncryptedNote {
+            ct_d: vec![0; ML_KEM768_CIPHERTEXT_BYTES - 1],
+            tag: 0,
+            ct_v: vec![0; ML_KEM768_CIPHERTEXT_BYTES],
+            encrypted_data: vec![0; ENCRYPTED_NOTE_BYTES],
+        })
+        .unwrap_err();
+        assert!(err.contains("bad ct_d length"));
     }
 }
