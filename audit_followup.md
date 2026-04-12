@@ -22,7 +22,7 @@ Disposition of findings from [audit_report.md](/home/arthurb/src/starkprivacy/au
 | Finding | Status | Disposition |
 | --- | --- | --- |
 | `C1` | Fixed | OCaml commitment encoding now matches Rust’s canonical 8-byte `u64` layout and zeroed gap. The OCaml nondeterminism bug from uninitialized gap bytes was also fixed. |
-| `C2` | Partially mitigated | Wallet file permissions are forced to `0600` on Unix, but the wallet is still plaintext and secrets are still not zeroized in memory. |
+| `C2` | Partially mitigated | Wallet file permissions are forced to `0600` on Unix, but the wallet is still plaintext and secrets are still not zeroized in memory. README/CLI docs now describe `sp-client` as a developer/test harness rather than a hardened end-user wallet. |
 | `H1` | Partially mitigated | Wallet persistence was already atomic; the new XMSS floor sidecar now catches stale wallet-file restores in the common local case. Full rollback protection still requires stronger external monotonicity. |
 | `M1` | Deferred | Fixed-nonce memo AEAD remains unchanged for now. Any meaningful fix should be thought through with the deterministic test path and spec, not patched casually. |
 | `M2` | Fixed | Detection tag comparison was changed to a constant-time style comparison. |
@@ -48,9 +48,9 @@ Disposition of findings from [audit_report.md](/home/arthurb/src/starkprivacy/au
 | `T7` | Partially fixed | Added a wallet unit test for stale-backup rejection against the durable XMSS floor sidecar. |
 | `T8` | Partially fixed | Commitment layout agreement is now checked explicitly on the OCaml side, and Rust/OCaml protocol vectors remain aligned. A dedicated cross-impl `u64::MAX` test would still be a good follow-up. |
 | `T9` | Fixed / stale | Dead code was removed and several helper paths now have direct tests. |
-| `T10` | Deferred | TrustMeBro paths still rely mostly on service/integration coverage rather than dedicated unit tests. |
+| `T10` | Fixed / stale | The audit undercounted existing Rust service-crate unit coverage. `services/tzel/src/lib.rs` already has direct TrustMeBro unit tests for shield/transfer/unshield request handling; the item was mostly stale rather than an active gap. |
 | `T11` | Partially fixed | Some more state-transition coverage was added, but the full rejection/atomicity matrix is still incomplete. |
-| `T12` | Deferred | Ignored proof-generation tests are still not wired into CI from inside this repo. |
+| `T12` | Fixed | GitHub Actions workflows now cover the fast unit suites and a separate scheduled/manual proof-roundtrip workflow runs the ignored real-proof integration tests. |
 
 ## Next sensible work
 

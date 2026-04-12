@@ -1,0 +1,41 @@
+name: Proof Roundtrips
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * *"
+
+permissions:
+  contents: read
+
+env:
+  TZEL_TRAP_FULL_XMSS_REBUILDS: "1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ignored-proof-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Rust nightly for prover/reprover
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-07-14
+
+      - name: Set up Scarb
+        uses: software-mansion/setup-scarb@v1
+        with:
+          scarb-version: "2.16.1"
+
+      - name: Build Cairo executables
+        working-directory: cairo
+        run: scarb build
+
+      - name: Run ignored real-proof roundtrip tests
+        run: cargo test --test integration -p tzel-services -- --ignored --nocapture

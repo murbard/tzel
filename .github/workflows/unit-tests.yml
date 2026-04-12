@@ -1,0 +1,78 @@
+name: Unit Tests
+
+on:
+  push:
+    branches:
+      - main
+      - wip-xmss-depth16-migration
+    paths-ignore:
+      - "docs/spec.html"
+      - "docs/pq.png"
+  pull_request:
+    paths-ignore:
+      - "docs/spec.html"
+      - "docs/pq.png"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZEL_TRAP_FULL_XMSS_REBUILDS: "1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust-and-cairo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Rust nightly for verifier/prover crates
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-07-14
+
+      - name: Set up Scarb
+        uses: software-mansion/setup-scarb@v1
+        with:
+          scarb-version: "2.16.1"
+
+      - name: Run Rust unit tests
+        run: |
+          cargo test -p tzel-core --lib
+          cargo +nightly-2025-07-14 test -p tzel-verifier --lib
+          cargo test --lib -p tzel-services
+          cargo test -p tzel-wallet-app --bin sp-client
+          cargo test -p tzel-ledger-app --bin sp-ledger
+          cargo test -p tzel-demo
+
+      - name: Run Cairo unit tests
+        working-directory: cairo
+        run: scarb test
+
+  ocaml:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install OCaml system prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgmp-dev pkg-config
+
+      - name: Set up OCaml
+        uses: ocaml/setup-ocaml@v3
+        with:
+          ocaml-compiler: "5.2.0"
+
+      - name: Install OCaml dependencies
+        run: |
+          opam install -y dune alcotest cstruct ctypes ctypes-foreign hex mirage-crypto yojson
+
+      - name: Run OCaml unit tests
+        run: ./scripts/ocaml_unit_tests.sh

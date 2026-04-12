@@ -1036,7 +1036,10 @@ fn ensure_path_matches_root(
 // ═══════════════════════════════════════════════════════════════════════
 
 #[derive(Parser)]
-#[command(name = "sp-client", about = "TzEL CLI wallet")]
+#[command(
+    name = "sp-client",
+    about = "TzEL developer/test CLI wallet"
+)]
 struct Cli {
     #[arg(short, long, default_value = "wallet.json")]
     wallet: String,

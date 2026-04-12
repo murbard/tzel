@@ -38,7 +38,7 @@ cd cairo && scarb build && cd ..
 # If you launch it from elsewhere, also pass --executables-dir /abs/path/to/cairo/target/dev
 target/release/sp-ledger --port 8080 --reprove-bin apps/prover/target/release/reprove &
 
-# Run the wallet
+# Run the developer/test wallet harness
 target/release/sp-client keygen
 target/release/sp-client fund -l http://localhost:8080 --addr alice --amount 1000
 target/release/sp-client shield -l http://localhost:8080 --sender alice --amount 1000
@@ -52,6 +52,8 @@ target/release/sp-client balance
 > **WARNING:** The ledger now refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `cairo/target/dev`). `--trust-me-bro` is never appropriate for real value.
 >
 > **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, and memo-hash checks. Its public-balance layer intentionally uses submitted strings such as `"alice"` as stand-ins for chain-native caller identity. It is not a network-authenticated wallet service and should not be exposed as a real public endpoint.
+>
+> **DEVELOPER WALLET NOTE:** `sp-client` is a developer/reference CLI used for local testing, demos, and integration flows. It persists plaintext secrets and wallet state in local JSON files and is not intended to be a hardened end-user wallet.
 
 For local testing and fast integration loops, `--trust-me-bro` is still useful: `sp-client` skips STARK proving and `sp-ledger` accepts unverified bundles so you can exercise the state-transition checks quickly. Keep that mode on localhost only and switch back to `--reprove-bin` for any path where proof verification actually matters.
 
@@ -102,7 +104,7 @@ master_sk
 |   |       +-- nk_tag_j -- public binding tag (in payment address)
 |   +-- ask_base
 |       +-- ask_j       -- per-address auth secret (never leaves wallet)
-|           +-- auth_root_j -- Merkle root of 1024 one-time WOTS+ keys
+|           +-- auth_root_j -- Merkle root of 65536 one-time WOTS+ keys
 |
 +-- incoming_seed
     +-- dsk
@@ -182,8 +184,9 @@ See `specs/security.md` for the full security notes and operational caveats. Key
 
 - **Active development** -- protocol and implementation are not audited for production use
 - **Reference ledger is localhost-only** -- `sp-ledger` is a demo/reference verifier for the protocol checks, not a real authenticated public-balance server
+- **`sp-client` is a developer/test harness** -- it is useful for local testing and fixtures, not as a hardened end-user wallet
 - **WOTS+ key reuse compromises funds** -- unlike multi-use signature schemes, reusing a WOTS+ key lets an attacker forge signatures and steal funds
-- **One-time key exhaustion** -- each address has 1024 signing keys; rotate addresses before exhaustion
+- **One-time key exhaustion** -- each address has 65536 signing keys; rotate addresses before exhaustion
 - **N is not private** -- nullifier count reveals input count
 - **Detection is honest-sender** -- malicious sender can bypass detection
 
