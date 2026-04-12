@@ -187,6 +187,8 @@ pub fn owner_tag(auth_root: &F, auth_pub_seed: &F, nk_tag: &F) -> F {
 pub fn commit(d_j: &F, v: u64, rcm: &F, otag: &F) -> F {
     let mut buf = [0u8; 128];
     buf[..32].copy_from_slice(d_j);
+    // Canonical commitment encoding stores v as a u64 in bytes [32..40).
+    // Bytes [40..64) are intentionally zero.
     buf[32..40].copy_from_slice(&v.to_le_bytes());
     buf[64..96].copy_from_slice(rcm);
     buf[96..128].copy_from_slice(otag);
@@ -591,6 +593,9 @@ pub fn recover_wots_pk(msg_hash: &F, pub_seed: &F, key_idx: u32, sig: &[F]) -> V
 }
 
 pub fn xmss_subtree_root(ask_j: &F, pub_seed: &F, start: u32, height: usize) -> F {
+    if height == AUTH_DEPTH && start == 0 {
+        assert_full_xmss_rebuild_allowed("xmss_subtree_root");
+    }
     if height == 0 {
         return wots_pk_to_leaf(pub_seed, start, &wots_pk(ask_j, start));
     }
@@ -613,6 +618,9 @@ fn xmss_root_and_path_inner(
     height: usize,
     target: u32,
 ) -> (F, Option<Vec<F>>) {
+    if height == AUTH_DEPTH && start == 0 {
+        assert_full_xmss_rebuild_allowed("xmss_root_and_path_inner");
+    }
     if height == 0 {
         let leaf = wots_pk_to_leaf(pub_seed, start, &wots_pk(ask_j, start));
         let path = (start == target).then(Vec::new);
@@ -654,46 +662,34 @@ fn xmss_root_and_path_inner(
 }
 
 pub fn build_auth_tree(ask_j: &F) -> F {
+    assert_full_xmss_rebuild_allowed("build_auth_tree");
     let pub_seed = derive_auth_pub_seed(ask_j);
     xmss_subtree_root(ask_j, &pub_seed, 0, AUTH_DEPTH)
 }
 
 pub fn auth_tree_path(ask_j: &F, index: usize) -> Vec<F> {
+    assert_full_xmss_rebuild_allowed("auth_tree_path");
     let pub_seed = derive_auth_pub_seed(ask_j);
     let (_, path) = xmss_root_and_path_inner(ask_j, &pub_seed, 0, AUTH_DEPTH, index as u32);
     path.expect("target leaf must be within auth tree")
 }
 
 pub fn auth_root_and_path(ask_j: &F, index: usize) -> (F, Vec<F>) {
+    assert_full_xmss_rebuild_allowed("auth_root_and_path");
     let pub_seed = derive_auth_pub_seed(ask_j);
     let (root, path) = xmss_root_and_path_inner(ask_j, &pub_seed, 0, AUTH_DEPTH, index as u32);
     (root, path.expect("target leaf must be within auth tree"))
 }
 
-pub fn advance_auth_path(
-    ask_j: &F,
-    pub_seed: &F,
-    current_idx: u32,
-    current_path: &[F],
-) -> Option<Vec<F>> {
-    let next_idx = current_idx.checked_add(1)?;
-    if next_idx as usize >= AUTH_TREE_SIZE {
-        return None;
+fn assert_full_xmss_rebuild_allowed(op: &str) {
+    if std::env::var_os("TZEL_TRAP_FULL_XMSS_REBUILDS").is_some()
+        && std::env::var_os("TZEL_ALLOW_FULL_XMSS_REBUILD").is_none()
+    {
+        panic!(
+            "unexpected full depth-{} XMSS rebuild via {} — default tests must use fixed fixtures or small-depth helpers",
+            AUTH_DEPTH, op
+        );
     }
-
-    let tau = current_idx.trailing_ones() as usize;
-    let mut next = current_path.to_vec();
-    if tau == 0 {
-        next[0] = auth_leaf_hash(ask_j, current_idx);
-    } else {
-        let start = next_idx - (1u32 << tau);
-        next[tau] = xmss_subtree_root(ask_j, pub_seed, start, tau);
-        for (j, slot) in next.iter_mut().take(tau).enumerate() {
-            let start = next_idx + (1u32 << j);
-            *slot = xmss_subtree_root(ask_j, pub_seed, start, j);
-        }
-    }
-    Some(next)
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -702,6 +698,14 @@ pub fn advance_auth_path(
 
 pub type Ek = ml_kem_768::EncapsulationKey;
 pub type Dk = ml_kem_768::DecapsulationKey;
+
+fn ct_eq_u16(a: u16, b: u16) -> bool {
+    let x = a ^ b;
+    let mut diff = 0u8;
+    diff |= x as u8;
+    diff |= (x >> 8) as u8;
+    diff == 0
+}
 
 pub fn kem_keygen_from_seed(seed: &[u8; 64]) -> (Ek, Dk) {
     let seed_arr = ml_kem::array::Array::from(*seed);
@@ -913,7 +917,7 @@ pub fn detect(enc: &EncryptedNote, dk_d: &Dk) -> bool {
     let ss = dk_d.try_decapsulate(&ct).unwrap();
     let tag_hash = hash(ss.as_slice());
     let computed = u16::from_le_bytes([tag_hash[0], tag_hash[1]]) & ((1 << DETECT_K) - 1);
-    computed == enc.tag
+    ct_eq_u16(computed, enc.tag)
 }
 
 pub fn decrypt_memo(enc: &EncryptedNote, dk_v: &Dk) -> Option<(u64, F, Vec<u8>)> {
@@ -2016,6 +2020,44 @@ mod tests {
         }
 
         #[test]
+        fn prop_commit_changes_with_rseed(
+            d_j in prop::array::uniform32(any::<u8>()),
+            otag in prop::array::uniform32(any::<u8>()),
+            rseed_1 in prop::array::uniform32(any::<u8>()),
+            rseed_2 in prop::array::uniform32(any::<u8>()),
+            v in any::<u64>(),
+        ) {
+            prop_assume!(rseed_1 != rseed_2);
+            let d_j = truncate_felt(d_j);
+            let otag = truncate_felt(otag);
+            let rseed_1 = truncate_felt(rseed_1);
+            let rseed_2 = truncate_felt(rseed_2);
+            prop_assert_ne!(
+                commit(&d_j, v, &derive_rcm(&rseed_1), &otag),
+                commit(&d_j, v, &derive_rcm(&rseed_2), &otag)
+            );
+        }
+
+        #[test]
+        fn prop_nullifier_depends_on_nk_spend_and_cm(
+            nk_spend_1 in prop::array::uniform32(any::<u8>()),
+            nk_spend_2 in prop::array::uniform32(any::<u8>()),
+            cm_1 in prop::array::uniform32(any::<u8>()),
+            cm_2 in prop::array::uniform32(any::<u8>()),
+            pos in any::<u64>(),
+        ) {
+            let nk_spend_1 = truncate_felt(nk_spend_1);
+            let nk_spend_2 = truncate_felt(nk_spend_2);
+            let cm_1 = truncate_felt(cm_1);
+            let cm_2 = truncate_felt(cm_2);
+            prop_assume!(nk_spend_1 != nk_spend_2 || cm_1 != cm_2);
+            prop_assert_ne!(
+                nullifier(&nk_spend_1, &cm_1, pos),
+                nullifier(&nk_spend_2, &cm_2, pos)
+            );
+        }
+
+        #[test]
         fn prop_merkle_auth_path_reconstructs_root(
             leaves in prop::collection::vec(prop::array::uniform32(any::<u8>()), 1..8),
             raw_idx in any::<usize>(),
@@ -2159,6 +2201,29 @@ mod tests {
         assert_eq!(current, auth_root);
     }
 
+    fn assert_wots_signature_recovers_leaf_at(key_idx: u32) {
+        let fixture = xmss_fixture();
+        let ask_j = derive_ask(&fixture.account.ask_base, 0);
+        let pub_seed = derive_auth_pub_seed(&ask_j);
+        let msg_hash = hash(b"high-index-wots-regression");
+
+        let (sig, pk, digits) = wots_sign(&ask_j, key_idx, &msg_hash);
+        let recovered_pk = recover_wots_pk(&msg_hash, &pub_seed, key_idx, &sig);
+
+        assert_eq!(recovered_pk, pk);
+        assert_eq!(digits, wots_digits(&msg_hash));
+        assert_eq!(
+            wots_pk_to_leaf(&pub_seed, key_idx, &recovered_pk),
+            auth_leaf_hash(&ask_j, key_idx)
+        );
+    }
+
+    #[test]
+    fn test_wots_signature_recovers_authenticated_leaf_at_high_indices() {
+        assert_wots_signature_recovers_leaf_at(256);
+        assert_wots_signature_recovers_leaf_at(u16::MAX as u32);
+    }
+
     #[test]
     fn test_encrypt_note_roundtrip_recomputes_commitment() {
         let (_acc, addr, dk_v, dk_d, _nk_spend) = sample_address_bundle(0x66, 0);
@@ -2215,12 +2280,84 @@ mod tests {
             transfer,
             transfer_sighash(
                 &auth_domain,
+                &u(20),
+                &nullifiers,
+                &cm_1,
+                &cm_2,
+                &mh_1,
+                &mh_2
+            )
+        );
+        assert_ne!(
+            transfer,
+            transfer_sighash(
+                &auth_domain,
                 &root,
                 &[u(3), u(40)],
                 &cm_1,
                 &cm_2,
                 &mh_1,
                 &mh_2
+            )
+        );
+        assert_ne!(
+            transfer,
+            transfer_sighash(
+                &auth_domain,
+                &root,
+                &[u(4), u(3)],
+                &cm_1,
+                &cm_2,
+                &mh_1,
+                &mh_2
+            )
+        );
+        assert_ne!(
+            transfer,
+            transfer_sighash(
+                &auth_domain,
+                &root,
+                &nullifiers,
+                &u(50),
+                &cm_2,
+                &mh_1,
+                &mh_2
+            )
+        );
+        assert_ne!(
+            transfer,
+            transfer_sighash(
+                &auth_domain,
+                &root,
+                &nullifiers,
+                &cm_1,
+                &u(60),
+                &mh_1,
+                &mh_2
+            )
+        );
+        assert_ne!(
+            transfer,
+            transfer_sighash(
+                &auth_domain,
+                &root,
+                &nullifiers,
+                &cm_1,
+                &cm_2,
+                &u(70),
+                &mh_2
+            )
+        );
+        assert_ne!(
+            transfer,
+            transfer_sighash(
+                &auth_domain,
+                &root,
+                &nullifiers,
+                &cm_1,
+                &cm_2,
+                &mh_1,
+                &u(80)
             )
         );
 
@@ -2248,6 +2385,54 @@ mod tests {
         assert_ne!(
             unshield,
             unshield_sighash(&auth_domain, &root, &nullifiers, 12, &u(10), &cm_1, &mh_1)
+        );
+        assert_ne!(
+            unshield,
+            unshield_sighash(
+                &auth_domain,
+                &u(20),
+                &nullifiers,
+                12,
+                &recipient,
+                &cm_1,
+                &mh_1
+            )
+        );
+        assert_ne!(
+            unshield,
+            unshield_sighash(
+                &auth_domain,
+                &root,
+                &[u(4), u(3)],
+                12,
+                &recipient,
+                &cm_1,
+                &mh_1
+            )
+        );
+        assert_ne!(
+            unshield,
+            unshield_sighash(
+                &auth_domain,
+                &root,
+                &nullifiers,
+                12,
+                &recipient,
+                &u(11),
+                &mh_1
+            )
+        );
+        assert_ne!(
+            unshield,
+            unshield_sighash(
+                &auth_domain,
+                &root,
+                &nullifiers,
+                12,
+                &recipient,
+                &cm_1,
+                &u(12)
+            )
         );
     }
 

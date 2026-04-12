@@ -17,9 +17,10 @@ This document is informative, not normative. The canonical protocol rules and en
 
 - **Input count is public:** the number of published nullifiers reveals `N`.
 - **Transaction shape and timing are public:** observers still learn transaction type, ordering, and whether there is a change note.
-- **Delegated provers can link same-address spends:** the prover sees per-address values such as `nk_spend_j` and `auth_root_j`. If the same service proves multiple spends from the same address, it can link them.
+- **Delegated provers get per-address spent-state visibility:** the prover sees per-address values such as `nk_spend_j` and `auth_root_j`. Given public commitments, positions, and the public nullifier set, a prover with `nk_spend_j` can compute candidate nullifiers for one address and learn which public notes for that address have been spent. This is stronger than mere same-address linking.
 - **Detection tags are only a filtering aid:** the false-positive rate `2^(-k)` is not, by itself, a meaningful privacy guarantee.
 - **No outgoing viewing in the current protocol:** full-view capability means incoming viewing plus nullifier/spent-state tracking for notes whose address metadata is known. There is no outgoing-view ciphertext in the current scheme.
+- **No expiry in spend authorization:** a delegated prover can withhold a completed authorization until one of its nullifiers is consumed elsewhere. This is a protocol-level anti-withholding gap, not a circuit bug.
 
 ## Honest-Sender and Ciphertext Caveats
 
@@ -35,11 +36,14 @@ This document is informative, not normative. The canonical protocol rules and en
 - **Addresses have finite signing capacity:** each address has `2^AUTH_DEPTH` one-time keys. Addresses must be rotated before exhaustion.
 - **Wallet state is part of the security boundary:** stale backups, multi-device races, or failed submissions that roll back key allocation can cause one-time-key reuse.
 - **Implementations must persist state durably before submission:** this includes per-address WOTS index advancement and any note/account state used to avoid key reuse.
+- **Backup restore needs operational discipline:** restoring an older wallet file can silently roll back the next WOTS leaf and re-enable catastrophic one-time-key reuse unless the restored file is known to be fresher than every previously used copy.
+- **Reference wallet files are plaintext:** the current wallet format stores `master_sk` and address state unencrypted on disk. File permissions should be restricted tightly; at-rest encryption and memory zeroization remain future hardening work.
 
 ## Deployment Notes
 
 - **The reference CLI ledger is demo-only for public balances:** `sp-ledger` is a localhost/reference verifier for proof and state-transition checks, not a real authenticated public account service.
 - **Public account identifiers must be specified exactly in deployments:** the reference ledger uses `H(UTF8(account_string))`, but any replacement must define the exact byte encoding and verifier rule.
+- **Shield proofs are not yet domain-bound:** shield carries `sender_id` but no `auth_domain`, so mirrored deployments with identical sender namespaces can accept the same shield proof object unless deployment separation is enforced externally.
 - **Proof verification must remain bound to the intended executable and authorization domain:** otherwise a valid proof may be accepted in the wrong verifier context.
 
 ## Additional Cryptographic Assumptions and Review Burden

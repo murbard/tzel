@@ -30,7 +30,6 @@ let felt_tag s =
 let tag_spend    = felt_tag "spend"
 let tag_nk       = felt_tag "nk"
 let tag_ask      = felt_tag "ask"
-let tag_auth_key = felt_tag "auth-key"
 let tag_incoming = felt_tag "incoming"
 let tag_dsk      = felt_tag "dsk"
 let tag_view     = felt_tag "view"
@@ -93,11 +92,13 @@ let hash_nf a b =
   Bytes.blit b 0 buf 32 32;
   hash_personalized "nulfSP__" buf
 
-(* H_commit(d, v, rcm, owner_tag): Note commitment *)
+(* H_commit(d, v, rcm, owner_tag): Note commitment.
+   v uses the canonical Rust wire/layout: the low 8 bytes store the u64
+   value in little-endian form and bytes [40..64) are zero. *)
 let hash_commit d v_felt rcm owner_tag =
   let buf = Bytes.create 128 in
   Bytes.blit d 0 buf 0 32;
-  Bytes.blit v_felt 0 buf 32 32;
+  Bytes.blit v_felt 0 buf 32 8;
   Bytes.blit rcm 0 buf 64 32;
   Bytes.blit owner_tag 0 buf 96 32;
   hash_personalized "cmmtSP__" buf

@@ -136,7 +136,6 @@ let test_felt_tag_constants () =
   check "spend"    "646e657073000000000000000000000000000000000000000000000000000000";
   check "nk"       "6b6e000000000000000000000000000000000000000000000000000000000000";
   check "ask"      "6b73610000000000000000000000000000000000000000000000000000000000";
-  check "auth-key" "79656b2d68747561000000000000000000000000000000000000000000000000";
   check "incoming" "676e696d6f636e69000000000000000000000000000000000000000000000000";
   check "dsk"      "6b73640000000000000000000000000000000000000000000000000000000000";
   check "view"     "7765697600000000000000000000000000000000000000000000000000000000";
@@ -145,7 +144,12 @@ let test_felt_tag_constants () =
   check "mlkem-v"  "762d6d656b6c6d00000000000000000000000000000000000000000000000000";
   check "mlkem-v2" "32762d6d656b6c6d000000000000000000000000000000000000000000000000";
   check "mlkem-d"  "642d6d656b6c6d00000000000000000000000000000000000000000000000000";
-  check "mlkem-d2" "32642d6d656b6c6d000000000000000000000000000000000000000000000000"
+  check "mlkem-d2" "32642d6d656b6c6d000000000000000000000000000000000000000000000000";
+  check "xmss-sk"  "6b732d73736d7800000000000000000000000000000000000000000000000000";
+  check "xmss-ps"  "73702d73736d7800000000000000000000000000000000000000000000000000";
+  check "xmss-ch"  "68632d73736d7800000000000000000000000000000000000000000000000000";
+  check "xmss-lt"  "746c2d73736d7800000000000000000000000000000000000000000000000000";
+  check "xmss-tr"  "72742d73736d7800000000000000000000000000000000000000000000000000"
 
 let test_hash1 () =
   let f = Tzel.Felt.of_u64 42 in
@@ -231,6 +235,32 @@ let test_hash_commit () =
   let cm = Tzel.Hash.hash_commit d v rcm ot in
   Alcotest.(check bool) "non-zero" true (not (Tzel.Felt.is_zero cm))
 
+let test_hash_commit_uses_only_low_u64_bytes () =
+  let d = Tzel.Felt.of_u64 1 in
+  let rcm = Tzel.Felt.of_u64 42 in
+  let ot = Tzel.Felt.of_u64 99 in
+  let canonical_v = Bytes.make 32 '\x00' in
+  for i = 0 to 7 do
+    Bytes.set_uint8 canonical_v i (0xA0 + i)
+  done;
+  let noisy_v = Bytes.copy canonical_v in
+  for i = 8 to 31 do
+    Bytes.set_uint8 noisy_v i 0xFF
+  done;
+  let cm_canonical = Tzel.Hash.hash_commit d canonical_v rcm ot in
+  let cm_noisy = Tzel.Hash.hash_commit d noisy_v rcm ot in
+  Alcotest.(check bool) "high bytes ignored" true
+    (Bytes.equal cm_canonical cm_noisy);
+
+  let buf = Bytes.make 128 '\x00' in
+  Bytes.blit d 0 buf 0 32;
+  Bytes.blit canonical_v 0 buf 32 8;
+  Bytes.blit rcm 0 buf 64 32;
+  Bytes.blit ot 0 buf 96 32;
+  let expected = Tzel.Hash.hash_personalized "cmmtSP__" buf in
+  Alcotest.(check bool) "matches canonical rust layout" true
+    (Bytes.equal cm_canonical expected)
+
 let test_account_id () =
   let id1 = Tzel.Hash.account_id "alice" in
   let id2 = Tzel.Hash.account_id "alice" in
@@ -257,6 +287,18 @@ let test_wots_sign_verify () =
   Alcotest.(check int) "sig length" 133 (Array.length signature);
   Alcotest.(check bool) "verify" true
     (Tzel.Wots.verify ~pub_seed ~key_idx signature sighash leaf)
+
+let test_wots_sign_verify_high_indices () =
+  let seed = Tzel.Felt.of_u64 42 in
+  let pub_seed = sample_wots_pub_seed seed in
+  let sighash = Tzel.Hash.hash_tag "test-sighash-hi" in
+  List.iter (fun key_idx ->
+    let pk = Tzel.Wots.keygen ~seed ~pub_seed ~key_idx in
+    let leaf = Tzel.Wots.pk_to_leaf ~pub_seed ~key_idx pk in
+    let signature = Tzel.Wots.sign ~seed ~pub_seed ~key_idx sighash in
+    Alcotest.(check bool) (Printf.sprintf "verify-%d" key_idx) true
+      (Tzel.Wots.verify ~pub_seed ~key_idx signature sighash leaf)
+  ) [256; 65535]
 
 let test_wots_wrong_message () =
   let seed = Tzel.Felt.of_u64 42 in
@@ -514,9 +556,47 @@ let test_key_derive_wots_seed () =
   let s1 = Tzel.Keys.derive_wots_seed ask_j 1 in
   Alcotest.(check bool) "different i -> different seed" false (Tzel.Felt.equal s0 s1)
 
+let test_key_auth_seed_helpers_agree () =
+  let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 3) in
+  let ask0 = Tzel.Keys.derive_ask keys 0 in
+  let ask1 = Tzel.Keys.derive_ask keys 1 in
+  let auth_seed = Tzel.Keys.derive_auth_key_seed ask0 9 in
+  let wots_seed = Tzel.Keys.derive_wots_seed ask0 9 in
+  let pub_seed0 = Tzel.Keys.derive_auth_pub_seed ask0 in
+  let pub_seed1 = Tzel.Keys.derive_auth_pub_seed ask1 in
+  Alcotest.(check bool) "auth seed equals wots seed" true
+    (Tzel.Felt.equal auth_seed wots_seed);
+  Alcotest.(check bool) "pub seeds differ across addresses" false
+    (Tzel.Felt.equal pub_seed0 pub_seed1)
+
 let test_auth_root d_j auth_pub_seed =
   Tzel.Hash.hash2 (Tzel.Hash.felt_tag "test-auth-root")
     (Tzel.Hash.hash2 d_j auth_pub_seed)
+
+let string_contains haystack needle =
+  let hay_len = String.length haystack in
+  let needle_len = String.length needle in
+  let rec loop i =
+    if i + needle_len > hay_len then false
+    else if String.sub haystack i needle_len = needle then true
+    else loop (i + 1)
+  in
+  needle_len = 0 || loop 0
+
+let expect_failure_contains label needle f =
+  try
+    let _ = f () in
+    Alcotest.failf "%s: expected Failure containing %S" label needle
+  with
+  | Failure msg ->
+    Alcotest.(check bool) label true (string_contains msg needle)
+
+let enable_full_xmss_rebuild_trap () =
+  match Sys.getenv_opt "TZEL_ALLOW_FULL_XMSS_REBUILD" with
+  | Some _ ->
+    Alcotest.fail
+      "TZEL_ALLOW_FULL_XMSS_REBUILD must be unset for default unit tests"
+  | None -> Unix.putenv "TZEL_TRAP_FULL_XMSS_REBUILDS" "1"
 
 let derive_test_address keys j =
   let d_j = Tzel.Keys.derive_diversifier keys j in
@@ -542,6 +622,116 @@ let test_key_auth_leaf_small_merkle () =
   Alcotest.(check bool) "auth path verifies" true
     (Tzel.Merkle.verify_path ~depth leaf 5 path root)
 
+let rec reduce_xmss_tree pub_seed level start leaves =
+  match leaves with
+  | [leaf] -> leaf
+  | _ ->
+    let rec pair node_idx acc = function
+      | [] -> List.rev acc
+      | [left] -> List.rev (left :: acc)
+      | left :: right :: rest ->
+        let node =
+          Tzel.Keys.xmss_node_hash pub_seed 0 level
+            ((start lsr (level + 1)) + node_idx)
+            left right
+        in
+        pair (node_idx + 1) (node :: acc) rest
+    in
+    reduce_xmss_tree pub_seed (level + 1) start (pair 0 [] leaves)
+
+let recompute_xmss_root_from_path pub_seed key_idx leaf path =
+  let rec go level idx current = function
+    | [] -> current
+    | sibling :: rest ->
+      let node_idx = idx lsr 1 in
+      let parent =
+        if idx land 1 = 0 then
+          Tzel.Keys.xmss_node_hash pub_seed 0 level node_idx current sibling
+        else
+          Tzel.Keys.xmss_node_hash pub_seed 0 level node_idx sibling current
+      in
+      go (level + 1) (idx lsr 1) parent rest
+  in
+  go 0 key_idx leaf path
+
+let test_key_xmss_subtree_root_small_depth () =
+  let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 17) in
+  let ask_j = Tzel.Keys.derive_ask keys 0 in
+  let pub_seed = Tzel.Keys.derive_auth_pub_seed ask_j in
+  let depth = 4 in
+  let leaves = List.init (1 lsl depth) (fun i -> Tzel.Keys.auth_leaf_hash ask_j i) in
+  let manual_root = reduce_xmss_tree pub_seed 0 0 leaves in
+  let subtree_root = Tzel.Keys.xmss_subtree_root ask_j pub_seed 0 depth in
+  Alcotest.(check bool) "small xmss root matches manual reduction" true
+    (Tzel.Felt.equal manual_root subtree_root)
+
+let test_key_xmss_root_and_path_inner_small_depth () =
+  let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 19) in
+  let ask_j = Tzel.Keys.derive_ask keys 0 in
+  let pub_seed = Tzel.Keys.derive_auth_pub_seed ask_j in
+  let depth = 4 in
+  for idx = 0 to (1 lsl depth) - 1 do
+    let (root, path) = Tzel.Keys.xmss_root_and_path_inner ask_j pub_seed 0 depth idx in
+    let leaf = Tzel.Keys.auth_leaf_hash ask_j idx in
+    let path = Option.get path in
+    let recomputed = recompute_xmss_root_from_path pub_seed idx leaf path in
+    Alcotest.(check bool) (Printf.sprintf "xmss path %d" idx) true
+      (Tzel.Felt.equal root recomputed)
+  done
+
+let test_key_xmss_root_and_path_inner_nonzero_start () =
+  let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 21) in
+  let ask_j = Tzel.Keys.derive_ask keys 0 in
+  let pub_seed = Tzel.Keys.derive_auth_pub_seed ask_j in
+  let start = 8 in
+  let depth = 3 in
+  for idx = start to start + (1 lsl depth) - 1 do
+    let (root, path) = Tzel.Keys.xmss_root_and_path_inner ask_j pub_seed start depth idx in
+    let leaf = Tzel.Keys.auth_leaf_hash ask_j idx in
+    let path = Option.get path in
+    let recomputed = recompute_xmss_root_from_path pub_seed idx leaf path in
+    Alcotest.(check bool) (Printf.sprintf "offset xmss path %d" idx) true
+      (Tzel.Felt.equal root recomputed)
+  done
+
+let test_key_xmss_subtree_root_nonzero_start () =
+  let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 25) in
+  let ask_j = Tzel.Keys.derive_ask keys 0 in
+  let pub_seed = Tzel.Keys.derive_auth_pub_seed ask_j in
+  let start = 8 in
+  let depth = 3 in
+  let leaves =
+    List.init (1 lsl depth) (fun i -> Tzel.Keys.auth_leaf_hash ask_j (start + i))
+  in
+  let manual_root = reduce_xmss_tree pub_seed 0 start leaves in
+  let subtree_root = Tzel.Keys.xmss_subtree_root ask_j pub_seed start depth in
+  Alcotest.(check bool) "offset xmss subtree root matches manual reduction" true
+    (Tzel.Felt.equal manual_root subtree_root)
+
+let test_key_xmss_node_hash_domain_separation () =
+  let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 29) in
+  let ask_j = Tzel.Keys.derive_ask keys 0 in
+  let pub_seed = Tzel.Keys.derive_auth_pub_seed ask_j in
+  let left = Tzel.Keys.auth_leaf_hash ask_j 0 in
+  let right = Tzel.Keys.auth_leaf_hash ask_j 1 in
+  let base = Tzel.Keys.xmss_node_hash pub_seed 0 0 0 left right in
+  let diff_level = Tzel.Keys.xmss_node_hash pub_seed 0 1 0 left right in
+  let diff_node = Tzel.Keys.xmss_node_hash pub_seed 0 0 1 left right in
+  let diff_key = Tzel.Keys.xmss_node_hash pub_seed 1 0 0 left right in
+  Alcotest.(check bool) "level participates" false (Tzel.Felt.equal base diff_level);
+  Alcotest.(check bool) "node index participates" false (Tzel.Felt.equal base diff_node);
+  Alcotest.(check bool) "key index participates" false (Tzel.Felt.equal base diff_key)
+
+let test_key_wots_pk_matches_auth_leaf_hash () =
+  let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 23) in
+  let ask_j = Tzel.Keys.derive_ask keys 0 in
+  let pub_seed = Tzel.Keys.derive_auth_pub_seed ask_j in
+  let key_idx = 7 in
+  let pk = Tzel.Keys.wots_pk ask_j key_idx in
+  let leaf = Tzel.Wots.pk_to_leaf ~pub_seed ~key_idx pk in
+  Alcotest.(check bool) "wots pk leaf matches auth leaf helper" true
+    (Tzel.Felt.equal leaf (Tzel.Keys.auth_leaf_hash ask_j key_idx))
+
 let test_owner_tag_binding () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 99) in
   let addr0 = derive_test_address keys 0 in
@@ -549,6 +739,35 @@ let test_owner_tag_binding () =
   let ot0 = Tzel.Keys.owner_tag addr0 in
   let ot1 = Tzel.Keys.owner_tag addr1 in
   Alcotest.(check bool) "different addresses -> different tags" false (Tzel.Felt.equal ot0 ot1)
+
+let test_owner_tag_binds_root_and_pub_seed () =
+  let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 101) in
+  let addr = derive_test_address keys 0 in
+  let base = Tzel.Keys.owner_tag addr in
+  let diff_root =
+    Tzel.Keys.owner_tag { addr with auth_root = Tzel.Hash.hash_tag "other-root" }
+  in
+  let diff_seed =
+    Tzel.Keys.owner_tag
+      { addr with auth_pub_seed = Tzel.Hash.hash_tag "other-auth-pub-seed" }
+  in
+  Alcotest.(check bool) "auth_root participates" false (Tzel.Felt.equal base diff_root);
+  Alcotest.(check bool) "auth_pub_seed participates" false
+    (Tzel.Felt.equal base diff_seed)
+
+let test_key_full_depth_wrappers_trap () =
+  enable_full_xmss_rebuild_trap ();
+  let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 303) in
+  let ask_j = Tzel.Keys.derive_ask keys 0 in
+  let check op f =
+    expect_failure_contains op
+      (Printf.sprintf "unexpected full depth-16 XMSS rebuild via %s" op)
+      f
+  in
+  check "build_auth_tree" (fun () -> ignore (Tzel.Keys.build_auth_tree ask_j));
+  check "auth_tree_path" (fun () -> ignore (Tzel.Keys.auth_tree_path ask_j 0));
+  check "auth_root_and_path" (fun () -> ignore (Tzel.Keys.auth_root_and_path ask_j 0));
+  check "derive_address" (fun () -> ignore (Tzel.Keys.derive_address keys 0))
 
 let test_key_to_payment_address () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 1) in
@@ -585,7 +804,23 @@ let test_note_determinism () =
   let keys = Tzel.Keys.derive (Tzel.Felt.of_u64 99) in
   let addr = derive_test_address keys 0 in
   let rseed = Tzel.Felt.of_u64 777 in
+  let owner_tag1 = Tzel.Keys.owner_tag addr in
+  let owner_tag2 = Tzel.Keys.owner_tag addr in
+  Alcotest.(check bool) "owner_tag deterministic" true
+    (Tzel.Felt.equal owner_tag1 owner_tag2);
   let n1 = Tzel.Note.create addr 1000L rseed in
+  Alcotest.(check bool) "note stores owner_tag" true
+    (Tzel.Felt.equal owner_tag1 n1.owner_tag);
+  let raw_rseed_cm =
+    Tzel.Hash.hash_commit addr.d_j (Tzel.Felt.of_u64 1000) rseed owner_tag1
+  in
+  Alcotest.(check string) "raw-rseed candidate"
+    (Tzel.Felt.to_hex raw_rseed_cm) (Tzel.Felt.to_hex n1.cm);
+  let manual_cm =
+    Tzel.Hash.hash_commit addr.d_j (Tzel.Felt.of_u64 1000) n1.rcm owner_tag1
+  in
+  Alcotest.(check string) "manual cm matches note"
+    (Tzel.Felt.to_hex manual_cm) (Tzel.Felt.to_hex n1.cm);
   let n2 = Tzel.Note.create addr 1000L rseed in
   Alcotest.(check bool) "cm deterministic" true (Tzel.Felt.equal n1.cm n2.cm);
   Alcotest.(check bool) "rcm deterministic" true (Tzel.Felt.equal n1.rcm n2.rcm)
@@ -1451,6 +1686,17 @@ let test_prover_verify_program_hash_mismatch () =
   let r = Tzel.Prover.verify_program_hash config Tzel.Prover.Shield preimage in
   Alcotest.(check bool) "mismatch" true (Result.is_error r)
 
+let test_prover_verify_program_hash_short_error () =
+  let config : Tzel.Prover.circuit_config = {
+    shield_program_hash = Tzel.Felt.of_u64 10;
+    transfer_program_hash = Tzel.Felt.of_u64 20;
+    unshield_program_hash = Tzel.Felt.of_u64 30;
+    auth_domain = Tzel.Felt.of_u64 1;
+    prover_binary = ""; verifier_binary = "";
+  } in
+  let r = Tzel.Prover.verify_program_hash config Tzel.Prover.Shield [Tzel.Felt.of_u64 1] in
+  Alcotest.(check bool) "short preimage rejected" true (Result.is_error r)
+
 let test_prover_verify_auth_domain () =
   let config : Tzel.Prover.circuit_config = {
     shield_program_hash = Tzel.Felt.zero;
@@ -1551,6 +1797,77 @@ let test_prover_felt_array_json () =
   (match json with `List l -> Alcotest.(check int) "2 elements" 2 (List.length l)
    | _ -> Alcotest.fail "expected List")
 
+let test_prover_verify_proof_rejects_failed_verifier () =
+  let config : Tzel.Prover.circuit_config = {
+    shield_program_hash = Tzel.Felt.of_u64 10;
+    transfer_program_hash = Tzel.Felt.of_u64 20;
+    unshield_program_hash = Tzel.Felt.of_u64 30;
+    auth_domain = Tzel.Felt.of_u64 42;
+    prover_binary = "/bin/false"; verifier_binary = "/bin/false";
+  } in
+  let bundle : Tzel.Prover.proof_bundle = {
+    proof_bytes = "deadbeef";
+    output_preimage = [Tzel.Felt.of_u64 1; Tzel.Felt.of_u64 1; Tzel.Felt.of_u64 10];
+  } in
+  Alcotest.(check bool) "failing verifier rejected" true
+    (Result.is_error (Tzel.Prover.verify_proof config Tzel.Prover.Shield bundle))
+
+let test_prover_verify_proof_shield_returns_public_outputs () =
+  let config : Tzel.Prover.circuit_config = {
+    shield_program_hash = Tzel.Felt.of_u64 10;
+    transfer_program_hash = Tzel.Felt.of_u64 20;
+    unshield_program_hash = Tzel.Felt.of_u64 30;
+    auth_domain = Tzel.Felt.of_u64 42;
+    prover_binary = "/bin/false"; verifier_binary = "/bin/true";
+  } in
+  let outputs = [Tzel.Felt.of_u64 99; Tzel.Felt.of_u64 100] in
+  let bundle : Tzel.Prover.proof_bundle = {
+    proof_bytes = "deadbeef";
+    output_preimage =
+      [Tzel.Felt.of_u64 1; Tzel.Felt.of_u64 2; Tzel.Felt.of_u64 10] @ outputs;
+  } in
+  match Tzel.Prover.verify_proof config Tzel.Prover.Shield bundle with
+  | Ok public_outputs ->
+    Alcotest.(check int) "shield output count" 2 (List.length public_outputs);
+    Alcotest.(check bool) "shield first output" true
+      (Tzel.Felt.equal (List.hd public_outputs) (List.hd outputs))
+  | Error e -> Alcotest.failf "shield verify should succeed: %s" e
+
+let test_prover_verify_proof_transfer_checks_auth_domain () =
+  let config : Tzel.Prover.circuit_config = {
+    shield_program_hash = Tzel.Felt.of_u64 10;
+    transfer_program_hash = Tzel.Felt.of_u64 20;
+    unshield_program_hash = Tzel.Felt.of_u64 30;
+    auth_domain = Tzel.Felt.of_u64 42;
+    prover_binary = "/bin/false"; verifier_binary = "/bin/true";
+  } in
+  let ok_bundle : Tzel.Prover.proof_bundle = {
+    proof_bytes = "deadbeef";
+    output_preimage =
+      [Tzel.Felt.of_u64 1; Tzel.Felt.of_u64 2; Tzel.Felt.of_u64 20;
+       Tzel.Felt.of_u64 42; Tzel.Felt.of_u64 7];
+  } in
+  let bad_bundle : Tzel.Prover.proof_bundle =
+    { ok_bundle with
+      output_preimage =
+        [Tzel.Felt.of_u64 1; Tzel.Felt.of_u64 2; Tzel.Felt.of_u64 20;
+         Tzel.Felt.of_u64 99] } in
+  Alcotest.(check bool) "transfer auth ok" true
+    (Result.is_ok (Tzel.Prover.verify_proof config Tzel.Prover.Transfer ok_bundle));
+  Alcotest.(check bool) "transfer auth mismatch rejected" true
+    (Result.is_error (Tzel.Prover.verify_proof config Tzel.Prover.Transfer bad_bundle))
+
+let test_prover_prove_returns_error_on_command_failure () =
+  let config : Tzel.Prover.circuit_config = {
+    shield_program_hash = Tzel.Felt.zero;
+    transfer_program_hash = Tzel.Felt.zero;
+    unshield_program_hash = Tzel.Felt.zero;
+    auth_domain = Tzel.Felt.zero;
+    prover_binary = "/bin/false"; verifier_binary = "/bin/false";
+  } in
+  Alcotest.(check bool) "prover failure propagated" true
+    (Result.is_error (Tzel.Prover.prove config ~witness_json:(`Assoc []) ~recursive:false))
+
 (* ══════════════════════════════════════════════════════════════════════
    Multi-transaction integration
    ══════════════════════════════════════════════════════════════════════ *)
@@ -1644,10 +1961,12 @@ let () =
       Alcotest.test_case "sighash_fold single" `Quick test_sighash_fold_single;
       Alcotest.test_case "sighash_fold empty" `Quick test_sighash_fold_empty;
       Alcotest.test_case "hash_commit" `Quick test_hash_commit;
+      Alcotest.test_case "hash_commit canonical u64 layout" `Quick test_hash_commit_uses_only_low_u64_bytes;
       Alcotest.test_case "account_id" `Quick test_account_id;
     ];
     "wots", [
       Alcotest.test_case "sign/verify" `Quick test_wots_sign_verify;
+      Alcotest.test_case "sign/verify high indices" `Quick test_wots_sign_verify_high_indices;
       Alcotest.test_case "wrong message" `Quick test_wots_wrong_message;
       Alcotest.test_case "fold determinism" `Quick test_wots_fold_deterministic;
       Alcotest.test_case "different seeds" `Quick test_wots_different_seeds;
@@ -1676,10 +1995,19 @@ let () =
       Alcotest.test_case "derive_ask" `Quick test_key_derive_ask;
       Alcotest.test_case "derive nk_spend/tag" `Quick test_key_derive_nk_spend_tag;
       Alcotest.test_case "derive_wots_seed" `Quick test_key_derive_wots_seed;
+      Alcotest.test_case "auth seed helpers agree" `Quick test_key_auth_seed_helpers_agree;
       Alcotest.test_case "auth leaf small merkle" `Quick test_key_auth_leaf_small_merkle;
+      Alcotest.test_case "xmss subtree root small depth" `Quick test_key_xmss_subtree_root_small_depth;
+      Alcotest.test_case "xmss root/path inner small depth" `Quick test_key_xmss_root_and_path_inner_small_depth;
+      Alcotest.test_case "xmss root/path offset subtree" `Quick test_key_xmss_root_and_path_inner_nonzero_start;
+      Alcotest.test_case "xmss subtree root offset subtree" `Quick test_key_xmss_subtree_root_nonzero_start;
+      Alcotest.test_case "xmss node hash domain separation" `Quick test_key_xmss_node_hash_domain_separation;
+      Alcotest.test_case "wots pk matches auth leaf" `Quick test_key_wots_pk_matches_auth_leaf_hash;
       Alcotest.test_case "owner tag binding" `Quick test_owner_tag_binding;
+      Alcotest.test_case "owner tag binds root and pub_seed" `Quick test_owner_tag_binds_root_and_pub_seed;
       Alcotest.test_case "to_payment_address" `Quick test_key_to_payment_address;
       Alcotest.test_case "multiple indices" `Quick test_key_address_multiple_indices;
+      Alcotest.test_case "full depth wrappers trap" `Quick test_key_full_depth_wrappers_trap;
     ];
     "note", [
       Alcotest.test_case "commitment" `Quick test_note_commitment;
@@ -1765,6 +2093,7 @@ let () =
       Alcotest.test_case "extract outputs empty" `Quick test_prover_extract_public_outputs_empty;
       Alcotest.test_case "verify program hash" `Quick test_prover_verify_program_hash;
       Alcotest.test_case "verify ph mismatch" `Quick test_prover_verify_program_hash_mismatch;
+      Alcotest.test_case "verify ph short" `Quick test_prover_verify_program_hash_short_error;
       Alcotest.test_case "verify auth domain" `Quick test_prover_verify_auth_domain;
       Alcotest.test_case "felt json" `Quick test_prover_felt_json;
       Alcotest.test_case "felt array json" `Quick test_prover_felt_array_json;
@@ -1773,6 +2102,10 @@ let () =
       Alcotest.test_case "output witness json" `Quick test_prover_output_witness_json;
       Alcotest.test_case "transfer witness json" `Quick test_prover_transfer_witness_json;
       Alcotest.test_case "unshield witness json" `Quick test_prover_unshield_witness_json;
+      Alcotest.test_case "verify proof fails verifier" `Quick test_prover_verify_proof_rejects_failed_verifier;
+      Alcotest.test_case "verify proof shield outputs" `Quick test_prover_verify_proof_shield_returns_public_outputs;
+      Alcotest.test_case "verify proof transfer auth" `Quick test_prover_verify_proof_transfer_checks_auth_domain;
+      Alcotest.test_case "prove failure propagated" `Quick test_prover_prove_returns_error_on_command_failure;
     ];
     "integration", [
       Alcotest.test_case "multi shield/transfer/unshield" `Quick test_multi_shield_transfer_unshield;

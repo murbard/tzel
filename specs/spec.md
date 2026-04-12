@@ -21,7 +21,7 @@ A UTXO-based private transaction system with:
 
 ## Key Hierarchy
 
-Notation: quoted labels such as `"spend"`, `"view"`, or `"auth-key"` denote **fixed felt252 domain-tag constants**, not UTF-8 strings that are themselves hashed first. The exact encoding of these tag constants is defined below in [Domain Tag Constants](#domain-tag-constants). In particular:
+Notation: quoted labels such as `"spend"`, `"view"`, or `"xmss-sk"` denote **fixed felt252 domain-tag constants**, not UTF-8 strings that are themselves hashed first. The exact encoding of these tag constants is defined below in [Domain Tag Constants](#domain-tag-constants). In particular:
 
 - `H("spend", x)` means `H(TAG_SPEND, x)`
 - `H("view", x)` means `H(TAG_VIEW, x)`
@@ -35,8 +35,8 @@ master_sk
 │   │       └── nk_tag_j  = H_nktg(nk_spend_j)   — per-address public binding tag
 │   ├── ask_base   = H(TAG_ASK, spend_seed)         — base authorization secret
 │   │   └── ask_j  = H(ask_base, j)               — per-address auth secret
-│   │       └── seed_i = H(H(TAG_AUTH_KEY, ask_j), i_felt) — per-key WOTS+ seed
-│   │           └── pk_i = WOTS+.KeyGen(seed_i)   — 133 chain endpoints (w=4)
+│   │       └── sk_root_i = H(TAG_XMSS_SK, ask_j, i_felt) — per-key WOTS+ secret root
+│   │           └── pk_i = WOTS+.KeyGen(sk_root_i) — 133 chain endpoints (w=4)
 │   │       └── (auth_root_j, pub_seed_j) = XMSS-style address auth public key
 │
 └── incoming_seed = H(TAG_INCOMING, master_sk)
@@ -266,7 +266,7 @@ Consumes N private notes, releases `v_pub` to a public address, and optionally c
 3. If change:
    - `owner_tag_c = H_owner(auth_root_c, pub_seed_c, nk_tag_c)` where `auth_root_c`, `pub_seed_c`, and `nk_tag_c` are private inputs
    - `cm_change = H_commit(d_j_c, v_change, rcm_c, owner_tag_c)`
-4. If no change: all change witness data constrained to zero (`v_change`, `d_j_change`, `rseed_change`, `auth_root_change`, `nk_tag_change`, `memo_ct_hash_change` = 0) to eliminate prover malleability
+4. If no change: all change witness data constrained to zero (`v_change`, `d_j_change`, `rseed_change`, `auth_root_change`, `pub_seed_change`, `nk_tag_change`, `memo_ct_hash_change` = 0) to eliminate prover malleability
 5. `sum(v_inputs) = v_pub + v_change`
 
 **Contract / ledger checks:** proof valid. Verify recipient binding per [Public Account Identifier Encoding](#public-account-identifier-encoding), credit `v_pub` to that recipient account, append `cm_change` to T (if nonzero). No signature verification needed — the STARK proof proves spend authorization.
@@ -322,6 +322,15 @@ sighash = fold(0x01, auth_domain, root, nf_0, ..., nf_{N-1}, cm_1, cm_2, mh_1, m
 // Unshield (type_tag = 0x02):
 sighash = fold(0x02, auth_domain, root, nf_0, ..., nf_{N-1}, v_pub, recipient_id, cm_change, mh_change)
 ```
+
+The fold algorithm is the sequential left fold used by the client and circuit:
+
+```
+fold(x_0, x_1, ..., x_n) =
+  H_sigh(H_sigh(...H_sigh(x_0, x_1), x_2)..., x_n)
+```
+
+where `H_sigh(a, b) = BLAKE2s_251(personal="sighSP__", a || b)`.
 
 `auth_domain` is a deployment-specific public input/output chosen by the verifier environment and enforced by the contract or ledger. It MUST uniquely identify the deployment context for spend authorizations. A practical derivation is `H(chain_id || contract_addr || verifier_or_program_id || deployment_salt)`, encoded canonically as a felt252.
 
@@ -438,6 +447,8 @@ note_data         — 0-3.2 KB   0 or 1 change note
 
 For a typical N=2 unshield: ~296-299 KB total.
 
+For transfer and unshield public-output parsing, the verifier infers the input count as `N = total_public_output_felts - 6`. That is, after the leading `auth_domain` and `root`, the final four felts are fixed-format outputs and the remaining middle slice is the nullifier list.
+
 ## Domain Separation
 
 All hashing uses BLAKE2s-256 truncated to 251 bits, with domain separation via BLAKE2s personalization (parameter block P[6..7]):
@@ -445,17 +456,19 @@ All hashing uses BLAKE2s-256 truncated to 251 bits, with domain separation via B
 | Use | Personalization | Function |
 |-----|----------------|----------|
 | Key derivation | (none) | `hash1`, `hash2_generic` |
-| Merkle nodes (commitment tree + auth tree) | `mrklSP__` | `hash2` |
+| Commitment-tree Merkle nodes | `mrklSP__` | `hash2`, `hash_merkle` |
 | Nullifiers | `nulfSP__` | `nullifier` |
 | Commitments | `cmmtSP__` | `commit` |
 | Per-address nk_spend | `nkspSP__` | `derive_nk_spend` |
 | Per-address nk_tag | `nktgSP__` | `derive_nk_tag` |
 | Owner tag | `ownrSP__` | `owner_tag` |
-| WOTS+ chain hash | `wotsSP__` | `hash1_wots` (in circuit) |
+| XMSS WOTS+ chain hash | (none) | `H_chain(pub_seed, adrs, x)` |
+| XMSS L-tree / auth-tree node hash | (none) | `H_node(pub_seed, adrs, left, right)` |
+| Standalone WOTS regression helper | `wotsSP__` | `hash1_wots` |
 | Sighash | `sighSP__` | `sighash_fold` (in circuit + client) |
 | Memo hash (client-side) | `memoSP__` | -- (not in circuit) |
 
-The commitment tree and auth tree both use `mrklSP__` for internal nodes. This is safe because they are verified against different roots in different circuit contexts — there is no cross-tree confusion.
+The commitment tree uses `mrklSP__` for internal nodes. The XMSS address tree does **not** use that personalization; it uses unpersonalized BLAKE2s with ADRS-based domain separation via `H_node`.
 
 ## Canonical Encodings
 
@@ -482,7 +495,6 @@ Examples:
 | `TAG_SPEND` | `"spend"` | `646e657073000000000000000000000000000000000000000000000000000000` |
 | `TAG_NK` | `"nk"` | `6b6e000000000000000000000000000000000000000000000000000000000000` |
 | `TAG_ASK` | `"ask"` | `6b73610000000000000000000000000000000000000000000000000000000000` |
-| `TAG_AUTH_KEY` | `"auth-key"` | `79656b2d68747561000000000000000000000000000000000000000000000000` |
 | `TAG_INCOMING` | `"incoming"` | `676e696d6f636e69000000000000000000000000000000000000000000000000` |
 | `TAG_DSK` | `"dsk"` | `6b73640000000000000000000000000000000000000000000000000000000000` |
 | `TAG_VIEW` | `"view"` | `7765697600000000000000000000000000000000000000000000000000000000` |
@@ -492,11 +504,16 @@ Examples:
 | `TAG_MLKEM_V2` | `"mlkem-v2"` | `32762d6d656b6c6d000000000000000000000000000000000000000000000000` |
 | `TAG_MLKEM_D` | `"mlkem-d"` | `642d6d656b6c6d00000000000000000000000000000000000000000000000000` |
 | `TAG_MLKEM_D2` | `"mlkem-d2"` | `32642d6d656b6c6d000000000000000000000000000000000000000000000000` |
+| `TAG_XMSS_SK` | `"xmss-sk"` | `6b732d73736d7800000000000000000000000000000000000000000000000000` |
+| `TAG_XMSS_PS` | `"xmss-ps"` | `73702d73736d7800000000000000000000000000000000000000000000000000` |
+| `TAG_XMSS_CHAIN` | `"xmss-ch"` | `68632d73736d7800000000000000000000000000000000000000000000000000` |
+| `TAG_XMSS_LTREE` | `"xmss-lt"` | `746c2d73736d7800000000000000000000000000000000000000000000000000` |
+| `TAG_XMSS_TREE` | `"xmss-tr"` | `72742d73736d7800000000000000000000000000000000000000000000000000` |
 
 Examples of use:
 
 - `H("spend", master_sk)` means `H(TAG_SPEND, master_sk)`
-- `H("auth-key", ask_j)` means `H(TAG_AUTH_KEY, ask_j)`
+- `H("xmss-sk", ask_j, i_felt)` means `H(TAG_XMSS_SK, ask_j, i_felt)`
 - `H("rcm")` means `H(TAG_RCM)`
 
 ### Canonical Binary Wire Format

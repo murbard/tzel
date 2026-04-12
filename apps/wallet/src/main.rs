@@ -143,6 +143,19 @@ impl TreeHashState {
         Some(value)
     }
 
+    fn lowest_node_height(&self) -> Option<u8> {
+        if !self.initialized || self.finished {
+            return None;
+        }
+        Some(
+            self.stack
+                .iter()
+                .map(|node| node.height)
+                .min()
+                .unwrap_or(self.target_height),
+        )
+    }
+
     fn step(&mut self, ask_j: &F, pub_seed: &F) {
         if !self.initialized || self.finished {
             return;
@@ -191,17 +204,49 @@ struct XmssBdsState {
     retain: Vec<RetainLevel>,
 }
 
+#[cfg(test)]
+static FULL_XMSS_REBUILD_TEST_GUARD: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+#[cfg(test)]
+static ALLOW_FULL_XMSS_REBUILD_IN_TESTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn assert_full_xmss_bds_rebuild_allowed(op: &str, depth: usize) {
+    let env_trap = std::env::var_os("TZEL_TRAP_FULL_XMSS_REBUILDS").is_some()
+        && std::env::var_os("TZEL_ALLOW_FULL_XMSS_REBUILD").is_none();
+    let test_trap =
+        cfg!(test) && !ALLOW_FULL_XMSS_REBUILD_IN_TESTS.load(std::sync::atomic::Ordering::SeqCst);
+    if depth == AUTH_DEPTH && (env_trap || test_trap) {
+        panic!(
+            "unexpected full depth-{} XMSS/BDS rebuild via {} — default tests must use fixed fixtures or small-depth helpers",
+            AUTH_DEPTH, op
+        );
+    }
+}
+
 impl XmssBdsState {
-    fn new(ask_j: &F, pub_seed: &F) -> Result<(Self, F), String> {
-        let mut auth_path = vec![ZERO; AUTH_DEPTH];
-        let keep = vec![FeltSlot::none(); AUTH_DEPTH];
-        let mut treehash: Vec<TreeHashState> = (0..(AUTH_DEPTH - XMSS_BDS_K))
-            .map(TreeHashState::new)
-            .collect();
-        let mut retain = vec![RetainLevel::default(); AUTH_DEPTH];
+    fn new_with_params(
+        ask_j: &F,
+        pub_seed: &F,
+        depth: usize,
+        k: usize,
+    ) -> Result<(Self, F), String> {
+        assert_full_xmss_bds_rebuild_allowed("XmssBdsState::new_with_params", depth);
+        if depth == 0 {
+            return Err("XMSS depth must be positive".to_string());
+        }
+        if k >= depth {
+            return Err(format!("invalid XMSS BDS k={} for depth {}", k, depth));
+        }
+
+        let auth_tree_size = 1usize << depth;
+        let mut auth_path = vec![ZERO; depth];
+        let keep = vec![FeltSlot::none(); depth];
+        let mut treehash: Vec<TreeHashState> = (0..(depth - k)).map(TreeHashState::new).collect();
+        let mut retain = vec![RetainLevel::default(); depth];
         let mut stack: Vec<XmssNode> = Vec::new();
 
-        for idx in 0..(AUTH_TREE_SIZE as u32) {
+        for idx in 0..(auth_tree_size as u32) {
             let mut node = XmssNode {
                 start_idx: idx,
                 height: 0,
@@ -215,12 +260,12 @@ impl XmssBdsState {
                 let node_idx = idx >> h;
                 if node_idx == 1 {
                     auth_path[h] = node.value;
-                } else if node_idx == 3 && h < (AUTH_DEPTH - XMSS_BDS_K) {
+                } else if node_idx == 3 && h < (depth - k) {
                     treehash[h].seed_completed(&node);
                 } else if node_idx >= 3
                     && (node_idx & 1) == 1
-                    && h >= (AUTH_DEPTH - XMSS_BDS_K)
-                    && h < (AUTH_DEPTH - 1)
+                    && h >= (depth - k)
+                    && h < (depth - 1)
                 {
                     retain[h].push(node.value);
                 }
@@ -259,10 +304,22 @@ impl XmssBdsState {
     }
 
     fn from_index(ask_j: &F, pub_seed: &F, next_index: u32) -> Result<(Self, F), String> {
-        if next_index as usize > AUTH_TREE_SIZE {
+        Self::from_index_with_params(ask_j, pub_seed, next_index, AUTH_DEPTH, XMSS_BDS_K)
+    }
+
+    fn from_index_with_params(
+        ask_j: &F,
+        pub_seed: &F,
+        next_index: u32,
+        depth: usize,
+        k: usize,
+    ) -> Result<(Self, F), String> {
+        assert_full_xmss_bds_rebuild_allowed("XmssBdsState::from_index_with_params", depth);
+        let auth_tree_size = 1usize << depth;
+        if next_index as usize > auth_tree_size {
             return Err(format!("invalid XMSS index {}", next_index));
         }
-        let (mut state, root) = Self::new(ask_j, pub_seed)?;
+        let (mut state, root) = Self::new_with_params(ask_j, pub_seed, depth, k)?;
         for _ in 0..next_index {
             state.advance(ask_j, pub_seed)?;
         }
@@ -274,18 +331,21 @@ impl XmssBdsState {
     }
 
     fn advance(&mut self, ask_j: &F, pub_seed: &F) -> Result<(), String> {
+        let depth = self.auth_path.len();
+        let treehash_levels = self.treehash.len();
+        let auth_tree_size = 1usize << depth;
         let index = self.next_index;
-        if index as usize >= AUTH_TREE_SIZE {
+        if index as usize >= auth_tree_size {
             return Err("XMSS keys exhausted".to_string());
         }
-        if index as usize == AUTH_TREE_SIZE - 1 {
+        if index as usize == auth_tree_size - 1 {
             self.next_index += 1;
             self.auth_path.clear();
             return Ok(());
         }
 
         let tau = index.trailing_ones() as usize;
-        if tau < AUTH_DEPTH - 1 && ((index >> (tau + 1)) & 1) == 0 {
+        if tau < depth - 1 && ((index >> (tau + 1)) & 1) == 0 {
             self.keep[tau] = FeltSlot::some(self.auth_path[tau]);
         }
 
@@ -296,16 +356,17 @@ impl XmssBdsState {
             let right = self.keep[tau - 1]
                 .take()
                 .ok_or_else(|| format!("missing BDS keep node at level {}", tau - 1))?;
+            let parent_start = index + 1 - (1u32 << tau);
             self.auth_path[tau] = xmss_tree_node_hash(
                 pub_seed,
                 (tau - 1) as u32,
-                index >> (tau + 1),
+                parent_start >> tau,
                 &left,
                 &right,
             );
 
             for h in 0..tau {
-                self.auth_path[h] = if h < (AUTH_DEPTH - XMSS_BDS_K) {
+                self.auth_path[h] = if h < treehash_levels {
                     self.treehash[h]
                         .take_ready()
                         .ok_or_else(|| format!("missing BDS treehash node at level {}", h))?
@@ -316,9 +377,9 @@ impl XmssBdsState {
                 };
             }
 
-            for h in 0..std::cmp::min(tau, AUTH_DEPTH - XMSS_BDS_K) {
+            for h in 0..std::cmp::min(tau, treehash_levels) {
                 let start_idx = index + 1 + (3u32 << h);
-                if (start_idx as usize) < AUTH_TREE_SIZE {
+                if (start_idx as usize) < auth_tree_size {
                     self.treehash[h].start(start_idx);
                 } else {
                     self.treehash[h].clear();
@@ -327,8 +388,28 @@ impl XmssBdsState {
         }
 
         self.next_index += 1;
-        for instance in &mut self.treehash {
-            instance.step(ask_j, pub_seed);
+        for _ in 0..(treehash_levels / 2) {
+            let mut best_idx = None;
+            let mut best_height = u8::MAX;
+            let mut best_start = u32::MAX;
+
+            for (idx, instance) in self.treehash.iter().enumerate() {
+                let Some(height) = instance.lowest_node_height() else {
+                    continue;
+                };
+                if height < best_height
+                    || (height == best_height && instance.start_idx < best_start)
+                {
+                    best_idx = Some(idx);
+                    best_height = height;
+                    best_start = instance.start_idx;
+                }
+            }
+
+            let Some(best_idx) = best_idx else {
+                break;
+            };
+            self.treehash[best_idx].step(ask_j, pub_seed);
         }
         Ok(())
     }
@@ -360,8 +441,19 @@ impl WalletAddressState {
         if self.bds.is_some() {
             return Ok(());
         }
-        let (state, root) =
-            XmssBdsState::from_index(ask_j, &self.auth_pub_seed, self.next_auth_index)?;
+        self.ensure_bds_with(ask_j, |ask_j, pub_seed, next_auth_index| {
+            XmssBdsState::from_index(ask_j, pub_seed, next_auth_index)
+        })
+    }
+
+    fn ensure_bds_with<R>(&mut self, ask_j: &F, rebuild: R) -> Result<(), String>
+    where
+        R: FnOnce(&F, &F, u32) -> Result<(XmssBdsState, F), String>,
+    {
+        if self.bds.is_some() {
+            return Ok(());
+        }
+        let (state, root) = rebuild(ask_j, &self.auth_pub_seed, self.next_auth_index)?;
         if root != self.auth_root {
             return Err(format!(
                 "rebuilt XMSS root mismatch for address {}",
@@ -422,18 +514,28 @@ impl WalletFile {
         j: u32,
         next_auth_index: u32,
     ) -> Result<WalletAddressState, String> {
+        #[cfg(test)]
         panic!(
             "unexpected XMSS address derivation for j={} next_auth_index={} — default tests must use fixed prederived wallet/address fixtures",
             j, next_auth_index
         );
+
+        #[cfg(not(test))]
         let acc = self.account();
+        #[cfg(not(test))]
         let d_j = derive_address(&acc.incoming_seed, j);
+        #[cfg(not(test))]
         let ask_j = derive_ask(&acc.ask_base, j);
+        #[cfg(not(test))]
         let auth_pub_seed = derive_auth_pub_seed(&ask_j);
+        #[cfg(not(test))]
         let (bds, auth_root) = XmssBdsState::from_index(&ask_j, &auth_pub_seed, next_auth_index)?;
+        #[cfg(not(test))]
         let nk_spend = derive_nk_spend(&acc.nk, &d_j);
+        #[cfg(not(test))]
         let nk_tag = derive_nk_tag(&nk_spend);
 
+        #[cfg(not(test))]
         Ok(WalletAddressState {
             index: j,
             d_j,
@@ -707,6 +809,7 @@ fn acquire_wallet_lock(path: &str) -> Result<WalletLock, String> {
 }
 
 fn load_wallet(path: &str) -> Result<WalletFile, String> {
+    warn_if_wallet_permissions_are_too_open(path);
     let data = std::fs::read_to_string(path).map_err(|e| format!("read wallet: {}", e))?;
     let mut wallet: WalletFile =
         serde_json::from_str(&data).map_err(|e| format!("parse wallet: {}", e))?;
@@ -726,8 +829,44 @@ fn save_wallet(path: &str, w: &WalletFile) -> Result<(), String> {
     file.sync_all().map_err(|e| format!("fsync tmp: {}", e))?;
     drop(file);
     std::fs::rename(&tmp, wallet_path).map_err(|e| format!("rename: {}", e))?;
+    set_wallet_permissions(wallet_path)?;
     sync_parent_dir(wallet_path)
 }
+
+#[cfg(unix)]
+fn set_wallet_permissions(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let perms = std::fs::Permissions::from_mode(0o600);
+    std::fs::set_permissions(path, perms).map_err(|e| format!("chmod wallet: {}", e))
+}
+
+#[cfg(not(unix))]
+fn set_wallet_permissions(_path: &std::path::Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(all(unix, not(test)))]
+fn warn_if_wallet_permissions_are_too_open(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        eprintln!(
+            "warning: wallet file {} is not private (mode {:o}); it contains plaintext spending keys",
+            path, mode
+        );
+    }
+}
+
+#[cfg(all(unix, test))]
+fn warn_if_wallet_permissions_are_too_open(_path: &str) {}
+
+#[cfg(not(unix))]
+fn warn_if_wallet_permissions_are_too_open(_path: &str) {}
 
 #[cfg(unix)]
 fn sync_parent_dir(path: &std::path::Path) -> Result<(), String> {
@@ -1178,6 +1317,18 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
+    fn allow_full_xmss_rebuild<T>(f: impl FnOnce() -> T) -> T {
+        let guard = FULL_XMSS_REBUILD_TEST_GUARD
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .expect("full XMSS rebuild guard should lock");
+        ALLOW_FULL_XMSS_REBUILD_IN_TESTS.store(true, std::sync::atomic::Ordering::SeqCst);
+        let result = f();
+        ALLOW_FULL_XMSS_REBUILD_IN_TESTS.store(false, std::sync::atomic::Ordering::SeqCst);
+        drop(guard);
+        result
+    }
+
     fn rebuild_address_state(master_sk: &F, j: u32, next_auth_index: u32) -> WalletAddressState {
         let acc = derive_account(master_sk);
         let d_j = derive_address(&acc.incoming_seed, j);
@@ -1213,7 +1364,7 @@ mod tests {
         let fixture: WalletFile =
             serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture read"))
                 .expect("fixture parse");
-        let rebuilt = rebuild_address_state(&fixture.master_sk, 0, 0);
+        let rebuilt = allow_full_xmss_rebuild(|| rebuild_address_state(&fixture.master_sk, 0, 0));
         assert_eq!(fixture.addresses[0].index, 0);
         assert_eq!(
             serde_json::to_value(&fixture.addresses[0]).unwrap(),
@@ -1416,6 +1567,56 @@ mod tests {
     }
 
     #[test]
+    fn test_legacy_kem_keys_absent_for_migrated_wallet() {
+        let w = test_wallet(0, None);
+        assert!(w.legacy_kem_keys().is_none());
+    }
+
+    #[test]
+    fn test_legacy_kem_keys_are_recovered_from_seed_material() {
+        let legacy_v = [0x33; 64];
+        let legacy_d = [0x44; 64];
+        let w = test_wallet(0, Some((legacy_v, legacy_d)));
+        let (ek_v1, dk_v1, ek_d1, dk_d1) = w.legacy_kem_keys().expect("legacy keys");
+        let (ek_v2, dk_v2) = kem_keygen_from_seed(&legacy_v);
+        let (ek_d2, dk_d2) = kem_keygen_from_seed(&legacy_d);
+
+        assert_eq!(ek_v1.to_bytes(), ek_v2.to_bytes());
+        assert_eq!(dk_v1.to_bytes(), dk_v2.to_bytes());
+        assert_eq!(ek_d1.to_bytes(), ek_d2.to_bytes());
+        assert_eq!(dk_d1.to_bytes(), dk_d2.to_bytes());
+    }
+
+    #[test]
+    fn test_legacy_kem_keys_reject_incomplete_seed_material() {
+        let mut w = test_wallet(0, None);
+        w.kem_seed_v = vec![0x11; 63];
+        w.kem_seed_d = vec![0x22; 64];
+
+        assert!(
+            w.legacy_kem_keys().is_none(),
+            "legacy KEM recovery must reject malformed seed lengths"
+        );
+    }
+
+    #[test]
+    fn test_per_address_kem_keys_are_deterministic_and_distinct() {
+        let w = test_wallet(0, None);
+        let (ek_v0_a, dk_v0_a, ek_d0_a, dk_d0_a) = w.kem_keys(0);
+        let (ek_v0_b, dk_v0_b, ek_d0_b, dk_d0_b) = w.kem_keys(0);
+        let (ek_v1, dk_v1, ek_d1, dk_d1) = w.kem_keys(1);
+
+        assert_eq!(ek_v0_a.to_bytes(), ek_v0_b.to_bytes());
+        assert_eq!(dk_v0_a.to_bytes(), dk_v0_b.to_bytes());
+        assert_eq!(ek_d0_a.to_bytes(), ek_d0_b.to_bytes());
+        assert_eq!(dk_d0_a.to_bytes(), dk_d0_b.to_bytes());
+        assert_ne!(ek_v0_a.to_bytes(), ek_v1.to_bytes());
+        assert_ne!(dk_v0_a.to_bytes(), dk_v1.to_bytes());
+        assert_ne!(ek_d0_a.to_bytes(), ek_d1.to_bytes());
+        assert_ne!(dk_d0_a.to_bytes(), dk_d1.to_bytes());
+    }
+
+    #[test]
     fn test_try_recover_note_new_per_address_wallet() {
         let w = test_wallet(1, None);
         let acc = w.account();
@@ -1461,6 +1662,23 @@ mod tests {
         assert_eq!(note.addr_index, 0);
         assert_eq!(note.v, 91);
         assert_eq!(note.cm, cm);
+    }
+
+    #[test]
+    fn test_try_recover_note_migrated_wallet_accepts_per_address_notes_even_with_legacy_seeds() {
+        let legacy_v = [0x21; 64];
+        let legacy_d = [0x43; 64];
+        let w = test_wallet(1, Some((legacy_v, legacy_d)));
+        let rseed = felt_tag(b"wallet-note-per-address-with-legacy");
+        let nm = note_memo_for_wallet_address(&w, 0, 41, rseed, None);
+
+        let note = w
+            .try_recover_note(&nm)
+            .expect("migrated wallet should still recover per-address notes");
+
+        assert_eq!(note.addr_index, 0);
+        assert_eq!(note.v, 41);
+        assert_eq!(note.cm, nm.cm);
     }
 
     #[test]
@@ -1521,6 +1739,69 @@ mod tests {
         assert!(!dir.path().join("wallet.json.tmp").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_save_wallet_sets_private_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let w = test_wallet(1, None);
+
+        save_wallet(wallet_path.to_str().unwrap(), &w).expect("wallet should save");
+
+        let mode = std::fs::metadata(&wallet_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn test_load_wallet_rejects_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        std::fs::write(&wallet_path, "{not-json").expect("write invalid wallet");
+
+        let err = match load_wallet(wallet_path.to_str().unwrap()) {
+            Ok(_) => panic!("invalid wallet must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("parse wallet"));
+    }
+
+    #[test]
+    fn test_load_wallet_reports_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("missing-wallet.json");
+        let err = match load_wallet(wallet_path.to_str().unwrap()) {
+            Ok(_) => panic!("missing wallet must fail"),
+            Err(err) => err,
+        };
+        assert!(err.contains("read wallet"));
+    }
+
+    #[test]
+    fn test_load_address_rejects_invalid_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let address_path = dir.path().join("address.json");
+        std::fs::write(&address_path, "{\"d_j\": 1").expect("write invalid address");
+
+        let err =
+            load_address(address_path.to_str().unwrap()).expect_err("invalid address must fail");
+        assert!(err.contains("parse address"));
+    }
+
+    #[test]
+    fn test_load_address_reports_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let address_path = dir.path().join("missing-address.json");
+        let err =
+            load_address(address_path.to_str().unwrap()).expect_err("missing address must fail");
+        assert!(err.contains("read address"));
+    }
+
     #[test]
     fn test_wallet_lock_rejects_concurrent_access() {
         let dir = tempfile::tempdir().unwrap();
@@ -1554,6 +1835,18 @@ mod tests {
     }
 
     #[test]
+    fn test_wallet_lock_invalid_pid_is_not_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let lock_path = wallet_lock_path(wallet_path.to_str().unwrap());
+
+        std::fs::write(&lock_path, "not-a-pid\n").expect("write invalid lock");
+        let err = acquire_wallet_lock(wallet_path.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("wallet is locked by another process"));
+        assert!(lock_path.exists(), "invalid lock should remain in place");
+    }
+
+    #[test]
     fn test_ensure_path_matches_root_rejects_mismatch() {
         let expected = [1u8; 32];
         let actual = [2u8; 32];
@@ -1579,11 +1872,433 @@ mod tests {
     }
 
     #[test]
+    fn test_next_address_reuses_preseeded_fixture_without_derivation() {
+        let base = base_test_wallet();
+        let mut wallet = WalletFile {
+            master_sk: base.master_sk,
+            kem_seed_v: vec![],
+            kem_seed_d: vec![],
+            addresses: base.addresses[..2].to_vec(),
+            addr_counter: 0,
+            notes: vec![],
+            scanned: 0,
+            wots_key_indices: std::collections::HashMap::new(),
+        };
+
+        let (state0, addr0) = wallet.next_address().expect("first fixture address");
+        let (state1, addr1) = wallet.next_address().expect("second fixture address");
+
+        assert_eq!(state0.index, 0);
+        assert_eq!(state1.index, 1);
+        assert_eq!(addr0.auth_root, base.addresses[0].auth_root);
+        assert_eq!(addr1.auth_root, base.addresses[1].auth_root);
+        assert_eq!(wallet.addr_counter, 2);
+        assert_eq!(wallet.addresses.len(), 2);
+    }
+
+    #[test]
+    fn test_materialize_addresses_populates_wots_index_map_from_fixture_state() {
+        let base = base_test_wallet();
+        let mut wallet = WalletFile {
+            master_sk: base.master_sk,
+            kem_seed_v: vec![],
+            kem_seed_d: vec![],
+            addresses: base.addresses[..2].to_vec(),
+            addr_counter: 2,
+            notes: vec![],
+            scanned: 0,
+            wots_key_indices: std::collections::HashMap::new(),
+        };
+
+        wallet
+            .materialize_addresses()
+            .expect("fixture materialization should stay on cached state");
+        assert_eq!(wallet.wots_key_indices.get(&0), Some(&0));
+        assert_eq!(wallet.wots_key_indices.get(&1), Some(&0));
+    }
+
+    #[test]
+    fn test_materialize_addresses_refreshes_wots_index_after_fixture_state_advance() {
+        let mut wallet = test_wallet(1, None);
+        assert_eq!(wallet.next_wots_key(0), 0);
+        wallet.wots_key_indices.clear();
+
+        wallet
+            .materialize_addresses()
+            .expect("fixture materialization should refresh cached WOTS index");
+
+        assert_eq!(wallet.wots_key_indices.get(&0), Some(&1));
+    }
+
+    #[test]
+    fn test_ensure_bds_rebuild_clears_legacy_fields_small_depth() {
+        let acc = derive_account(&felt_tag(b"wallet-small-bds"));
+        let d_j = derive_address(&acc.incoming_seed, 0);
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
+        let next_auth_index = 5;
+        let (rebuilt_state, rebuilt_root) =
+            XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, next_auth_index, 6, 2)
+                .expect("small-depth BDS state should rebuild");
+
+        let mut addr = WalletAddressState {
+            index: 0,
+            d_j,
+            auth_root: rebuilt_root,
+            auth_pub_seed,
+            nk_tag: derive_nk_tag(&derive_nk_spend(&acc.nk, &d_j)),
+            bds: None,
+            next_auth_index,
+            next_auth_path: rebuilt_state.current_path().to_vec(),
+        };
+
+        addr.ensure_bds_with(&ask_j, |_, _, idx| {
+            XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, idx, 6, 2)
+        })
+        .expect("legacy small-depth address state should rebuild");
+
+        let restored = addr.bds.as_ref().expect("BDS state should be restored");
+        assert_eq!(restored.next_index, rebuilt_state.next_index);
+        assert_eq!(restored.current_path(), rebuilt_state.current_path());
+        assert_eq!(addr.next_auth_index, 0);
+        assert!(addr.next_auth_path.is_empty());
+    }
+
+    #[test]
+    fn test_ensure_bds_with_rejects_root_mismatch() {
+        let acc = derive_account(&felt_tag(b"wallet-small-root-mismatch"));
+        let d_j = derive_address(&acc.incoming_seed, 0);
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
+        let next_auth_index = 3;
+        let (rebuilt_state, rebuilt_root) =
+            XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, next_auth_index, 6, 2)
+                .expect("small-depth BDS state should rebuild");
+        let mut wrong_root = rebuilt_root;
+        wrong_root[0] ^= 0x01;
+
+        let mut addr = WalletAddressState {
+            index: 0,
+            d_j,
+            auth_root: wrong_root,
+            auth_pub_seed,
+            nk_tag: derive_nk_tag(&derive_nk_spend(&acc.nk, &d_j)),
+            bds: None,
+            next_auth_index,
+            next_auth_path: rebuilt_state.current_path().to_vec(),
+        };
+
+        let err = addr
+            .ensure_bds_with(&ask_j, |_, _, idx| {
+                XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, idx, 6, 2)
+            })
+            .expect_err("root mismatch should be rejected");
+        assert!(err.contains("rebuilt XMSS root mismatch"));
+        assert!(addr.bds.is_none());
+        assert_eq!(addr.next_auth_index, next_auth_index);
+        assert_eq!(addr.next_auth_path, rebuilt_state.current_path().to_vec());
+    }
+
+    #[test]
+    fn test_ensure_bds_with_rejects_path_mismatch() {
+        let acc = derive_account(&felt_tag(b"wallet-small-path-mismatch"));
+        let d_j = derive_address(&acc.incoming_seed, 0);
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let auth_pub_seed = derive_auth_pub_seed(&ask_j);
+        let next_auth_index = 4;
+        let (rebuilt_state, rebuilt_root) =
+            XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, next_auth_index, 6, 2)
+                .expect("small-depth BDS state should rebuild");
+        let mut wrong_path = rebuilt_state.current_path().to_vec();
+        wrong_path[0][0] ^= 0x01;
+
+        let mut addr = WalletAddressState {
+            index: 0,
+            d_j,
+            auth_root: rebuilt_root,
+            auth_pub_seed,
+            nk_tag: derive_nk_tag(&derive_nk_spend(&acc.nk, &d_j)),
+            bds: None,
+            next_auth_index,
+            next_auth_path: wrong_path,
+        };
+
+        let err = addr
+            .ensure_bds_with(&ask_j, |_, _, idx| {
+                XmssBdsState::from_index_with_params(&ask_j, &auth_pub_seed, idx, 6, 2)
+            })
+            .expect_err("path mismatch should be rejected");
+        assert!(err.contains("rebuilt XMSS path mismatch"));
+        assert!(addr.bds.is_none());
+        assert_eq!(addr.next_auth_index, next_auth_index);
+    }
+
+    #[test]
+    fn test_ensure_bds_with_short_circuits_when_state_is_already_present() {
+        let ask_j = felt_tag(b"wallet-ensure-bds-ignored");
+        let mut addr = test_wallet(1, None).addresses[0].clone();
+        let original = addr
+            .bds
+            .clone()
+            .expect("fixture address should include BDS");
+        let stale_path = vec![felt_tag(b"stale-legacy-path")];
+        addr.next_auth_index = 99;
+        addr.next_auth_path = stale_path.clone();
+
+        addr.ensure_bds_with(&ask_j, |_, _, _| -> Result<(XmssBdsState, F), String> {
+            panic!("ensure_bds_with should not rebuild when BDS state is already populated");
+        })
+        .expect("existing BDS state should short-circuit");
+
+        let restored = addr.bds.as_ref().expect("BDS state should remain present");
+        assert_eq!(restored.next_index, original.next_index);
+        assert_eq!(restored.current_path(), original.current_path());
+        assert_eq!(addr.next_auth_index, 99);
+        assert_eq!(addr.next_auth_path, stale_path);
+    }
+
+    fn recompute_xmss_root_from_path(leaf: F, key_idx: u32, pub_seed: &F, siblings: &[F]) -> F {
+        let mut current = leaf;
+        let mut idx = key_idx;
+        for (level, sibling) in siblings.iter().enumerate() {
+            let node_idx = idx >> 1;
+            current = if idx & 1 == 0 {
+                xmss_tree_node_hash(pub_seed, level as u32, node_idx, &current, sibling)
+            } else {
+                xmss_tree_node_hash(pub_seed, level as u32, node_idx, sibling, &current)
+            };
+            idx >>= 1;
+        }
+        current
+    }
+
+    fn small_reference_root_and_path(
+        ask_j: &F,
+        pub_seed: &F,
+        depth: usize,
+        target: u32,
+    ) -> (F, Vec<F>) {
+        let mut nodes: Vec<F> = (0..(1u32 << depth))
+            .map(|idx| auth_leaf_hash_with_pub_seed(ask_j, pub_seed, idx))
+            .collect();
+        let mut idx = target as usize;
+        let mut path = Vec::with_capacity(depth);
+
+        for level in 0..depth {
+            path.push(nodes[idx ^ 1]);
+            let mut next = Vec::with_capacity(nodes.len() / 2);
+            for (node_idx, pair) in nodes.chunks_exact(2).enumerate() {
+                next.push(xmss_tree_node_hash(
+                    pub_seed,
+                    level as u32,
+                    node_idx as u32,
+                    &pair[0],
+                    &pair[1],
+                ));
+            }
+            nodes = next;
+            idx >>= 1;
+        }
+
+        (nodes[0], path)
+    }
+
+    #[test]
+    fn test_xmss_bds_from_index_matches_reference_path_small_depth() {
+        let acc = derive_account(&felt_tag(b"wallet-bds-ref"));
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let pub_seed = derive_auth_pub_seed(&ask_j);
+        let depth = 6usize;
+        let k = 2usize;
+
+        for next_index in [0u32, 1, 2, 5, 17, 31] {
+            let (state, root) =
+                XmssBdsState::from_index_with_params(&ask_j, &pub_seed, next_index, depth, k)
+                    .expect("small-depth BDS state should build");
+            let (reference_root, reference_path) =
+                small_reference_root_and_path(&ask_j, &pub_seed, depth, next_index);
+            let leaf = auth_leaf_hash_with_pub_seed(&ask_j, &pub_seed, next_index);
+            let rebuilt_from_bds =
+                recompute_xmss_root_from_path(leaf, next_index, &pub_seed, state.current_path());
+            let rebuilt_from_reference =
+                recompute_xmss_root_from_path(leaf, next_index, &pub_seed, &reference_path);
+
+            assert_eq!(root, reference_root);
+            assert_eq!(
+                rebuilt_from_reference, root,
+                "reference path must verify for key {}",
+                next_index
+            );
+            assert_eq!(
+                state.current_path(),
+                reference_path.as_slice(),
+                "BDS path bytes differ for key {}",
+                next_index
+            );
+            assert_eq!(
+                rebuilt_from_bds, root,
+                "BDS path must verify for key {}",
+                next_index
+            );
+        }
+    }
+
+    #[test]
+    fn test_xmss_bds_advance_matches_reference_sequence_small_depth() {
+        let acc = derive_account(&felt_tag(b"wallet-bds-advance"));
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let pub_seed = derive_auth_pub_seed(&ask_j);
+        let depth = 6usize;
+        let k = 2usize;
+        let (mut state, _) = XmssBdsState::from_index_with_params(&ask_j, &pub_seed, 0, depth, k)
+            .expect("small-depth BDS state should build");
+
+        for key_idx in 0u32..12 {
+            let (_, reference_path) =
+                small_reference_root_and_path(&ask_j, &pub_seed, depth, key_idx);
+            let leaf = auth_leaf_hash_with_pub_seed(&ask_j, &pub_seed, key_idx);
+            let rebuilt_from_bds =
+                recompute_xmss_root_from_path(leaf, key_idx, &pub_seed, state.current_path());
+            let rebuilt_from_reference =
+                recompute_xmss_root_from_path(leaf, key_idx, &pub_seed, &reference_path);
+            let expected_root = small_subtree_root(&ask_j, &pub_seed, 0, depth as u32);
+            assert_eq!(
+                rebuilt_from_reference, expected_root,
+                "reference path must verify for key {}",
+                key_idx
+            );
+            assert_eq!(
+                state.current_path(),
+                reference_path.as_slice(),
+                "BDS path bytes differ for key {}",
+                key_idx
+            );
+            assert_eq!(
+                rebuilt_from_bds, expected_root,
+                "BDS path must verify for key {}",
+                key_idx
+            );
+            state
+                .advance(&ask_j, &pub_seed)
+                .expect("advance should succeed");
+        }
+    }
+
+    #[test]
+    fn test_reserve_next_auth_returns_path_bound_to_auth_root() {
+        let mut w = test_wallet(1, None);
+        let acc = w.account();
+        let ask_j = derive_ask(&acc.ask_base, 0);
+        let msg_hash = felt_tag(b"wallet-reserve-auth");
+
+        let (key_idx, auth_root, auth_pub_seed, path) = w
+            .reserve_next_auth(0)
+            .expect("fixture address should reserve auth path");
+        let (sig, _pk, _digits) = wots_sign(&ask_j, key_idx, &msg_hash);
+        let recovered_pk = recover_wots_pk(&msg_hash, &auth_pub_seed, key_idx, &sig);
+        let leaf = wots_pk_to_leaf(&auth_pub_seed, key_idx, &recovered_pk);
+        let recomputed = recompute_xmss_root_from_path(leaf, key_idx, &auth_pub_seed, &path);
+
+        assert_eq!(recomputed, auth_root);
+        assert_eq!(w.wots_key_indices.get(&0), Some(&1));
+    }
+
+    #[test]
+    fn test_reserve_next_auth_rejects_missing_address() {
+        let mut w = test_wallet(0, None);
+        let err = w
+            .reserve_next_auth(0)
+            .expect_err("missing address record should error");
+        assert!(err.contains("missing address record 0"));
+    }
+
+    #[test]
+    fn test_reserve_next_auth_rejects_exhausted_tree() {
+        let mut w = test_wallet(1, None);
+        w.addresses[0].bds = Some(XmssBdsState {
+            next_index: AUTH_TREE_SIZE as u32,
+            auth_path: vec![],
+            keep: vec![],
+            treehash: vec![],
+            retain: vec![],
+        });
+
+        let err = w
+            .reserve_next_auth(0)
+            .expect_err("exhausted XMSS tree should error");
+        assert!(err.contains("XMSS keys exhausted for address 0"));
+    }
+
+    #[test]
     fn test_next_wots_key_is_monotonic() {
         let mut w = test_wallet(1, None);
         assert_eq!(w.next_wots_key(0), 0);
         assert_eq!(w.next_wots_key(0), 1);
         assert_eq!(w.next_wots_key(0), 2);
+    }
+
+    #[test]
+    fn test_select_notes_rejects_insufficient_funds() {
+        let mut w = test_wallet(0, None);
+        w.notes = vec![
+            Note {
+                nk_spend: ZERO,
+                nk_tag: ZERO,
+                auth_root: ZERO,
+                d_j: ZERO,
+                v: 10,
+                rseed: ZERO,
+                cm: felt_tag(b"note-0"),
+                index: 0,
+                addr_index: 0,
+            },
+            Note {
+                nk_spend: ZERO,
+                nk_tag: ZERO,
+                auth_root: ZERO,
+                d_j: ZERO,
+                v: 15,
+                rseed: ZERO,
+                cm: felt_tag(b"note-1"),
+                index: 1,
+                addr_index: 0,
+            },
+        ];
+
+        let err = w.select_notes(40).expect_err("overspend should fail");
+        assert!(err.contains("insufficient funds"));
+    }
+
+    #[test]
+    fn test_select_notes_prefers_single_large_note_when_sufficient() {
+        let mut w = test_wallet(0, None);
+        w.notes = vec![
+            Note {
+                nk_spend: ZERO,
+                nk_tag: ZERO,
+                auth_root: ZERO,
+                d_j: ZERO,
+                v: 5,
+                rseed: ZERO,
+                cm: felt_tag(b"small-note"),
+                index: 0,
+                addr_index: 0,
+            },
+            Note {
+                nk_spend: ZERO,
+                nk_tag: ZERO,
+                auth_root: ZERO,
+                d_j: ZERO,
+                v: 40,
+                rseed: ZERO,
+                cm: felt_tag(b"large-note"),
+                index: 1,
+                addr_index: 0,
+            },
+        ];
+
+        let selected = w.select_notes(30).expect("selection should succeed");
+        assert_eq!(selected, vec![1]);
     }
 
     #[test]

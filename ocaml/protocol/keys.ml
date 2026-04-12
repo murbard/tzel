@@ -83,7 +83,20 @@ let auth_leaf_hash ask_j key_idx =
   let pk = wots_pk ask_j key_idx in
   Wots.pk_to_leaf ~pub_seed ~key_idx pk
 
+let assert_full_xmss_rebuild_allowed op height =
+  if
+    height = auth_depth
+    && Option.is_some (Sys.getenv_opt "TZEL_TRAP_FULL_XMSS_REBUILDS")
+    && Option.is_none (Sys.getenv_opt "TZEL_ALLOW_FULL_XMSS_REBUILD")
+  then
+    failwith
+      (Printf.sprintf
+         "unexpected full depth-%d XMSS rebuild via %s — default tests must use \
+          fixed fixtures or small-depth helpers"
+         auth_depth op)
+
 let rec xmss_subtree_root ask_j pub_seed start height =
+  if start = 0 then assert_full_xmss_rebuild_allowed "xmss_subtree_root" height;
   if height = 0 then
     let pk = wots_pk ask_j start in
     Wots.pk_to_leaf ~pub_seed ~key_idx:start pk
@@ -94,6 +107,8 @@ let rec xmss_subtree_root ask_j pub_seed start height =
     xmss_node_hash pub_seed 0 (height - 1) (start lsr height) left right
 
 let rec xmss_root_and_path_inner ask_j pub_seed start height target =
+  if start = 0 then
+    assert_full_xmss_rebuild_allowed "xmss_root_and_path_inner" height;
   if height = 0 then
     let leaf = auth_leaf_hash ask_j start in
     let path = if start = target then Some [] else None in
@@ -123,20 +138,24 @@ let rec xmss_root_and_path_inner ask_j pub_seed start height target =
     (root, path)
 
 let build_auth_tree ask_j =
+  assert_full_xmss_rebuild_allowed "build_auth_tree" auth_depth;
   let pub_seed = derive_auth_pub_seed ask_j in
   xmss_subtree_root ask_j pub_seed 0 auth_depth
 
 let auth_tree_path ask_j index =
+  assert_full_xmss_rebuild_allowed "auth_tree_path" auth_depth;
   let pub_seed = derive_auth_pub_seed ask_j in
   let (_root, path) = xmss_root_and_path_inner ask_j pub_seed 0 auth_depth index in
   Array.of_list (Option.get path)
 
 let auth_root_and_path ask_j index =
+  assert_full_xmss_rebuild_allowed "auth_root_and_path" auth_depth;
   let pub_seed = derive_auth_pub_seed ask_j in
   let (root, path) = xmss_root_and_path_inner ask_j pub_seed 0 auth_depth index in
   (root, Array.of_list (Option.get path))
 
 let derive_address keys j =
+  assert_full_xmss_rebuild_allowed "derive_address" auth_depth;
   let d_j = derive_diversifier keys j in
   let ask_j = derive_ask keys j in
   let auth_pub_seed = derive_auth_pub_seed ask_j in

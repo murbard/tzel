@@ -239,3 +239,98 @@ pub fn generate_interop_scenario() -> InteropScenario {
 pub fn generate_interop_scenario_json() -> String {
     serde_json::to_string_pretty(&generate_interop_scenario()).unwrap()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generated_interop_scenario_is_self_consistent() {
+        let scenario = generate_interop_scenario();
+        let alice_acc = derive_account(&fixed_felt(0x11));
+        let bob_acc = derive_account(&fixed_felt(0x55));
+        let alice_addr0 = derive_scenario_address(&alice_acc, 0);
+        let alice_addr1 = derive_scenario_address(&alice_acc, 1);
+        let bob_addr0 = derive_scenario_address(&bob_acc, 0);
+
+        assert_eq!(scenario.auth_domain, default_auth_domain());
+        assert_eq!(scenario.initial_alice_balance, 100);
+        assert_eq!(scenario.shield.address.d_j, alice_addr0.payment.d_j);
+        assert_eq!(
+            scenario.transfer.cm_1,
+            commit_for_address(&alice_addr1.payment, 60, &fixed_felt(0x22))
+        );
+        assert_eq!(
+            scenario.transfer.cm_2,
+            commit_for_address(&bob_addr0.payment, 40, &fixed_felt(0x23))
+        );
+
+        let (shield_cm, _shield_enc, shield_mh) = deterministic_note(
+            &alice_addr0.payment,
+            100,
+            &fixed_felt(0x21),
+            b"interop-shield",
+            0x31,
+            0x41,
+        );
+        assert_eq!(scenario.shield.cm, shield_cm);
+        assert_eq!(scenario.shield.memo_ct_hash, shield_mh);
+
+        let mut tree = MerkleTree::new();
+        tree.append(scenario.shield.cm);
+        assert_eq!(scenario.transfer.root, tree.root());
+        assert_eq!(
+            scenario.transfer.nullifiers,
+            vec![nullifier(&alice_addr0.nk_spend, &scenario.shield.cm, 0)]
+        );
+
+        tree.append(scenario.transfer.cm_1);
+        tree.append(scenario.transfer.cm_2);
+        assert_eq!(scenario.unshield.root, tree.root());
+        assert_eq!(
+            scenario.unshield.nullifiers,
+            vec![nullifier(&bob_addr0.nk_spend, &scenario.transfer.cm_2, 2)]
+        );
+
+        assert_eq!(scenario.unshield.v_pub, 40);
+        assert_eq!(scenario.unshield.recipient, "bob");
+        assert_eq!(scenario.unshield.cm_change, ZERO);
+        assert!(scenario.unshield.enc_change.is_none());
+        assert_eq!(scenario.unshield.memo_ct_hash_change, ZERO);
+
+        assert_eq!(scenario.expected.alice_public_balance, 0);
+        assert_eq!(scenario.expected.bob_public_balance, 40);
+        assert_eq!(scenario.expected.tree_size, tree.leaves.len());
+        assert_eq!(scenario.expected.nullifier_count, 2);
+    }
+
+    #[test]
+    fn test_deterministic_note_is_stable_and_binds_commitment() {
+        let acc = derive_account(&fixed_felt(0x44));
+        let addr = derive_scenario_address(&acc, 3);
+        let rseed = fixed_felt(0x66);
+        let (cm1, enc1, mh1) =
+            deterministic_note(&addr.payment, 77, &rseed, b"interop-note", 0x12, 0x34);
+        let (cm2, enc2, mh2) =
+            deterministic_note(&addr.payment, 77, &rseed, b"interop-note", 0x12, 0x34);
+
+        assert_eq!(cm1, cm2);
+        assert_eq!(mh1, mh2);
+        assert_eq!(enc1.tag, enc2.tag);
+        assert_eq!(enc1.encrypted_data, enc2.encrypted_data);
+        assert_eq!(cm1, commit_for_address(&addr.payment, 77, &rseed));
+        assert_eq!(mh1, memo_ct_hash(&enc1));
+    }
+
+    #[test]
+    fn test_generate_interop_scenario_json_roundtrip() {
+        let json = generate_interop_scenario_json();
+        let reparsed: InteropScenario =
+            serde_json::from_str(&json).expect("interop scenario json should parse");
+
+        assert_eq!(reparsed.shield.sender, "alice");
+        assert_eq!(reparsed.unshield.recipient, "bob");
+        assert_eq!(reparsed.expected.tree_size, 3);
+        assert_eq!(reparsed.expected.nullifier_count, 2);
+    }
+}

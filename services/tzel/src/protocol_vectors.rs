@@ -115,7 +115,18 @@ fn merkle_root(depth: usize, leaves: &[F]) -> F {
     }
 }
 
-fn address_record(account: &Account, j: u32) -> (F, F, F, F, F, F) {
+#[derive(Clone)]
+struct AddressRecord {
+    j: u32,
+    d_j: F,
+    nk_spend: F,
+    nk_tag: F,
+    auth_root: F,
+    auth_pub_seed: F,
+    owner_tag: F,
+}
+
+fn address_record(account: &Account, j: u32) -> AddressRecord {
     let d_j = derive_address(&account.incoming_seed, j);
     let ask_j = derive_ask(&account.ask_base, j);
     let auth_root = build_auth_tree(&ask_j);
@@ -123,19 +134,39 @@ fn address_record(account: &Account, j: u32) -> (F, F, F, F, F, F) {
     let nk_spend = derive_nk_spend(&account.nk, &d_j);
     let nk_tag = derive_nk_tag(&nk_spend);
     let owner_tag = owner_tag(&auth_root, &auth_pub_seed, &nk_tag);
-    (d_j, nk_spend, nk_tag, auth_root, auth_pub_seed, owner_tag)
+    AddressRecord {
+        j,
+        d_j,
+        nk_spend,
+        nk_tag,
+        auth_root,
+        auth_pub_seed,
+        owner_tag,
+    }
 }
 
 fn j0_payment_address(account: &Account) -> PaymentAddress {
-    let (d_j, _, nk_tag, auth_root, auth_pub_seed, _) = address_record(account, 0);
+    let record = address_record(account, 0);
     let (ek_v, _, ek_d, _) = derive_kem_keys(&account.incoming_seed, 0);
     PaymentAddress {
-        d_j,
-        auth_root,
-        auth_pub_seed,
-        nk_tag,
+        d_j: record.d_j,
+        auth_root: record.auth_root,
+        auth_pub_seed: record.auth_pub_seed,
+        nk_tag: record.nk_tag,
         ek_v: ek_v.to_bytes().to_vec(),
         ek_d: ek_d.to_bytes().to_vec(),
+    }
+}
+
+#[cfg(test)]
+fn wire_fixture_payment_address() -> PaymentAddress {
+    PaymentAddress {
+        d_j: felt_of_u64(1),
+        auth_root: felt_of_u64(2),
+        auth_pub_seed: felt_of_u64(3),
+        nk_tag: felt_of_u64(4),
+        ek_v: vec![0xA5; crate::canonical_wire::ML_KEM768_ENCAPSULATION_KEY_BYTES],
+        ek_d: vec![0x5A; crate::canonical_wire::ML_KEM768_ENCAPSULATION_KEY_BYTES],
     }
 }
 
@@ -162,6 +193,13 @@ pub fn generate_protocol_v1_value() -> Value {
     let view_root = crate::derive_view_root(&account.incoming_seed);
     let detect_root = crate::derive_detect_root(&account.incoming_seed);
     let dsk = hash_two(&crate::tag_dsk(), &account.incoming_seed);
+    let address_records: Vec<AddressRecord> =
+        (0..=2u32).map(|j| address_record(&account, j)).collect();
+    let addr_j0 = address_records
+        .iter()
+        .find(|record| record.j == 0)
+        .expect("protocol vectors should include address 0")
+        .clone();
 
     let blake2s = {
         let long_input = vec![b'x'; 200];
@@ -206,18 +244,17 @@ pub fn generate_protocol_v1_value() -> Value {
     });
 
     let addresses = Value::Array(
-        (0..=2u32)
-            .map(|j| {
-                let (d_j, nk_spend, nk_tag, auth_root, auth_pub_seed, owner_tag) =
-                    address_record(&account, j);
+        address_records
+            .iter()
+            .map(|record| {
                 json!({
-                    "j": j,
-                    "d_j": hex_felt(&d_j),
-                    "nk_spend": hex_felt(&nk_spend),
-                    "nk_tag": hex_felt(&nk_tag),
-                    "auth_root": hex_felt(&auth_root),
-                    "auth_pub_seed": hex_felt(&auth_pub_seed),
-                    "owner_tag": hex_felt(&owner_tag),
+                    "j": record.j,
+                    "d_j": hex_felt(&record.d_j),
+                    "nk_spend": hex_felt(&record.nk_spend),
+                    "nk_tag": hex_felt(&record.nk_tag),
+                    "auth_root": hex_felt(&record.auth_root),
+                    "auth_pub_seed": hex_felt(&record.auth_pub_seed),
+                    "owner_tag": hex_felt(&record.owner_tag),
                 })
             })
             .collect(),
@@ -459,8 +496,6 @@ pub fn generate_protocol_v1_value() -> Value {
     };
 
     let notes = {
-        let (d_j, nk_spend, nk_tag, auth_root, auth_pub_seed, owner_tag) =
-            address_record(&account, 0);
         let cases = [(1000u64, 777u64, 0u64), (0, 1, 5), (999_999, 42, 100)];
         Value::Array(
             cases
@@ -468,20 +503,20 @@ pub fn generate_protocol_v1_value() -> Value {
                 .map(|(v, rseed_i, pos)| {
                     let rseed = felt_of_u64(rseed_i);
                     let rcm = derive_rcm(&rseed);
-                    let cm = commit(&d_j, v, &rcm, &owner_tag);
+                    let cm = commit(&addr_j0.d_j, v, &rcm, &addr_j0.owner_tag);
                     json!({
-                        "d_j": hex_felt(&d_j),
+                        "d_j": hex_felt(&addr_j0.d_j),
                         "v": v.to_string(),
                         "rseed": hex_felt(&rseed),
-                        "auth_root": hex_felt(&auth_root),
-                        "auth_pub_seed": hex_felt(&auth_pub_seed),
-                        "nk_tag": hex_felt(&nk_tag),
+                        "auth_root": hex_felt(&addr_j0.auth_root),
+                        "auth_pub_seed": hex_felt(&addr_j0.auth_pub_seed),
+                        "nk_tag": hex_felt(&addr_j0.nk_tag),
                         "rcm": hex_felt(&rcm),
-                        "owner_tag": hex_felt(&owner_tag),
+                        "owner_tag": hex_felt(&addr_j0.owner_tag),
                         "cm": hex_felt(&cm),
-                        "nk_spend": hex_felt(&nk_spend),
+                        "nk_spend": hex_felt(&addr_j0.nk_spend),
                         "pos": pos,
-                        "nf": hex_felt(&nullifier(&nk_spend, &cm, pos)),
+                        "nf": hex_felt(&nullifier(&addr_j0.nk_spend, &cm, pos)),
                     })
                 })
                 .collect(),
@@ -591,6 +626,7 @@ pub fn generate_protocol_v1_json() -> String {
 mod tests {
     use super::*;
     use serde_json::Value;
+    use tzel_core::{canonical_wire::*, MEMO_SIZE};
 
     #[test]
     fn test_protocol_vectors_file_is_self_consistent() {
@@ -660,5 +696,80 @@ mod tests {
             generated["cross_impl_encrypt"]["ek_d"],
             generated["mlkem_keygen"][0]["ek_d"]
         );
+    }
+
+    #[test]
+    fn test_merkle_root_handles_empty_and_sparse_prefixes() {
+        let zero1 = hash_merkle(&ZERO, &ZERO);
+        let zero2 = hash_merkle(&zero1, &zero1);
+        assert_eq!(merkle_root(2, &[]), zero2);
+
+        let leaves = [felt_of_u64(1), felt_of_u64(2), felt_of_u64(3)];
+        let level0_left = hash_merkle(&leaves[0], &leaves[1]);
+        let level0_right = hash_merkle(&leaves[2], &ZERO);
+        let expected = hash_merkle(&level0_left, &level0_right);
+        assert_eq!(merkle_root(2, &leaves), expected);
+    }
+
+    #[test]
+    fn test_memo_helpers_have_expected_fixed_format() {
+        let none = memo_none();
+        let text = memo_text("hi");
+
+        assert_eq!(none.len(), MEMO_SIZE);
+        assert_eq!(text.len(), MEMO_SIZE);
+        assert_eq!(none[0], 0xF6);
+        assert_eq!(&text[..2], b"hi");
+        assert!(text[2..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn test_detection_tag_is_masked_and_deterministic() {
+        let ss = [0x42u8; 32];
+        let tag1 = detection_tag_from_ss(&ss);
+        let tag2 = detection_tag_from_ss(&ss);
+        assert_eq!(tag1, tag2);
+        assert!(tag1 < (1 << DETECT_K));
+    }
+
+    #[test]
+    fn test_wire_helpers_roundtrip_deterministic_fixture_values() {
+        let address = wire_fixture_payment_address();
+        let addr_bytes = encode_payment_address(&address).expect("address should encode");
+        assert_eq!(
+            decode_payment_address(&addr_bytes)
+                .expect("address should decode")
+                .d_j,
+            address.d_j
+        );
+
+        let enc = deterministic_wire_note();
+        let enc_bytes = encode_encrypted_note(&enc).expect("note should encode");
+        assert_eq!(
+            decode_encrypted_note(&enc_bytes)
+                .expect("note should decode")
+                .encrypted_data,
+            enc.encrypted_data
+        );
+
+        let note_memo = NoteMemo {
+            index: WIRE_INDEX as usize,
+            cm: hash_two(&felt_of_u64(7), &felt_of_u64(8)),
+            enc: enc.clone(),
+        };
+        let memo_bytes = encode_note_memo(&note_memo).expect("memo should encode");
+        assert_eq!(
+            decode_note_memo(&memo_bytes)
+                .expect("memo should decode")
+                .index,
+            note_memo.index
+        );
+
+        let published =
+            encode_published_note(&note_memo.cm, &enc).expect("published note should encode");
+        let (decoded_cm, decoded_enc) =
+            decode_published_note(&published).expect("published note should decode");
+        assert_eq!(decoded_cm, note_memo.cm);
+        assert_eq!(decoded_enc.tag, enc.tag);
     }
 }

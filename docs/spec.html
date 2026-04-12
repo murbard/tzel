@@ -421,7 +421,7 @@
 </ul>
 <hr />
 <h2 id="key-hierarchy">Key Hierarchy</h2>
-<p>Notation: quoted labels such as <code>"spend"</code>, <code>"view"</code>, or <code>"auth-key"</code> denote <strong>fixed felt252 domain-tag constants</strong>, not UTF-8 strings that are themselves hashed first. The exact encoding of these tag constants is defined below in <a href="#domain-tag-constants">Domain Tag Constants</a>. In particular:</p>
+<p>Notation: quoted labels such as <code>"spend"</code>, <code>"view"</code>, or <code>"xmss-sk"</code> denote <strong>fixed felt252 domain-tag constants</strong>, not UTF-8 strings that are themselves hashed first. The exact encoding of these tag constants is defined below in <a href="#domain-tag-constants">Domain Tag Constants</a>. In particular:</p>
 <ul>
 <li><code>H("spend", x)</code> means <code>H(TAG_SPEND, x)</code></li>
 <li><code>H("view", x)</code> means <code>H(TAG_VIEW, x)</code></li>
@@ -434,8 +434,8 @@
 │   │       └── nk_tag_j  = H_nktg(nk_spend_j)   — per-address public binding tag
 │   ├── ask_base   = H(TAG_ASK, spend_seed)         — base authorization secret
 │   │   └── ask_j  = H(ask_base, j)               — per-address auth secret
-│   │       └── seed_i = H(H(TAG_AUTH_KEY, ask_j), i_felt) — per-key WOTS+ seed
-│   │           └── pk_i = WOTS+.KeyGen(seed_i)   — 133 chain endpoints (w=4)
+│   │       └── sk_root_i = H(TAG_XMSS_SK, ask_j, i_felt) — per-key WOTS+ secret root
+│   │           └── pk_i = WOTS+.KeyGen(sk_root_i) — 133 chain endpoints (w=4)
 │   │       └── (auth_root_j, pub_seed_j) = XMSS-style address auth public key
 │
 └── incoming_seed = H(TAG_INCOMING, master_sk)
@@ -644,7 +644,7 @@ nf          = H_nf(nk_spend_j, H_nf(cm, pos))           — position-dependent n
 3. If change:
    - <code>owner_tag_c = H_owner(auth_root_c, pub_seed_c, nk_tag_c)</code> where <code>auth_root_c</code>, <code>pub_seed_c</code>, and <code>nk_tag_c</code> are private inputs
    - <code>cm_change = H_commit(d_j_c, v_change, rcm_c, owner_tag_c)</code>
-4. If no change: all change witness data constrained to zero (<code>v_change</code>, <code>d_j_change</code>, <code>rseed_change</code>, <code>auth_root_change</code>, <code>nk_tag_change</code>, <code>memo_ct_hash_change</code> = 0) to eliminate prover malleability
+4. If no change: all change witness data constrained to zero (<code>v_change</code>, <code>d_j_change</code>, <code>rseed_change</code>, <code>auth_root_change</code>, <code>pub_seed_change</code>, <code>nk_tag_change</code>, <code>memo_ct_hash_change</code> = 0) to eliminate prover malleability
 5. <code>sum(v_inputs) = v_pub + v_change</code></p>
 <p><strong>Contract / ledger checks:</strong> proof valid. Verify recipient binding per <a href="#public-account-identifier-encoding">Public Account Identifier Encoding</a>, credit <code>v_pub</code> to that recipient account, append <code>cm_change</code> to T (if nonzero). No signature verification needed — the STARK proof proves spend authorization.</p>
 <h2 id="contract-consensus-rules">Contract Consensus Rules</h2>
@@ -676,6 +676,11 @@ sighash = fold(0x01, auth_domain, root, nf_0, ..., nf_{N-1}, cm_1, cm_2, mh_1, m
 // Unshield (type_tag = 0x02):
 sighash = fold(0x02, auth_domain, root, nf_0, ..., nf_{N-1}, v_pub, recipient_id, cm_change, mh_change)
 </code></pre>
+<p>The fold algorithm is the sequential left fold used by the client and circuit:</p>
+<pre><code>fold(x_0, x_1, ..., x_n) =
+  H_sigh(H_sigh(...H_sigh(x_0, x_1), x_2)..., x_n)
+</code></pre>
+<p>where <code>H_sigh(a, b) = BLAKE2s_251(personal="sighSP__", a || b)</code>.</p>
 <p><code>auth_domain</code> is a deployment-specific public input/output chosen by the verifier environment and enforced by the contract or ledger. It MUST uniquely identify the deployment context for spend authorizations. A practical derivation is <code>H(chain_id || contract_addr || verifier_or_program_id || deployment_salt)</code>, encoded canonically as a felt252.</p>
 <p>The circuit-type tag prevents cross-circuit replay (a transfer signature cannot be used for an unshield). <code>auth_domain</code> prevents replay across mirrored deployments, forks, or verifier migrations that would otherwise share the same Merkle root history. Nullifier uniqueness still prevents replay of an already-consumed authorization on the same deployment.</p>
 <p><strong>Still out of scope:</strong> <code>expiry</code> and per-transaction <code>nonce</code> are not currently included in the sighash. As a result, a valid authorization can remain usable until one of its nullifiers is consumed. These remain higher-level anti-withholding / anti-latency controls, not part of the base spend authorization proof.</p>
@@ -756,6 +761,7 @@ note_data         — 0-3.2 KB   0 or 1 change note
                   ~295-299 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
 </code></pre>
 <p>For a typical N=2 unshield: ~296-299 KB total.</p>
+<p>For transfer and unshield public-output parsing, the verifier infers the input count as <code>N = total_public_output_felts - 6</code>. That is, after the leading <code>auth_domain</code> and <code>root</code>, the final four felts are fixed-format outputs and the remaining middle slice is the nullifier list.</p>
 <h2 id="domain-separation">Domain Separation</h2>
 <p>All hashing uses BLAKE2s-256 truncated to 251 bits, with domain separation via BLAKE2s personalization (parameter block P[6..7]):</p>
 <table>
@@ -773,9 +779,9 @@ note_data         — 0-3.2 KB   0 or 1 change note
 <td><code>hash1</code>, <code>hash2_generic</code></td>
 </tr>
 <tr>
-<td>Merkle nodes (commitment tree + auth tree)</td>
+<td>Commitment-tree Merkle nodes</td>
 <td><code>mrklSP__</code></td>
-<td><code>hash2</code></td>
+<td><code>hash2</code>, <code>hash_merkle</code></td>
 </tr>
 <tr>
 <td>Nullifiers</td>
@@ -803,9 +809,19 @@ note_data         — 0-3.2 KB   0 or 1 change note
 <td><code>owner_tag</code></td>
 </tr>
 <tr>
-<td>WOTS+ chain hash</td>
+<td>XMSS WOTS+ chain hash</td>
+<td>(none)</td>
+<td><code>H_chain(pub_seed, adrs, x)</code></td>
+</tr>
+<tr>
+<td>XMSS L-tree / auth-tree node hash</td>
+<td>(none)</td>
+<td><code>H_node(pub_seed, adrs, left, right)</code></td>
+</tr>
+<tr>
+<td>Standalone WOTS regression helper</td>
 <td><code>wotsSP__</code></td>
-<td><code>hash1_wots</code> (in circuit)</td>
+<td><code>hash1_wots</code></td>
 </tr>
 <tr>
 <td>Sighash</td>
@@ -819,7 +835,7 @@ note_data         — 0-3.2 KB   0 or 1 change note
 </tr>
 </tbody>
 </table>
-<p>The commitment tree and auth tree both use <code>mrklSP__</code> for internal nodes. This is safe because they are verified against different roots in different circuit contexts — there is no cross-tree confusion.</p>
+<p>The commitment tree uses <code>mrklSP__</code> for internal nodes. The XMSS address tree does <strong>not</strong> use that personalization; it uses unpersonalized BLAKE2s with ADRS-based domain separation via <code>H_node</code>.</p>
 <h2 id="canonical-encodings">Canonical Encodings</h2>
 <h3 id="felt252-representation">Felt252 Representation</h3>
 <p>All hash outputs are BLAKE2s-256 (32 bytes) with the top 5 bits cleared (<code>output[31] &amp;= 0x07</code>), producing values in <code>[0, 2^251)</code> that fit in a felt252. Values are encoded as 32-byte little-endian arrays.</p>
@@ -856,11 +872,6 @@ note_data         — 0-3.2 KB   0 or 1 change note
 <td><code>TAG_ASK</code></td>
 <td><code>"ask"</code></td>
 <td><code>6b73610000000000000000000000000000000000000000000000000000000000</code></td>
-</tr>
-<tr>
-<td><code>TAG_AUTH_KEY</code></td>
-<td><code>"auth-key"</code></td>
-<td><code>79656b2d68747561000000000000000000000000000000000000000000000000</code></td>
 </tr>
 <tr>
 <td><code>TAG_INCOMING</code></td>
@@ -907,12 +918,37 @@ note_data         — 0-3.2 KB   0 or 1 change note
 <td><code>"mlkem-d2"</code></td>
 <td><code>32642d6d656b6c6d000000000000000000000000000000000000000000000000</code></td>
 </tr>
+<tr>
+<td><code>TAG_XMSS_SK</code></td>
+<td><code>"xmss-sk"</code></td>
+<td><code>6b732d73736d7800000000000000000000000000000000000000000000000000</code></td>
+</tr>
+<tr>
+<td><code>TAG_XMSS_PS</code></td>
+<td><code>"xmss-ps"</code></td>
+<td><code>73702d73736d7800000000000000000000000000000000000000000000000000</code></td>
+</tr>
+<tr>
+<td><code>TAG_XMSS_CHAIN</code></td>
+<td><code>"xmss-ch"</code></td>
+<td><code>68632d73736d7800000000000000000000000000000000000000000000000000</code></td>
+</tr>
+<tr>
+<td><code>TAG_XMSS_LTREE</code></td>
+<td><code>"xmss-lt"</code></td>
+<td><code>746c2d73736d7800000000000000000000000000000000000000000000000000</code></td>
+</tr>
+<tr>
+<td><code>TAG_XMSS_TREE</code></td>
+<td><code>"xmss-tr"</code></td>
+<td><code>72742d73736d7800000000000000000000000000000000000000000000000000</code></td>
+</tr>
 </tbody>
 </table>
 <p>Examples of use:</p>
 <ul>
 <li><code>H("spend", master_sk)</code> means <code>H(TAG_SPEND, master_sk)</code></li>
-<li><code>H("auth-key", ask_j)</code> means <code>H(TAG_AUTH_KEY, ask_j)</code></li>
+<li><code>H("xmss-sk", ask_j, i_felt)</code> means <code>H(TAG_XMSS_SK, ask_j, i_felt)</code></li>
 <li><code>H("rcm")</code> means <code>H(TAG_RCM)</code></li>
 </ul>
 <h3 id="canonical-binary-wire-format">Canonical Binary Wire Format</h3>

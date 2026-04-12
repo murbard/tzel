@@ -24,11 +24,18 @@ let compute_tag (ss_d : bytes) =
   let raw = b0 lor (b1 lsl 8) in
   raw land ((1 lsl detection_precision) - 1)
 
+let equal_u16_ct a b =
+  let x = a lxor b in
+  let diff = ref 0 in
+  diff := !diff lor (x land 0xFF);
+  diff := !diff lor ((x lsr 8) land 0xFF);
+  !diff = 0
+
 (* Check a detection tag (server-side with dk_d) *)
 let check_tag ~dk_d ~ct_d ~expected_tag =
   let ss_d = Mlkem.decaps dk_d ct_d in
   let computed = compute_tag ss_d in
-  computed = expected_tag
+  equal_u16_ct computed expected_tag
 
 (* Encode plaintext for memo encryption: v:8 || rseed:32 || memo:1024 *)
 let encode_plaintext (v : int64) (rseed : Felt.t) (memo : bytes) =
@@ -61,7 +68,7 @@ let decode_plaintext pt =
 let encrypt_memo ~(ss_v : bytes) ~(v : int64) ~(rseed : Felt.t) ~(memo : bytes) =
   let key_bytes = Blake2s.hash ss_v in
   let key = Mirage_crypto.Chacha20.of_secret (Bytes.to_string key_bytes) in
-  let nonce = String.make 12 '\x00' in  (* nonce = 0 *)
+  let nonce = String.make 12 '\x00' in
   let plaintext = encode_plaintext v rseed memo in
   let ct = Mirage_crypto.Chacha20.authenticate_encrypt ~key ~nonce
     (Bytes.to_string plaintext) in

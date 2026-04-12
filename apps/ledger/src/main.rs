@@ -271,3 +271,178 @@ async fn main() {
     let listener = TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state(auth_domain: F) -> AppState {
+        Arc::new(LedgerState {
+            ledger: Mutex::new(Ledger::with_auth_domain(auth_domain)),
+            proof_verifier: LedgerProofVerifier::trust_me_bro_only(),
+        })
+    }
+
+    fn dummy_note(tag: u16) -> EncryptedNote {
+        EncryptedNote {
+            ct_d: vec![0xA5; ML_KEM768_CIPHERTEXT_BYTES],
+            tag,
+            ct_v: vec![0x5A; ML_KEM768_CIPHERTEXT_BYTES],
+            encrypted_data: vec![0x11; ENCRYPTED_NOTE_BYTES],
+        }
+    }
+
+    #[test]
+    fn test_parse_felt_be_hex_accepts_plain_and_prefixed_forms() {
+        let plain = parse_felt_be_hex("2a").expect("plain hex should parse");
+        let prefixed = parse_felt_be_hex("0x2a").expect("prefixed hex should parse");
+        assert_eq!(plain, prefixed);
+        assert_eq!(plain[0], 0x2a);
+        assert!(plain[1..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn test_parse_felt_be_hex_rejects_invalid_inputs() {
+        assert!(parse_felt_be_hex("")
+            .unwrap_err()
+            .contains("empty auth_domain"));
+        assert!(parse_felt_be_hex("zz").unwrap_err().contains("must be hex"));
+        assert!(parse_felt_be_hex(&"11".repeat(33))
+            .unwrap_err()
+            .contains("fit in 32 bytes"));
+
+        let mut oversized = [0u8; 32];
+        oversized[0] = 0x08;
+        let oversized_hex = hex::encode(oversized);
+        assert!(parse_felt_be_hex(&oversized_hex)
+            .unwrap_err()
+            .contains("exceeds 251 bits"));
+    }
+
+    #[tokio::test]
+    async fn test_fund_handler_updates_balances() {
+        let st = test_state(default_auth_domain());
+        let _ = fund_handler(
+            State(st.clone()),
+            Json(FundReq {
+                recipient: "alice".into(),
+                amount: 55,
+            }),
+        )
+        .await
+        .expect("fund should succeed");
+
+        let Json(resp) = balances_handler(State(st)).await;
+        assert_eq!(resp.balances.get("alice"), Some(&55));
+    }
+
+    #[tokio::test]
+    async fn test_tree_and_config_handlers_reflect_state() {
+        let auth_domain = u64_to_felt(0x44);
+        let st = test_state(auth_domain);
+        {
+            let mut ledger = st.ledger.lock().unwrap();
+            ledger.tree.append(u64_to_felt(7));
+            ledger.tree.append(u64_to_felt(9));
+        }
+
+        let Json(config) = config_handler(State(st.clone())).await;
+        assert_eq!(config.auth_domain, auth_domain);
+
+        let Json(tree) = tree_handler(State(st.clone())).await;
+        assert_eq!(tree.size, 2);
+        assert_eq!(tree.depth, DEPTH);
+
+        let Json(path) = tree_path_handler(State(st.clone()), axum::extract::Path(1))
+            .await
+            .expect("path should exist");
+        assert_eq!(path.root, tree.root);
+        assert_eq!(path.siblings.len(), DEPTH);
+    }
+
+    #[tokio::test]
+    async fn test_notes_handler_applies_cursor_and_next_cursor() {
+        let st = test_state(default_auth_domain());
+        {
+            let mut ledger = st.ledger.lock().unwrap();
+            ledger.memos.push((u64_to_felt(10), dummy_note(1)));
+            ledger.memos.push((u64_to_felt(11), dummy_note(2)));
+            ledger.memos.push((u64_to_felt(12), dummy_note(3)));
+        }
+
+        let Json(resp) =
+            notes_handler(State(st.clone()), Query(CursorParam { cursor: Some(1) })).await;
+        assert_eq!(resp.next_cursor, 3);
+        assert_eq!(resp.notes.len(), 2);
+        assert_eq!(resp.notes[0].index, 1);
+        assert_eq!(resp.notes[0].cm, u64_to_felt(11));
+        assert_eq!(resp.notes[1].index, 2);
+
+        let Json(from_zero) = notes_handler(State(st), Query(CursorParam { cursor: None })).await;
+        assert_eq!(from_zero.notes.len(), 3);
+        assert_eq!(from_zero.next_cursor, 3);
+    }
+
+    #[tokio::test]
+    async fn test_notes_handler_empty_state_returns_empty_feed() {
+        let st = test_state(default_auth_domain());
+        let Json(resp) = notes_handler(State(st), Query(CursorParam { cursor: None })).await;
+        assert!(resp.notes.is_empty());
+        assert_eq!(resp.next_cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn test_notes_handler_cursor_past_end_returns_empty_feed() {
+        let st = test_state(default_auth_domain());
+        {
+            let mut ledger = st.ledger.lock().unwrap();
+            ledger.memos.push((u64_to_felt(10), dummy_note(1)));
+            ledger.memos.push((u64_to_felt(11), dummy_note(2)));
+        }
+
+        let Json(resp) = notes_handler(State(st), Query(CursorParam { cursor: Some(9) })).await;
+        assert!(resp.notes.is_empty());
+        assert_eq!(resp.next_cursor, 2);
+    }
+
+    #[tokio::test]
+    async fn test_nullifiers_handler_returns_inserted_values() {
+        let st = test_state(default_auth_domain());
+        let nf0 = u64_to_felt(21);
+        let nf1 = u64_to_felt(22);
+        {
+            let mut ledger = st.ledger.lock().unwrap();
+            ledger.nullifiers.insert(nf0);
+            ledger.nullifiers.insert(nf1);
+        }
+
+        let Json(resp) = nullifiers_handler(State(st)).await;
+        assert_eq!(resp.nullifiers.len(), 2);
+        assert!(resp.nullifiers.contains(&nf0));
+        assert!(resp.nullifiers.contains(&nf1));
+    }
+
+    #[tokio::test]
+    async fn test_nullifiers_handler_empty_state_returns_empty_list() {
+        let st = test_state(default_auth_domain());
+        let Json(resp) = nullifiers_handler(State(st)).await;
+        assert!(resp.nullifiers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_balances_handler_empty_state_returns_empty_map() {
+        let st = test_state(default_auth_domain());
+        let Json(resp) = balances_handler(State(st)).await;
+        assert!(resp.balances.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_tree_path_handler_rejects_out_of_range() {
+        let st = test_state(default_auth_domain());
+        let err = tree_path_handler(State(st), axum::extract::Path(0))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("out of range"));
+    }
+}
