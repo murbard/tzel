@@ -126,6 +126,74 @@ mod tests {
 
     #[test]
     #[should_panic(expected: ('shield: bad commitment',))]
+    fn test_shield_rejects_mutated_value() {
+        let fixture = build_fixture();
+        verify(
+            fixture.v_pub + 1_u64,
+            fixture.cm_new,
+            fixture.sender,
+            fixture.memo_ct_hash,
+            fixture.auth_root,
+            fixture.auth_pub_seed,
+            fixture.nk_tag,
+            fixture.d_j,
+            fixture.rseed,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected: ('shield: bad commitment',))]
+    fn test_shield_rejects_mutated_auth_root() {
+        let fixture = build_fixture();
+        verify(
+            fixture.v_pub,
+            fixture.cm_new,
+            fixture.sender,
+            fixture.memo_ct_hash,
+            fixture.auth_root + 1,
+            fixture.auth_pub_seed,
+            fixture.nk_tag,
+            fixture.d_j,
+            fixture.rseed,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected: ('shield: bad commitment',))]
+    fn test_shield_rejects_mutated_nk_tag() {
+        let fixture = build_fixture();
+        verify(
+            fixture.v_pub,
+            fixture.cm_new,
+            fixture.sender,
+            fixture.memo_ct_hash,
+            fixture.auth_root,
+            fixture.auth_pub_seed,
+            fixture.nk_tag + 1,
+            fixture.d_j,
+            fixture.rseed,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected: ('shield: bad commitment',))]
+    fn test_shield_rejects_mutated_note_randomness() {
+        let fixture = build_fixture();
+        verify(
+            fixture.v_pub,
+            fixture.cm_new,
+            fixture.sender,
+            fixture.memo_ct_hash,
+            fixture.auth_root,
+            fixture.auth_pub_seed,
+            fixture.nk_tag,
+            fixture.d_j,
+            fixture.rseed + 1,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected: ('shield: bad commitment',))]
     fn test_shield_rejects_mutated_note_body() {
         let fixture = build_fixture();
         verify(

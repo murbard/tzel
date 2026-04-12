@@ -281,6 +281,43 @@ mod tests {
         hash::commit(d_j, v, rcm, otag)
     }
 
+    fn unshield_sighash(
+        auth_domain: felt252,
+        root: felt252,
+        nf_list: Span<felt252>,
+        v_pub: u64,
+        recipient: felt252,
+        cm_change: felt252,
+        memo_ct_hash_change: felt252,
+    ) -> felt252 {
+        let mut sighash = hash::sighash_fold(0x02, auth_domain);
+        sighash = hash::sighash_fold(sighash, root);
+        let mut i: u32 = 0;
+        while i < nf_list.len() {
+            sighash = hash::sighash_fold(sighash, *nf_list.at(i));
+            i += 1;
+        }
+        sighash = hash::sighash_fold(sighash, v_pub.into());
+        sighash = hash::sighash_fold(sighash, recipient);
+        sighash = hash::sighash_fold(sighash, cm_change);
+        sighash = hash::sighash_fold(sighash, memo_ct_hash_change);
+        sighash
+    }
+
+    fn sign_unshield_input(
+        sighash: felt252, auth_pub_seed: felt252, auth_idx: u32, key_material_base: felt252,
+    ) -> Array<felt252> {
+        let digits = hash::sighash_to_wots_digits(sighash);
+        let mut wots_sig_flat: Array<felt252> = array![];
+        let mut j: u32 = 0;
+        while j < xmss_common::WOTS_CHAINS {
+            let start = hash::hash1(j.into() + key_material_base);
+            wots_sig_flat.append(chain_advance(start, auth_pub_seed, auth_idx, j, *digits.at(j)));
+            j += 1;
+        }
+        wots_sig_flat
+    }
+
     fn sign_unshield_statement(
         auth_domain: felt252,
         root: felt252,
@@ -292,23 +329,10 @@ mod tests {
         auth_pub_seed: felt252,
         auth_idx: u32,
     ) -> Array<felt252> {
-        let mut sighash = hash::sighash_fold(0x02, auth_domain);
-        sighash = hash::sighash_fold(sighash, root);
-        sighash = hash::sighash_fold(sighash, nf);
-        sighash = hash::sighash_fold(sighash, v_pub.into());
-        sighash = hash::sighash_fold(sighash, recipient);
-        sighash = hash::sighash_fold(sighash, cm_change);
-        sighash = hash::sighash_fold(sighash, memo_ct_hash_change);
-
-        let digits = hash::sighash_to_wots_digits(sighash);
-        let mut wots_sig_flat: Array<felt252> = array![];
-        let mut j: u32 = 0;
-        while j < xmss_common::WOTS_CHAINS {
-            let start = hash::hash1(j.into() + 0x8200);
-            wots_sig_flat.append(chain_advance(start, auth_pub_seed, auth_idx, j, *digits.at(j)));
-            j += 1;
-        }
-        wots_sig_flat
+        let sighash = unshield_sighash(
+            auth_domain, root, array![nf].span(), v_pub, recipient, cm_change, memo_ct_hash_change,
+        );
+        sign_unshield_input(sighash, auth_pub_seed, auth_idx, 0x8200)
     }
 
     fn build_fixture_with_values(v_in: u64, v_pub: u64, v_change: u64) -> UnshieldFixture {
@@ -417,6 +441,279 @@ mod tests {
 
     fn build_fixture() -> UnshieldFixture {
         build_fixture_with_values(80_u64, 50_u64, 30_u64)
+    }
+
+    fn build_two_input_fixture() -> UnshieldFixture {
+        let auth_domain = 0x9101;
+        let auth_pub_seed = 0x9102;
+
+        let auth_idx_0 = 0_u32;
+        let auth_idx_1 = 1_u32;
+        let key_base_0 = 0x9200;
+        let key_base_1 = 0x9300;
+
+        let mut endpoints_0: Array<felt252> = array![];
+        let mut endpoints_1: Array<felt252> = array![];
+        let mut chain_idx: u32 = 0;
+        while chain_idx < xmss_common::WOTS_CHAINS {
+            let start_0 = hash::hash1(chain_idx.into() + key_base_0);
+            let start_1 = hash::hash1(chain_idx.into() + key_base_1);
+            endpoints_0
+                .append(
+                    chain_advance(
+                        start_0, auth_pub_seed, auth_idx_0, chain_idx, xmss_common::WOTS_W - 1,
+                    ),
+                );
+            endpoints_1
+                .append(
+                    chain_advance(
+                        start_1, auth_pub_seed, auth_idx_1, chain_idx, xmss_common::WOTS_W - 1,
+                    ),
+                );
+            chain_idx += 1;
+        }
+
+        let leaf_0 = xmss_common::xmss_ltree(auth_pub_seed, auth_idx_0, endpoints_0.span());
+        let leaf_1 = xmss_common::xmss_ltree(auth_pub_seed, auth_idx_1, endpoints_1.span());
+
+        let mut upper_auth_siblings: Array<felt252> = array![];
+        let mut auth_level: u32 = 1;
+        while auth_level < merkle::AUTH_DEPTH {
+            upper_auth_siblings.append(hash::hash1(auth_level.into() + 0x9400));
+            auth_level += 1;
+        }
+        let mut auth_siblings_0: Array<felt252> = array![leaf_1];
+        let mut auth_siblings_1: Array<felt252> = array![leaf_0];
+        let mut i: u32 = 0;
+        while i < upper_auth_siblings.len() {
+            auth_siblings_0.append(*upper_auth_siblings.at(i));
+            auth_siblings_1.append(*upper_auth_siblings.at(i));
+            i += 1;
+        }
+        let auth_root = auth_root_from_leaf(
+            leaf_0, auth_pub_seed, auth_idx_0, auth_siblings_0.span(),
+        );
+
+        let nk_spend_0 = 0x9501;
+        let nk_spend_1 = 0x9502;
+        let d_j_in_0 = 0x9503;
+        let d_j_in_1 = 0x9504;
+        let v_in_0 = 45_u64;
+        let v_in_1 = 35_u64;
+        let rseed_in_0 = 0x9505;
+        let rseed_in_1 = 0x9506;
+
+        let cm_0 = note_commitment(
+            d_j_in_0, v_in_0, rseed_in_0, auth_root, auth_pub_seed, hash::derive_nk_tag(nk_spend_0),
+        );
+        let cm_1_in = note_commitment(
+            d_j_in_1, v_in_1, rseed_in_1, auth_root, auth_pub_seed, hash::derive_nk_tag(nk_spend_1),
+        );
+
+        let mut upper_cm_siblings: Array<felt252> = array![];
+        let mut tree_level: u32 = 1;
+        while tree_level < merkle::TREE_DEPTH {
+            upper_cm_siblings.append(hash::hash1(tree_level.into() + 0x9600));
+            tree_level += 1;
+        }
+        let mut cm_siblings_0: Array<felt252> = array![cm_1_in];
+        let mut cm_siblings_1: Array<felt252> = array![cm_0];
+        let mut j: u32 = 0;
+        while j < upper_cm_siblings.len() {
+            cm_siblings_0.append(*upper_cm_siblings.at(j));
+            cm_siblings_1.append(*upper_cm_siblings.at(j));
+            j += 1;
+        }
+
+        let root = merkle_root_from_path(cm_0, cm_siblings_0.span(), 0);
+        let nf_0 = hash::nullifier(nk_spend_0, cm_0, 0);
+        let nf_1 = hash::nullifier(nk_spend_1, cm_1_in, 1);
+
+        let v_pub = 50_u64;
+        let recipient = 0x9701;
+        let has_change = true;
+        let d_j_change = 0x9702;
+        let v_change = 30_u64;
+        let rseed_change = 0x9703;
+        let auth_root_change = 0x9704;
+        let auth_pub_seed_change = 0x9705;
+        let nk_tag_change = 0x9706;
+        let memo_ct_hash_change = 0x9707;
+        let cm_change = change_commitment_or_zero(
+            has_change,
+            d_j_change,
+            v_change,
+            rseed_change,
+            auth_root_change,
+            auth_pub_seed_change,
+            nk_tag_change,
+            memo_ct_hash_change,
+        );
+
+        let nf_list: Array<felt252> = array![nf_0, nf_1];
+        let sighash = unshield_sighash(
+            auth_domain, root, nf_list.span(), v_pub, recipient, cm_change, memo_ct_hash_change,
+        );
+
+        let sig_0 = sign_unshield_input(sighash, auth_pub_seed, auth_idx_0, key_base_0);
+        let sig_1 = sign_unshield_input(sighash, auth_pub_seed, auth_idx_1, key_base_1);
+        let mut wots_sig_flat: Array<felt252> = array![];
+        let mut k: u32 = 0;
+        while k < sig_0.len() {
+            wots_sig_flat.append(*sig_0.at(k));
+            k += 1;
+        }
+        let mut m: u32 = 0;
+        while m < sig_1.len() {
+            wots_sig_flat.append(*sig_1.at(m));
+            m += 1;
+        }
+
+        let mut cm_siblings_flat: Array<felt252> = array![];
+        let mut p: u32 = 0;
+        while p < cm_siblings_0.len() {
+            cm_siblings_flat.append(*cm_siblings_0.at(p));
+            p += 1;
+        }
+        let mut q: u32 = 0;
+        while q < cm_siblings_1.len() {
+            cm_siblings_flat.append(*cm_siblings_1.at(q));
+            q += 1;
+        }
+
+        let mut auth_siblings_flat: Array<felt252> = array![];
+        let mut r: u32 = 0;
+        while r < auth_siblings_0.len() {
+            auth_siblings_flat.append(*auth_siblings_0.at(r));
+            r += 1;
+        }
+        let mut s: u32 = 0;
+        while s < auth_siblings_1.len() {
+            auth_siblings_flat.append(*auth_siblings_1.at(s));
+            s += 1;
+        }
+
+        UnshieldFixture {
+            auth_domain,
+            root,
+            nf_list,
+            v_pub,
+            recipient,
+            nk_spend_list: array![nk_spend_0, nk_spend_1],
+            auth_root_list: array![auth_root, auth_root],
+            auth_pub_seed_list: array![auth_pub_seed, auth_pub_seed],
+            wots_sig_flat,
+            auth_siblings_flat,
+            auth_index_list: array![auth_idx_0.into(), auth_idx_1.into()],
+            d_j_in_list: array![d_j_in_0, d_j_in_1],
+            v_in_list: array![v_in_0, v_in_1],
+            rseed_in_list: array![rseed_in_0, rseed_in_1],
+            cm_siblings_flat,
+            cm_path_indices_list: array![0_u64, 1_u64],
+            has_change,
+            d_j_change,
+            v_change,
+            rseed_change,
+            auth_root_change,
+            auth_pub_seed_change,
+            nk_tag_change,
+            memo_ct_hash_change,
+        }
+    }
+
+    fn build_duplicate_nf_fixture() -> UnshieldFixture {
+        let base = build_fixture_with_values(80_u64, 90_u64, 70_u64);
+        let cm_change = change_commitment_or_zero(
+            base.has_change,
+            base.d_j_change,
+            base.v_change,
+            base.rseed_change,
+            base.auth_root_change,
+            base.auth_pub_seed_change,
+            base.nk_tag_change,
+            base.memo_ct_hash_change,
+        );
+        let sighash = unshield_sighash(
+            base.auth_domain,
+            base.root,
+            array![*base.nf_list.at(0), *base.nf_list.at(0)].span(),
+            base.v_pub,
+            base.recipient,
+            cm_change,
+            base.memo_ct_hash_change,
+        );
+        let sig = sign_unshield_input(
+            sighash,
+            *base.auth_pub_seed_list.at(0),
+            (*base.auth_index_list.at(0)).try_into().unwrap(),
+            0x8200,
+        );
+        let mut wots_sig_flat: Array<felt252> = array![];
+        let mut i: u32 = 0;
+        while i < sig.len() {
+            wots_sig_flat.append(*sig.at(i));
+            i += 1;
+        }
+        let mut j: u32 = 0;
+        while j < sig.len() {
+            wots_sig_flat.append(*sig.at(j));
+            j += 1;
+        }
+
+        let mut cm_siblings_flat: Array<felt252> = array![];
+        let mut k: u32 = 0;
+        while k < base.cm_siblings_flat.len() {
+            cm_siblings_flat.append(*base.cm_siblings_flat.at(k));
+            k += 1;
+        }
+        let mut m: u32 = 0;
+        while m < base.cm_siblings_flat.len() {
+            cm_siblings_flat.append(*base.cm_siblings_flat.at(m));
+            m += 1;
+        }
+
+        let mut auth_siblings_flat: Array<felt252> = array![];
+        let mut p: u32 = 0;
+        while p < base.auth_siblings_flat.len() {
+            auth_siblings_flat.append(*base.auth_siblings_flat.at(p));
+            p += 1;
+        }
+        let mut q: u32 = 0;
+        while q < base.auth_siblings_flat.len() {
+            auth_siblings_flat.append(*base.auth_siblings_flat.at(q));
+            q += 1;
+        }
+
+        UnshieldFixture {
+            auth_domain: base.auth_domain,
+            root: base.root,
+            nf_list: array![*base.nf_list.at(0), *base.nf_list.at(0)],
+            v_pub: base.v_pub,
+            recipient: base.recipient,
+            nk_spend_list: array![*base.nk_spend_list.at(0), *base.nk_spend_list.at(0)],
+            auth_root_list: array![*base.auth_root_list.at(0), *base.auth_root_list.at(0)],
+            auth_pub_seed_list: array![
+                *base.auth_pub_seed_list.at(0), *base.auth_pub_seed_list.at(0),
+            ],
+            wots_sig_flat,
+            auth_siblings_flat,
+            auth_index_list: array![*base.auth_index_list.at(0), *base.auth_index_list.at(0)],
+            d_j_in_list: array![*base.d_j_in_list.at(0), *base.d_j_in_list.at(0)],
+            v_in_list: array![*base.v_in_list.at(0), *base.v_in_list.at(0)],
+            rseed_in_list: array![*base.rseed_in_list.at(0), *base.rseed_in_list.at(0)],
+            cm_siblings_flat,
+            cm_path_indices_list: array![
+                *base.cm_path_indices_list.at(0), *base.cm_path_indices_list.at(0),
+            ],
+            has_change: base.has_change,
+            d_j_change: base.d_j_change,
+            v_change: base.v_change,
+            rseed_change: base.rseed_change,
+            auth_root_change: base.auth_root_change,
+            auth_pub_seed_change: base.auth_pub_seed_change,
+            nk_tag_change: base.nk_tag_change,
+            memo_ct_hash_change: base.memo_ct_hash_change,
+        }
     }
 
     fn run_verify(fixture: @UnshieldFixture) -> Array<felt252> {
@@ -542,6 +839,19 @@ mod tests {
     }
 
     #[test]
+    fn test_unshield_accepts_valid_two_input_statement() {
+        let fixture = build_two_input_fixture();
+        let outputs = run_verify(@fixture);
+        assert(outputs.len() == 8, 'unshield outputs len two input');
+        assert(*outputs.at(0) == fixture.auth_domain, 'unshield2 out domain');
+        assert(*outputs.at(1) == fixture.root, 'unshield2 out root');
+        assert(*outputs.at(2) == *fixture.nf_list.at(0), 'unshield2 out nf0');
+        assert(*outputs.at(3) == *fixture.nf_list.at(1), 'unshield2 out nf1');
+        assert(*outputs.at(4) == fixture.v_pub.into(), 'unshield2 out vpub');
+        assert(*outputs.at(5) == fixture.recipient, 'unshield2 out recipient');
+    }
+
+    #[test]
     #[should_panic(expected: ('xmss auth root mismatch',))]
     fn test_unshield_rejects_public_nullifier_mutation_via_signature_binding() {
         let mut fixture = build_fixture();
@@ -616,6 +926,23 @@ mod tests {
     #[should_panic(expected: ('unshield: balance mismatch',))]
     fn test_unshield_rejects_balance_mismatch_even_with_consistent_change_commitment() {
         let fixture = build_fixture_with_values(80_u64, 50_u64, 29_u64);
+        run_verify(@fixture);
+    }
+
+    #[test]
+    #[should_panic(expected: ('xmss auth root mismatch',))]
+    fn test_unshield_rejects_second_input_auth_path_mutation() {
+        let mut fixture = build_two_input_fixture();
+        fixture
+            .auth_siblings_flat =
+                copy_and_mutate(fixture.auth_siblings_flat.span(), merkle::AUTH_DEPTH + 2);
+        run_verify(@fixture);
+    }
+
+    #[test]
+    #[should_panic(expected: ('unshield: dup nf',))]
+    fn test_unshield_rejects_duplicate_nullifiers_after_all_other_checks() {
+        let fixture = build_duplicate_nf_fixture();
         run_verify(@fixture);
     }
 }

@@ -36,6 +36,20 @@ run_mutant \
   "test_shield_rejects_mutated_commitment"
 
 run_mutant \
+  "shield_ignore_auth_root" \
+  "src/shield.cairo" \
+  "let otag = hash::owner_tag(auth_root, auth_pub_seed, nk_tag);" \
+  "let otag = hash::owner_tag(0x3333, auth_pub_seed, nk_tag);" \
+  "test_shield_rejects_mutated_auth_root"
+
+run_mutant \
+  "shield_ignore_rseed" \
+  "src/shield.cairo" \
+  "let rcm = hash::derive_rcm(rseed);" \
+  "let rcm = hash::derive_rcm(0x7777);" \
+  "test_shield_rejects_mutated_note_randomness"
+
+run_mutant \
   "transfer_skip_nf_check" \
   "src/transfer.cairo" \
   "assert(nf == *nf_list.at(i), 'transfer: bad nf');" \
@@ -83,6 +97,20 @@ run_mutant \
   "assert(sum_in == sum_out, 'unshield: balance mismatch');" \
   "assert(1 == 1, 'unshield: balance mismatch');" \
   "test_unshield_rejects_balance_mismatch_even_with_consistent_change_commitment"
+
+run_mutant \
+  "unshield_skip_dup_nf_check" \
+  "src/unshield.cairo" \
+  "assert(*nf_list.at(a) != *nf_list.at(b), 'unshield: dup nf');" \
+  "assert(1 == 1, 'unshield: dup nf');" \
+  "test_unshield_rejects_duplicate_nullifiers_after_all_other_checks"
+
+run_mutant \
+  "unshield_break_second_input_auth_slice" \
+  "src/unshield.cairo" \
+  "let auth_sib_start = i * merkle::AUTH_DEPTH;" \
+  "let auth_sib_start = 0;" \
+  "test_unshield_accepts_valid_two_input_statement"
 
 run_mutant \
   "unshield_skip_no_change_value_check" \

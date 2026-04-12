@@ -39,12 +39,12 @@ Disposition of findings from [audit_report.md](/home/arthurb/src/starkprivacy/au
 
 | Finding | Status | Disposition |
 | --- | --- | --- |
-| `T1` | Deferred | Cairo still lacks direct unit tests. |
-| `T2` | Partially fixed | Core crypto property coverage is better than the report counted, and more small-depth XMSS/BDS tests were added. More invariant/property work is still worthwhile. |
+| `T1` | Fixed | Cairo now has direct unit tests for hash/merkle/XMSS helpers plus statement-level shield/transfer/unshield tests. Mutation-smoke scripts also check that obvious weakened verifier variants are killed by the test suite. |
+| `T2` | Partially fixed | Core crypto property coverage is better than the report counted, more small-depth XMSS/BDS tests were added, and Cairo statement-mutation tests now exercise key binding invariants. More Rust-side invariant/property work is still worthwhile. |
 | `T3` | Deferred | No fuzzing targets added yet. |
 | `T4` | Resolved | Existing Rust sighash sensitivity coverage already included more fields than the report credited. |
 | `T5` | Resolved | High-index WOTS+ sign/verify tests at `256` and `65535` already exist in Rust. |
-| `T6` | Partially fixed | Wallet unit coverage was expanded substantially around state transitions, BDS behavior, and persistence. Full multi-input/change witness construction coverage is still not complete. |
+| `T6` | Partially fixed | Wallet unit coverage was expanded substantially around state transitions, BDS behavior, and persistence. Cairo now has direct multi-input transfer/unshield statement tests, but wallet-level multi-input/change witness construction coverage is still not complete. |
 | `T7` | Partially fixed | Added a wallet unit test for stale-backup rejection against the durable XMSS floor sidecar. |
 | `T8` | Partially fixed | Commitment layout agreement is now checked explicitly on the OCaml side, and Rust/OCaml protocol vectors remain aligned. A dedicated cross-impl `u64::MAX` test would still be a good follow-up. |
 | `T9` | Fixed / stale | Dead code was removed and several helper paths now have direct tests. |
@@ -54,7 +54,7 @@ Disposition of findings from [audit_report.md](/home/arthurb/src/starkprivacy/au
 
 ## Next sensible work
 
-1. Add direct Cairo unit tests.
-2. Add wallet multi-input/change witness unit coverage.
-3. Add a dedicated Rust/OCaml cross-implementation commitment check at `v = u64::MAX`.
+1. Add wallet multi-input/change witness unit coverage.
+2. Add a dedicated Rust/OCaml cross-implementation commitment check at `v = u64::MAX`.
+3. Add fuzzing targets for wire decoding, note parsing, and wallet/service boundary inputs.
 4. Decide whether to implement historical root pruning and memo nonce changes as protocol changes rather than local code tweaks.

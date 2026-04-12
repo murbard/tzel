@@ -321,13 +321,7 @@ mod tests {
         auth_idx: u32,
     ) -> Array<felt252> {
         let sighash = transfer_sighash(
-            auth_domain,
-            root,
-            array![nf].span(),
-            cm_1,
-            cm_2,
-            memo_ct_hash_1,
-            memo_ct_hash_2,
+            auth_domain, root, array![nf].span(), cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2,
         );
         sign_transfer_input(sighash, auth_pub_seed, auth_idx, 0x7500)
     }
@@ -458,12 +452,18 @@ mod tests {
         while chain_idx < xmss_common::WOTS_CHAINS {
             let start_0 = hash::hash1(chain_idx.into() + key_base_0);
             let start_1 = hash::hash1(chain_idx.into() + key_base_1);
-            endpoints_0.append(
-                chain_advance(start_0, auth_pub_seed, auth_idx_0, chain_idx, xmss_common::WOTS_W - 1),
-            );
-            endpoints_1.append(
-                chain_advance(start_1, auth_pub_seed, auth_idx_1, chain_idx, xmss_common::WOTS_W - 1),
-            );
+            endpoints_0
+                .append(
+                    chain_advance(
+                        start_0, auth_pub_seed, auth_idx_0, chain_idx, xmss_common::WOTS_W - 1,
+                    ),
+                );
+            endpoints_1
+                .append(
+                    chain_advance(
+                        start_1, auth_pub_seed, auth_idx_1, chain_idx, xmss_common::WOTS_W - 1,
+                    ),
+                );
             chain_idx += 1;
         }
 
@@ -484,7 +484,9 @@ mod tests {
             auth_siblings_1.append(*upper_auth_siblings.at(i));
             i += 1;
         }
-        let auth_root = auth_root_from_leaf(leaf_0, auth_pub_seed, auth_idx_0, auth_siblings_0.span());
+        let auth_root = auth_root_from_leaf(
+            leaf_0, auth_pub_seed, auth_idx_0, auth_siblings_0.span(),
+        );
 
         let nk_spend_0 = 0x8C01;
         let nk_spend_1 = 0x8C02;
@@ -496,20 +498,10 @@ mod tests {
         let rseed_in_1 = 0x8C06;
 
         let cm_0 = output_commitment(
-            d_j_in_0,
-            v_in_0,
-            rseed_in_0,
-            auth_root,
-            auth_pub_seed,
-            hash::derive_nk_tag(nk_spend_0),
+            d_j_in_0, v_in_0, rseed_in_0, auth_root, auth_pub_seed, hash::derive_nk_tag(nk_spend_0),
         );
         let cm_1_in = output_commitment(
-            d_j_in_1,
-            v_in_1,
-            rseed_in_1,
-            auth_root,
-            auth_pub_seed,
-            hash::derive_nk_tag(nk_spend_1),
+            d_j_in_1, v_in_1, rseed_in_1, auth_root, auth_pub_seed, hash::derive_nk_tag(nk_spend_1),
         );
 
         let mut upper_cm_siblings: Array<felt252> = array![];
@@ -551,13 +543,7 @@ mod tests {
 
         let nf_list: Array<felt252> = array![nf_0, nf_1];
         let sighash = transfer_sighash(
-            auth_domain,
-            root,
-            nf_list.span(),
-            cm_1,
-            cm_2,
-            memo_ct_hash_1,
-            memo_ct_hash_2,
+            auth_domain, root, nf_list.span(), cm_1, cm_2, memo_ct_hash_1, memo_ct_hash_2,
         );
 
         let sig_0 = sign_transfer_input(sighash, auth_pub_seed, auth_idx_0, key_base_0);
@@ -691,7 +677,9 @@ mod tests {
             nf_list: array![*base.nf_list.at(0), *base.nf_list.at(0)],
             nk_spend_list: array![*base.nk_spend_list.at(0), *base.nk_spend_list.at(0)],
             auth_root_list: array![*base.auth_root_list.at(0), *base.auth_root_list.at(0)],
-            auth_pub_seed_list: array![*base.auth_pub_seed_list.at(0), *base.auth_pub_seed_list.at(0)],
+            auth_pub_seed_list: array![
+                *base.auth_pub_seed_list.at(0), *base.auth_pub_seed_list.at(0),
+            ],
             auth_index_list: array![*base.auth_index_list.at(0), *base.auth_index_list.at(0)],
             d_j_in_list: array![*base.d_j_in_list.at(0), *base.d_j_in_list.at(0)],
             v_in_list: array![*base.v_in_list.at(0), *base.v_in_list.at(0)],
@@ -863,7 +851,9 @@ mod tests {
     #[should_panic(expected: ('xmss auth root mismatch',))]
     fn test_transfer_rejects_second_input_auth_path_mutation() {
         let mut fixture = build_two_input_fixture();
-        fixture.auth_siblings_flat = copy_and_mutate(fixture.auth_siblings_flat.span(), merkle::AUTH_DEPTH + 2);
+        fixture
+            .auth_siblings_flat =
+                copy_and_mutate(fixture.auth_siblings_flat.span(), merkle::AUTH_DEPTH + 2);
         run_verify(@fixture);
     }
 
