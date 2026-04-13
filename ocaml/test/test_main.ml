@@ -261,6 +261,38 @@ let test_hash_commit_uses_only_low_u64_bytes () =
   Alcotest.(check bool) "matches canonical rust layout" true
     (Bytes.equal cm_canonical expected)
 
+let commitment_u64_max_fixture_path =
+  let candidates = [
+    "../specs/test_vectors/commitment_u64_max_v1.json";
+    "../../specs/test_vectors/commitment_u64_max_v1.json";
+  ] in
+  try List.find Sys.file_exists candidates
+  with Not_found -> "../specs/test_vectors/commitment_u64_max_v1.json"
+
+let load_commitment_u64_max_fixture () =
+  let open Yojson.Basic.Util in
+  let json = Yojson.Basic.from_file commitment_u64_max_fixture_path in
+  let get_felt field = json |> member field |> to_string |> Tzel.Felt.of_hex in
+  ( get_felt "d_j",
+    get_felt "rcm",
+    get_felt "owner_tag",
+    get_felt "value_felt",
+    get_felt "cm" )
+
+let test_hash_commit_u64_max_cross_impl_fixture () =
+  let (d_j, rcm, owner_tag, value_felt, expected_cm) =
+    load_commitment_u64_max_fixture ()
+  in
+  let expected_v = Bytes.make 32 '\x00' in
+  for i = 0 to 7 do
+    Bytes.set_uint8 expected_v i 0xFF
+  done;
+  Alcotest.(check bool) "fixture value layout" true
+    (Bytes.equal value_felt expected_v);
+  let actual = Tzel.Hash.hash_commit d_j value_felt rcm owner_tag in
+  Alcotest.(check bool) "u64::MAX commitment matches shared fixture" true
+    (Bytes.equal actual expected_cm)
+
 let test_account_id () =
   let id1 = Tzel.Hash.account_id "alice" in
   let id2 = Tzel.Hash.account_id "alice" in
@@ -1991,6 +2023,7 @@ let () =
       Alcotest.test_case "sighash_fold empty" `Quick test_sighash_fold_empty;
       Alcotest.test_case "hash_commit" `Quick test_hash_commit;
       Alcotest.test_case "hash_commit canonical u64 layout" `Quick test_hash_commit_uses_only_low_u64_bytes;
+      Alcotest.test_case "hash_commit u64::MAX fixture" `Quick test_hash_commit_u64_max_cross_impl_fixture;
       Alcotest.test_case "account_id" `Quick test_account_id;
     ];
     "wots", [

@@ -2047,6 +2047,31 @@ mod tests {
         bytes: Vec<u8>,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct U64MaxCommitmentFixture {
+        #[serde(with = "hex_f")]
+        d_j: F,
+        #[serde(with = "hex_f")]
+        rcm: F,
+        #[serde(with = "hex_f")]
+        owner_tag: F,
+        #[serde(with = "hex_f")]
+        value_felt: F,
+        #[serde(with = "hex_f")]
+        cm: F,
+    }
+
+    fn u64_max_commitment_fixture() -> &'static U64MaxCommitmentFixture {
+        static FIXTURE: std::sync::OnceLock<U64MaxCommitmentFixture> = std::sync::OnceLock::new();
+        FIXTURE.get_or_init(|| {
+            serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../specs/test_vectors/commitment_u64_max_v1.json"
+            )))
+            .expect("u64 max commitment fixture should parse")
+        })
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(32))]
 
@@ -2294,6 +2319,20 @@ mod tests {
         let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &addr.nk_tag);
         let recomputed = commit(&addr.d_j, value, &rcm, &otag);
         assert_eq!(recomputed, cm);
+    }
+
+    #[test]
+    fn test_u64_max_commitment_fixture_matches_rust_commit_layout() {
+        let fixture = u64_max_commitment_fixture();
+        assert_eq!(
+            fixture.value_felt,
+            u64_to_felt(u64::MAX),
+            "fixture should encode the canonical low-8-byte u64::MAX layout"
+        );
+        assert_eq!(
+            commit(&fixture.d_j, u64::MAX, &fixture.rcm, &fixture.owner_tag),
+            fixture.cm
+        );
     }
 
     #[test]

@@ -44,9 +44,9 @@ Disposition of findings from [audit_report.md](/home/arthurb/src/starkprivacy/au
 | `T3` | Fixed | Added `cargo-fuzz` targets for canonical wire decoding, bootloader output parsing, felt conversion boundaries, and encrypted-note validation. |
 | `T4` | Resolved | Existing Rust sighash sensitivity coverage already included more fields than the report credited. |
 | `T5` | Resolved | High-index WOTS+ sign/verify tests at `256` and `65535` already exist in Rust. |
-| `T6` | Partially fixed | Wallet unit coverage was expanded substantially around state transitions, BDS behavior, and persistence. Cairo now has direct multi-input transfer/unshield statement tests, but wallet-level multi-input/change witness construction coverage is still not complete. |
+| `T6` | Fixed | Wallet unit tests now exercise the real skip-proof transfer and unshield command paths with multi-input spends, preseeded change addresses, request capture, decrypted change verification, and post-submit wallet persistence. |
 | `T7` | Partially fixed | Added a wallet unit test for stale-backup rejection against the durable XMSS floor sidecar. |
-| `T8` | Partially fixed | Commitment layout agreement is now checked explicitly on the OCaml side, and Rust/OCaml protocol vectors remain aligned. A dedicated cross-impl `u64::MAX` test would still be a good follow-up. |
+| `T8` | Fixed | Rust and OCaml now both check the shared `specs/test_vectors/commitment_u64_max_v1.json` fixture, explicitly locking down the canonical `u64::MAX` commitment layout across implementations. |
 | `T9` | Fixed / stale | Dead code was removed and several helper paths now have direct tests. |
 | `T10` | Fixed / stale | The audit undercounted existing Rust service-crate unit coverage. `services/tzel/src/lib.rs` already has direct TrustMeBro unit tests for shield/transfer/unshield request handling; the item was mostly stale rather than an active gap. |
 | `T11` | Partially fixed | Some more state-transition coverage was added, but the full rejection/atomicity matrix is still incomplete. |
@@ -54,7 +54,5 @@ Disposition of findings from [audit_report.md](/home/arthurb/src/starkprivacy/au
 
 ## Next sensible work
 
-1. Add wallet multi-input/change witness unit coverage.
-2. Add a dedicated Rust/OCaml cross-implementation commitment check at `v = u64::MAX`.
-3. Decide whether the reference ledger needs any operational rate limiting at all, or whether that concern should stay explicitly out of scope.
-4. Decide whether wallet cleanup/submission atomicity is worth addressing in the developer/test client, or simply documenting as a known UX limitation.
+1. Decide whether the reference ledger needs any operational rate limiting at all, or whether that concern should stay explicitly out of scope.
+2. Decide whether wallet cleanup/submission atomicity is worth addressing in the developer/test client, or simply documenting as a known UX limitation.

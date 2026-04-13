@@ -3,7 +3,7 @@
 (test
  (name test_main)
  (modules test_main)
- (libraries tzel alcotest hex mirage-crypto))
+ (libraries tzel alcotest hex mirage-crypto yojson))
 
 (test
  (name test_interop)

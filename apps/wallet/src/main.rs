@@ -1425,8 +1425,12 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::io::{BufRead, BufReader, Read};
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::sync::OnceLock;
+    use std::thread;
 
     fn allow_full_xmss_rebuild<T>(f: impl FnOnce() -> T) -> T {
         let guard = FULL_XMSS_REBUILD_TEST_GUARD
@@ -1567,6 +1571,180 @@ mod tests {
         let (ek_v, _, ek_d, _) = w.kem_keys(j);
         let enc = encrypt_note(value, &rseed, memo, &ek_v, &ek_d);
         NoteMemo { index: 0, cm, enc }
+    }
+
+    fn wallet_note_for_address(
+        w: &WalletFile,
+        j: u32,
+        value: u64,
+        rseed: F,
+        index: usize,
+    ) -> Note {
+        let acc = w.account();
+        let addr = &w.addresses[j as usize];
+        let nk_spend = derive_nk_spend(&acc.nk, &addr.d_j);
+        let nk_tag = derive_nk_tag(&nk_spend);
+        let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &nk_tag);
+        let rcm = derive_rcm(&rseed);
+        let cm = commit(&addr.d_j, value, &rcm, &otag);
+        Note {
+            nk_spend,
+            nk_tag,
+            auth_root: addr.auth_root,
+            d_j: addr.d_j,
+            v: value,
+            rseed,
+            cm,
+            index,
+            addr_index: j,
+        }
+    }
+
+    fn payment_address_for_wallet_address(w: &WalletFile, j: u32) -> PaymentAddress {
+        let (ek_v, _, ek_d, _) = w.kem_keys(j);
+        w.addresses[j as usize].payment_address(&ek_v, &ek_d)
+    }
+
+    #[derive(Debug)]
+    enum CapturedLedgerRequest {
+        Transfer(TransferReq),
+        Unshield(UnshieldReq),
+    }
+
+    struct FakeLedger {
+        base_url: String,
+        captured: Arc<Mutex<Vec<CapturedLedgerRequest>>>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl FakeLedger {
+        fn start(root: F) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake ledger");
+            let addr = listener.local_addr().expect("fake ledger local addr");
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let captured_for_thread = Arc::clone(&captured);
+            let worker = thread::spawn(move || {
+                for _ in 0..2 {
+                    let (mut stream, _) = listener.accept().expect("accept fake ledger request");
+                    let (method, path, body) = read_http_request(&mut stream);
+                    match (method.as_str(), path.as_str()) {
+                        ("GET", "/tree") => write_http_json(
+                            &mut stream,
+                            &TreeInfoResp {
+                                root,
+                                size: 2,
+                                depth: DEPTH,
+                            },
+                        ),
+                        ("POST", "/transfer") => {
+                            let req: TransferReq =
+                                serde_json::from_slice(&body).expect("parse transfer request");
+                            captured_for_thread
+                                .lock()
+                                .expect("lock transfer capture")
+                                .push(CapturedLedgerRequest::Transfer(req));
+                            write_http_json(
+                                &mut stream,
+                                &TransferResp {
+                                    index_1: 17,
+                                    index_2: 18,
+                                },
+                            );
+                        }
+                        ("POST", "/unshield") => {
+                            let req: UnshieldReq =
+                                serde_json::from_slice(&body).expect("parse unshield request");
+                            captured_for_thread
+                                .lock()
+                                .expect("lock unshield capture")
+                                .push(CapturedLedgerRequest::Unshield(req));
+                            write_http_json(
+                                &mut stream,
+                                &UnshieldResp {
+                                    change_index: Some(23),
+                                },
+                            );
+                        }
+                        _ => panic!("unexpected fake ledger route: {} {}", method, path),
+                    }
+                }
+            });
+            Self {
+                base_url: format!("http://{}", addr),
+                captured,
+                worker: Some(worker),
+            }
+        }
+
+        fn url(&self) -> &str {
+            &self.base_url
+        }
+
+        fn finish(mut self) -> Vec<CapturedLedgerRequest> {
+            self.worker
+                .take()
+                .expect("fake ledger worker handle")
+                .join()
+                .expect("fake ledger thread should exit cleanly");
+            Arc::try_unwrap(self.captured)
+                .expect("fake ledger captures should be uniquely owned")
+                .into_inner()
+                .expect("unlock fake ledger captures")
+        }
+    }
+
+    fn read_http_request(stream: &mut TcpStream) -> (String, String, Vec<u8>) {
+        let mut reader = BufReader::new(
+            stream
+                .try_clone()
+                .expect("clone fake ledger stream for reading"),
+        );
+        let mut request_line = String::new();
+        reader
+            .read_line(&mut request_line)
+            .expect("read request line");
+        assert!(
+            !request_line.is_empty(),
+            "fake ledger received an empty request line"
+        );
+
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).expect("read request header");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = line.split_once(':') {
+                if name.eq_ignore_ascii_case("Content-Length") {
+                    content_length = value.trim().parse().expect("parse content length");
+                }
+            }
+        }
+
+        let mut body = vec![0u8; content_length];
+        reader
+            .read_exact(&mut body)
+            .expect("read fake ledger request body");
+
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().expect("request method").to_string();
+        let path = parts.next().expect("request path").to_string();
+        (method, path, body)
+    }
+
+    fn write_http_json<T: serde::Serialize>(stream: &mut TcpStream, value: &T) {
+        let body = serde_json::to_vec(value).expect("serialize fake ledger response");
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write fake ledger response header");
+        stream
+            .write_all(&body)
+            .expect("write fake ledger response body");
+        stream.flush().expect("flush fake ledger response");
     }
 
     proptest! {
@@ -2480,6 +2658,196 @@ mod tests {
             let _ = w.next_wots_key(0);
         }));
         assert!(panic.is_err(), "WOTS key exhaustion must panic");
+    }
+
+    #[test]
+    fn test_transfer_skip_proof_multiple_inputs_uses_preseeded_change_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let recipient_path = dir.path().join("recipient.json");
+        let recipient_path_str = recipient_path.to_str().unwrap();
+
+        let mut w = test_wallet(2, None);
+        w.addr_counter = 1;
+        w.notes = vec![
+            wallet_note_for_address(&w, 0, 40, felt_tag(b"wallet-transfer-note-0"), 7),
+            wallet_note_for_address(&w, 0, 25, felt_tag(b"wallet-transfer-note-1"), 11),
+        ];
+        save_wallet(wallet_path_str, &w).expect("wallet should save");
+
+        let recipient = payment_address_for_wallet_address(&w, 0);
+        std::fs::write(
+            &recipient_path,
+            serde_json::to_string_pretty(&recipient).expect("serialize recipient address"),
+        )
+        .expect("write recipient address");
+
+        let expected_nullifiers: std::collections::HashSet<F> = w
+            .notes
+            .iter()
+            .map(|n| nullifier(&n.nk_spend, &n.cm, n.index as u64))
+            .collect();
+        let change_addr = w.addresses[1].clone();
+        let (_ek_v0, dk_v0, _ek_d0, dk_d0) = w.kem_keys(0);
+        let (_ek_v1, dk_v1, _ek_d1, dk_d1) = w.kem_keys(1);
+
+        let ledger_root = felt_tag(b"wallet-transfer-root");
+        let ledger = FakeLedger::start(ledger_root);
+        let pc = ProveConfig {
+            skip_proof: true,
+            reprove_bin: String::new(),
+            executables_dir: String::new(),
+        };
+
+        cmd_transfer(
+            wallet_path_str,
+            ledger.url(),
+            recipient_path_str,
+            50,
+            Some("memo-1".into()),
+            &pc,
+        )
+        .expect("transfer should succeed against fake ledger");
+
+        let captured = ledger.finish();
+        assert_eq!(captured.len(), 1);
+        let req = match &captured[0] {
+            CapturedLedgerRequest::Transfer(req) => req,
+            _ => panic!("expected captured transfer request"),
+        };
+
+        assert_eq!(req.root, ledger_root);
+        assert_eq!(
+            req.nullifiers.iter().copied().collect::<std::collections::HashSet<F>>(),
+            expected_nullifiers
+        );
+        assert!(matches!(&req.proof, Proof::TrustMeBro));
+
+        assert!(detect(&req.enc_1, &dk_d0));
+        let (recipient_value, recipient_rseed, recipient_memo) =
+            decrypt_memo(&req.enc_1, &dk_v0).expect("recipient note should decrypt");
+        assert_eq!(recipient_value, 50);
+        assert_eq!(&recipient_memo[..6], b"memo-1");
+        let recipient_otag = owner_tag(
+            &recipient.auth_root,
+            &recipient.auth_pub_seed,
+            &recipient.nk_tag,
+        );
+        assert_eq!(
+            commit(
+                &recipient.d_j,
+                recipient_value,
+                &derive_rcm(&recipient_rseed),
+                &recipient_otag
+            ),
+            req.cm_1
+        );
+
+        assert!(detect(&req.enc_2, &dk_d1));
+        let (change_value, change_rseed, change_memo) =
+            decrypt_memo(&req.enc_2, &dk_v1).expect("change note should decrypt");
+        assert_eq!(change_value, 15);
+        assert_eq!(change_memo[0], 0xF6);
+        let change_otag = owner_tag(
+            &change_addr.auth_root,
+            &change_addr.auth_pub_seed,
+            &change_addr.nk_tag,
+        );
+        assert_eq!(
+            commit(
+                &change_addr.d_j,
+                change_value,
+                &derive_rcm(&change_rseed),
+                &change_otag
+            ),
+            req.cm_2
+        );
+
+        let loaded = load_wallet(wallet_path_str).expect("wallet should reload");
+        assert!(loaded.notes.is_empty(), "spent notes should be removed");
+        assert_eq!(loaded.addr_counter, 2);
+        assert_eq!(loaded.addresses.len(), 2);
+    }
+
+    #[test]
+    fn test_unshield_skip_proof_multiple_inputs_uses_preseeded_change_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+
+        let mut w = test_wallet(2, None);
+        w.addr_counter = 1;
+        w.notes = vec![
+            wallet_note_for_address(&w, 0, 35, felt_tag(b"wallet-unshield-note-0"), 5),
+            wallet_note_for_address(&w, 0, 30, felt_tag(b"wallet-unshield-note-1"), 9),
+        ];
+        save_wallet(wallet_path_str, &w).expect("wallet should save");
+
+        let expected_nullifiers: std::collections::HashSet<F> = w
+            .notes
+            .iter()
+            .map(|n| nullifier(&n.nk_spend, &n.cm, n.index as u64))
+            .collect();
+        let change_addr = w.addresses[1].clone();
+        let (_ek_v1, dk_v1, _ek_d1, dk_d1) = w.kem_keys(1);
+
+        let ledger_root = felt_tag(b"wallet-unshield-root");
+        let ledger = FakeLedger::start(ledger_root);
+        let pc = ProveConfig {
+            skip_proof: true,
+            reprove_bin: String::new(),
+            executables_dir: String::new(),
+        };
+
+        cmd_unshield(wallet_path_str, ledger.url(), 50, "bob", &pc)
+            .expect("unshield should succeed against fake ledger");
+
+        let captured = ledger.finish();
+        assert_eq!(captured.len(), 1);
+        let req = match &captured[0] {
+            CapturedLedgerRequest::Unshield(req) => req,
+            _ => panic!("expected captured unshield request"),
+        };
+
+        assert_eq!(req.root, ledger_root);
+        assert_eq!(req.v_pub, 50);
+        assert_eq!(req.recipient, "bob");
+        assert_eq!(
+            req.nullifiers.iter().copied().collect::<std::collections::HashSet<F>>(),
+            expected_nullifiers
+        );
+        assert!(matches!(&req.proof, Proof::TrustMeBro));
+        assert_ne!(req.cm_change, ZERO);
+
+        let enc_change = req
+            .enc_change
+            .as_ref()
+            .expect("change note should be present");
+        assert!(detect(enc_change, &dk_d1));
+        let (change_value, change_rseed, change_memo) =
+            decrypt_memo(enc_change, &dk_v1).expect("change note should decrypt");
+        assert_eq!(change_value, 15);
+        assert_eq!(change_memo[0], 0xF6);
+        let change_otag = owner_tag(
+            &change_addr.auth_root,
+            &change_addr.auth_pub_seed,
+            &change_addr.nk_tag,
+        );
+        assert_eq!(
+            commit(
+                &change_addr.d_j,
+                change_value,
+                &derive_rcm(&change_rseed),
+                &change_otag
+            ),
+            req.cm_change
+        );
+
+        let loaded = load_wallet(wallet_path_str).expect("wallet should reload");
+        assert!(loaded.notes.is_empty(), "spent notes should be removed");
+        assert_eq!(loaded.addr_counter, 2);
+        assert_eq!(loaded.addresses.len(), 2);
     }
 
     #[test]
