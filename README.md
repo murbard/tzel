@@ -54,6 +54,7 @@ For deployment-oriented installs with standard paths instead of a workspace chec
 - operator box: `ops/shadownet/README.md`
 - prover layout: `ops/prover/README.md`
 - shared binary installer: `./scripts/install_tzel_binaries.sh --prefix /usr/local --executables-dir /opt/tzel/cairo/target/dev`
+- live public-box smoke: `TZEL_SMOKE_L1_RECIPIENT=tz1... ./scripts/shadownet_live_e2e_smoke.sh /etc/tzel/shadownet.env`
 
 > **WARNING:** The ledger now refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `cairo/target/dev`). `--trust-me-bro` is never appropriate for real value.
 >

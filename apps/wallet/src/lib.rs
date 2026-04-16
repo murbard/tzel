@@ -10,7 +10,7 @@ use tzel_services::kernel_wire::{
     KernelTransferReq, KernelUnshieldReq, KernelWithdrawReq,
 };
 use tzel_services::operator_api::{
-    RollupSubmissionKind, RollupSubmissionStatus, RollupSubmissionTransport,
+    RollupSubmission, RollupSubmissionKind, RollupSubmissionStatus, RollupSubmissionTransport,
     SubmitRollupMessageReq, SubmitRollupMessageResp,
 };
 use tzel_services::*;
@@ -1091,6 +1091,15 @@ fn get_json<Resp: for<'de> Deserialize<'de>>(url: &str) -> Result<Resp, String> 
         .map_err(|e| format!("parse response: {}", e))
 }
 
+fn get_text(url: &str) -> Result<String, String> {
+    let resp = ureq::get(url)
+        .call()
+        .map_err(|e| format!("HTTP error: {}", e))?;
+    resp.into_body()
+        .read_to_string()
+        .map_err(|e| format!("read response: {}", e))
+}
+
 fn ensure_path_matches_root(
     path_root: &F,
     expected_root: &F,
@@ -1262,15 +1271,54 @@ impl<'a> RollupRpc<'a> {
         )
     }
 
+    fn durable_length_url(&self, key: &str) -> String {
+        format!(
+            "{}/global/block/head/durable/wasm_2_0_0/length?key={}",
+            self.profile.rollup_node_url.trim_end_matches('/'),
+            key
+        )
+    }
+
+    fn head_hash_url(&self) -> String {
+        format!(
+            "{}/global/block/head/hash",
+            self.profile.rollup_node_url.trim_end_matches('/')
+        )
+    }
+
     fn read_durable_text(&self, key: &str) -> Result<String, String> {
         let url = self.durable_value_url(key);
-        let resp = ureq::get(&url).call().map_err(|e| match e {
-            ureq::Error::StatusCode(code) => format!("rollup RPC {} returned HTTP {}", url, code),
-            other => format!("rollup RPC {} failed: {}", url, other),
-        })?;
-        resp.into_body()
-            .read_to_string()
-            .map_err(|e| format!("read rollup RPC response: {}", e))
+        get_text(&url).map_err(|e| format!("rollup RPC {} failed: {}", url, e))
+    }
+
+    fn read_durable_length(&self, key: &str) -> Result<Option<usize>, String> {
+        let url = self.durable_length_url(key);
+        let raw = get_text(&url).map_err(|e| format!("rollup RPC {} failed: {}", url, e))?;
+        let value: Option<serde_json::Value> =
+            serde_json::from_str(&raw).map_err(|e| format!("parse durable length: {}", e))?;
+        match value {
+            None => Ok(None),
+            Some(serde_json::Value::String(text)) => {
+                let parsed = text
+                    .parse::<u64>()
+                    .map_err(|e| format!("parse durable length integer: {}", e))?;
+                usize::try_from(parsed)
+                    .map(Some)
+                    .map_err(|_| format!("durable length at {} does not fit in usize", key))
+            }
+            Some(serde_json::Value::Number(number)) => {
+                let parsed = number
+                    .as_u64()
+                    .ok_or_else(|| format!("durable length at {} must be non-negative", key))?;
+                usize::try_from(parsed)
+                    .map(Some)
+                    .map_err(|_| format!("durable length at {} does not fit in usize", key))
+            }
+            Some(other) => Err(format!(
+                "durable length at {} has unexpected JSON form {}",
+                key, other
+            )),
+        }
     }
 
     fn read_durable_bytes(&self, key: &str) -> Result<Vec<u8>, String> {
@@ -1325,8 +1373,14 @@ impl<'a> RollupRpc<'a> {
 
         let mut notes = Vec::with_capacity(count - cursor);
         for i in cursor..count {
-            let bytes =
-                self.read_durable_bytes(&indexed_durable_key(DURABLE_NOTE_PREFIX, i as u64))?;
+            let key = indexed_durable_key(DURABLE_NOTE_PREFIX, i as u64);
+            if self.read_durable_length(&key)?.is_none() {
+                return Err(format!(
+                    "rollup durable state is missing note {} at {} while tree size is {}. This usually means the deployed rollup kernel does not persist published note payloads, or the rollup node is not serving the expected durable state.",
+                    i, key, count
+                ));
+            }
+            let bytes = self.read_durable_bytes(&key)?;
             let (cm, enc) = canonical_wire::decode_published_note(&bytes)?;
             notes.push(NoteMemo { index: i, cm, enc });
         }
@@ -1384,6 +1438,11 @@ impl<'a> RollupRpc<'a> {
             tree,
             notes,
         })
+    }
+
+    fn head_hash(&self) -> Result<String, String> {
+        let raw = get_text(&self.head_hash_url())?;
+        serde_json::from_str::<String>(&raw).or_else(|_| Ok(raw.trim().to_string()))
     }
 
     fn submit_kernel_message(
@@ -1549,35 +1608,8 @@ fn submit_kernel_message_via_operator(
         },
     )?;
     let submission = resp.submission;
-    let transport = match submission.transport {
-        RollupSubmissionTransport::DirectInbox => "direct_inbox",
-        RollupSubmissionTransport::Dal => "dal",
-    };
-    let status = match submission.status {
-        RollupSubmissionStatus::SubmittedToL1 => "submitted_to_l1",
-        RollupSubmissionStatus::PendingDal => "pending_dal",
-        RollupSubmissionStatus::CommitmentIncluded => "commitment_included",
-        RollupSubmissionStatus::Attested => "attested",
-        RollupSubmissionStatus::Failed => "failed",
-    };
-    let mut lines = vec![
-        format!("Operator submission id: {}", submission.id),
-        format!("Status: {} via {}", status, transport),
-    ];
-    if !submission.dal_chunks.is_empty() {
-        lines.push(format!("DAL chunks: {}", submission.dal_chunks.len()));
-        for (index, chunk) in submission.dal_chunks.iter().enumerate() {
-            lines.push(format!(
-                "  chunk {}: slot {} level {} bytes {} commitment {}",
-                index, chunk.slot_index, chunk.published_level, chunk.payload_len, chunk.commitment
-            ));
-        }
-    }
-    if let Some(detail) = submission.detail {
-        lines.push(detail);
-    }
     Ok(RollupSubmissionReceipt {
-        output: lines.join("\n"),
+        output: format_rollup_submission(&submission),
         operation_hash: submission.operation_hash,
         submission_id: Some(submission.id),
         pending_dal: matches!(
@@ -1595,6 +1627,41 @@ fn load_operator_submission(
 ) -> Result<SubmitRollupMessageResp, String> {
     let base = operator_url.trim_end_matches('/');
     get_json(&format!("{}/v1/rollup/submissions/{}", base, submission_id))
+}
+
+fn format_rollup_submission(submission: &RollupSubmission) -> String {
+    let transport = match submission.transport {
+        RollupSubmissionTransport::DirectInbox => "direct_inbox",
+        RollupSubmissionTransport::Dal => "dal",
+    };
+    let status = match submission.status {
+        RollupSubmissionStatus::SubmittedToL1 => "submitted_to_l1",
+        RollupSubmissionStatus::PendingDal => "pending_dal",
+        RollupSubmissionStatus::CommitmentIncluded => "commitment_included",
+        RollupSubmissionStatus::Attested => "attested",
+        RollupSubmissionStatus::Failed => "failed",
+    };
+    let mut lines = vec![
+        format!("Operator submission id: {}", submission.id),
+        format!("Kind: {:?}", submission.kind),
+        format!("Status: {} via {}", status, transport),
+    ];
+    if let Some(op_hash) = &submission.operation_hash {
+        lines.push(format!("Operation hash: {}", op_hash));
+    }
+    if !submission.dal_chunks.is_empty() {
+        lines.push(format!("DAL chunks: {}", submission.dal_chunks.len()));
+        for (index, chunk) in submission.dal_chunks.iter().enumerate() {
+            lines.push(format!(
+                "  chunk {}: slot {} level {} bytes {} commitment {}",
+                index, chunk.slot_index, chunk.published_level, chunk.payload_len, chunk.commitment
+            ));
+        }
+    }
+    if let Some(detail) = &submission.detail {
+        lines.push(detail.clone());
+    }
+    lines.join("\n")
 }
 
 fn indexed_durable_key(prefix: &str, index: u64) -> String {
@@ -1920,9 +1987,18 @@ enum UserCmd {
     /// Derive a new receiving address.
     Receive,
     /// Sync notes and spent nullifiers directly from the rollup node durable state.
-    Sync,
+    Sync {
+        /// Keep polling until interrupted.
+        #[arg(long)]
+        watch: bool,
+        /// Poll interval for `sync --watch`.
+        #[arg(long, default_value_t = 5)]
+        interval_secs: u64,
+    },
     /// Show local private balance plus live public bridge balance when configured.
     Balance,
+    /// Check whether the wallet profile, operator, and rollup node are usable.
+    Check,
     /// Deposit tez on L1 into the configured bridge ticketer for your public rollup account.
     Deposit {
         #[arg(long)]
@@ -2027,12 +2103,13 @@ fn run_user(cli: UserCli) -> Result<(), String> {
     let _wallet_lock = match &cli.cmd {
         UserCmd::Init
         | UserCmd::Receive
-        | UserCmd::Sync
+        | UserCmd::Sync { .. }
         | UserCmd::Shield { .. }
         | UserCmd::Send { .. }
         | UserCmd::Unshield { .. } => Some(acquire_wallet_lock(&cli.wallet)?),
         UserCmd::Profile { .. }
         | UserCmd::Balance
+        | UserCmd::Check
         | UserCmd::Deposit { .. }
         | UserCmd::Status { .. }
         | UserCmd::Withdraw { .. }
@@ -2050,11 +2127,22 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::Init => cmd_keygen(&cli.wallet),
         UserCmd::Profile { cmd } => run_user_profile(&cli.wallet, cmd),
         UserCmd::Receive => cmd_address(&cli.wallet),
-        UserCmd::Sync => {
+        UserCmd::Sync {
+            watch,
+            interval_secs,
+        } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            cmd_rollup_sync(&cli.wallet, &profile)
+            if watch {
+                cmd_rollup_sync_watch(&cli.wallet, &profile, interval_secs)
+            } else {
+                cmd_rollup_sync(&cli.wallet, &profile)
+            }
         }
         UserCmd::Balance => cmd_user_balance(&cli.wallet),
+        UserCmd::Check => {
+            let profile = load_required_network_profile(&cli.wallet)?;
+            cmd_wallet_check(&cli.wallet, &profile)
+        }
         UserCmd::Deposit {
             amount,
             public_account,
@@ -3859,6 +3947,39 @@ mod tests {
         );
         assert_eq!(loaded.notes[0].cm, cm);
     }
+
+    #[test]
+    fn test_format_rollup_submission_includes_status_and_chunks() {
+        let submission = RollupSubmission {
+            id: "sub-abc".into(),
+            kind: RollupSubmissionKind::Transfer,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            status: RollupSubmissionStatus::CommitmentIncluded,
+            transport: RollupSubmissionTransport::Dal,
+            operation_hash: Some("ooTestHash123456789ABCDEFG".into()),
+            dal_chunks: vec![tzel_services::operator_api::RollupDalChunk {
+                slot_index: 3,
+                published_level: 101,
+                payload_len: 128,
+                commitment: "sh1chunk".into(),
+                operation_hash: Some("ooChunkHash123456789ABCDEFG".into()),
+            }],
+            commitment: Some("sh1chunk".into()),
+            published_level: Some(101),
+            slot_index: Some(3),
+            payload_hash: Some(hex::encode([0x11; 32])),
+            payload_len: 128,
+            detail: Some("Waiting for DAL attestation".into()),
+        };
+
+        let text = format_rollup_submission(&submission);
+        assert!(text.contains("Operator submission id: sub-abc"));
+        assert!(text.contains("Kind: Transfer"));
+        assert!(text.contains("Status: commitment_included via dal"));
+        assert!(text.contains("Operation hash: ooTestHash123456789ABCDEFG"));
+        assert!(text.contains("chunk 0: slot 3 level 101 bytes 128 commitment sh1chunk"));
+        assert!(text.contains("Waiting for DAL attestation"));
+    }
 }
 
 fn cmd_balance(path: &str) -> Result<(), String> {
@@ -3913,10 +4034,66 @@ fn cmd_user_balance(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), String> {
+    let wallet = load_wallet(path)?;
+    let rollup = RollupRpc::new(profile);
+    let head_hash = rollup.head_hash()?;
+    let auth_domain = rollup.read_felt(DURABLE_AUTH_DOMAIN)?;
+    let tree_size = rollup.read_u64(DURABLE_TREE_SIZE)?;
+    let public_balance = rollup
+        .load_balances()?
+        .get(&profile.public_account)
+        .copied()
+        .unwrap_or(0);
+
+    println!("Wallet file: {}", path);
+    println!("Network: {}", profile.network);
+    println!("Rollup head: {}", head_hash);
+    println!("Auth domain: {}", short(&auth_domain));
+    println!("Tree size: {}", tree_size);
+    println!(
+        "Local wallet: notes={}, pending={}, scanned={}",
+        wallet.notes.len(),
+        wallet.pending_spends.len(),
+        wallet.scanned
+    );
+    println!(
+        "Public rollup balance ({}): {}",
+        profile.public_account, public_balance
+    );
+
+    if let Some(operator_url) = &profile.operator_url {
+        let health_url = format!("{}/healthz", operator_url.trim_end_matches('/'));
+        let health = get_text(&health_url)?;
+        println!("Operator health: {}", health.trim());
+    } else {
+        println!("Operator health: not configured");
+    }
+
+    let note_check_limit = usize::try_from(tree_size)
+        .unwrap_or(usize::MAX)
+        .min(wallet.scanned.max(1))
+        .min(4);
+    for index in 0..note_check_limit {
+        let key = indexed_durable_key(DURABLE_NOTE_PREFIX, index as u64);
+        if rollup.read_durable_length(&key)?.is_none() {
+            return Err(format!(
+                "rollup durable note {} is missing at {} while tree size is {}. This deployment cannot serve private note sync correctly.",
+                index, key, tree_size
+            ));
+        }
+    }
+
+    println!("Check passed");
+    Ok(())
+}
+
 fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), String> {
     let mut w = load_wallet(path)?;
     let rollup = RollupRpc::new(profile);
-    let feed = rollup.load_notes_since(w.scanned)?;
+    let feed = rollup
+        .load_notes_since(w.scanned)
+        .map_err(|e| format!("sync failed: {}. Run `tzel-wallet check` for a fuller diagnosis.", e))?;
     let nullifiers = rollup.load_nullifiers()?;
     let summary = apply_scan_feed(&mut w, &feed, nullifiers);
     save_wallet(path, &w)?;
@@ -3934,6 +4111,22 @@ fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), Str
         public_balance
     );
     Ok(())
+}
+
+fn cmd_rollup_sync_watch(
+    path: &str,
+    profile: &WalletNetworkProfile,
+    interval_secs: u64,
+) -> Result<(), String> {
+    let interval = std::time::Duration::from_secs(interval_secs.max(1));
+    println!(
+        "Watching rollup state every {}s. Press Ctrl-C to stop.",
+        interval.as_secs()
+    );
+    loop {
+        cmd_rollup_sync(path, profile)?;
+        std::thread::sleep(interval);
+    }
 }
 
 fn cmd_bridge_deposit(
@@ -3963,10 +4156,7 @@ fn cmd_operator_status(profile: &WalletNetworkProfile, submission_id: &str) -> R
         .as_deref()
         .ok_or_else(|| "this wallet profile has no operator_url configured".to_string())?;
     let resp = load_operator_submission(operator_url, submission_id)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&resp.submission).unwrap()
-    );
+    println!("{}", format_rollup_submission(&resp.submission));
     Ok(())
 }
 

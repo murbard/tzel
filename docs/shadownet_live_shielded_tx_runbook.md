@@ -18,6 +18,16 @@ The goal is to end with:
 3. Alice sends a private transfer to Bob
 4. Bob syncs and sees the received note
 
+Before you start, make sure the deployed rollup passes:
+
+```bash
+/usr/local/bin/tzel-wallet --wallet alice.wallet check
+```
+
+If `check` reports missing durable note payloads while the tree size is non-zero,
+that deployment cannot support private note sync and should be replaced with a
+fresh rollup origination using the current kernel.
+
 ## 1. Install The Required Binaries
 
 From the repo root:
@@ -140,6 +150,12 @@ Wait for both operations to be included, then verify local services again:
 curl -fsS http://127.0.0.1:8787/healthz
 curl -fsS http://127.0.0.1:28944/global/block/head/hash
 curl -fsS http://127.0.0.1:10732/synchronized
+```
+
+For a single-command end-to-end smoke on a prepared public box, see:
+
+```bash
+TZEL_SMOKE_L1_RECIPIENT=tz1REPLACE_ME ./scripts/shadownet_live_e2e_smoke.sh /etc/tzel/shadownet.env
 ```
 
 ## 4. Decide Where To Run The Wallet

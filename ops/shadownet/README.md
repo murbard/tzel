@@ -36,6 +36,9 @@ by the rest of the DAL network. In practice that means:
     `verified_bridge_fixture_message`, `reprove`, and the Cairo executable JSON files
 - `../../scripts/shadownet_operator_preflight.sh`
   - checks binaries, env vars, and local service RPCs
+- `../../scripts/shadownet_live_e2e_smoke.sh`
+  - uses two disposable wallets to run `deposit -> shield -> send -> unshield -> withdraw`
+    against the configured public box
 
 ## Setup
 
@@ -60,6 +63,8 @@ by the rest of the DAL network. In practice that means:
    - `sudo systemctl enable --now octez-node octez-dal-node octez-rollup-node tzel-operator`
 9. Run preflight.
    - `./scripts/shadownet_operator_preflight.sh /etc/tzel/shadownet.env`
+10. Run a wallet-facing smoke once the rollup is configured.
+   - `TZEL_SMOKE_L1_RECIPIENT=tz1REPLACE_ME ./scripts/shadownet_live_e2e_smoke.sh /etc/tzel/shadownet.env`
 
 ## Expected Local RPCs
 
@@ -77,3 +82,23 @@ At minimum, allow inbound TCP for:
 
 Keep the RPC endpoints bound to loopback unless you explicitly want remote
 access.
+
+## Wallet Diagnosis
+
+Before handing the box to testers, verify that a freshly created wallet can read
+the rollup state:
+
+```bash
+/usr/local/bin/tzel-wallet --wallet /tmp/tzel-check.wallet init
+/usr/local/bin/tzel-wallet --wallet /tmp/tzel-check.wallet profile init-shadownet \
+  --rollup-node-url http://127.0.0.1:28944 \
+  --rollup-address "$TZEL_ROLLUP_ADDRESS" \
+  --bridge-ticketer "$TZEL_BRIDGE_TICKETER" \
+  --operator-url http://127.0.0.1:8787 \
+  --source-alias "$TZEL_SOURCE_ALIAS"
+/usr/local/bin/tzel-wallet --wallet /tmp/tzel-check.wallet check
+```
+
+If `check` reports missing durable note payloads while the tree size is non-zero,
+the live rollup was likely originated with an older kernel and should be
+redeployed before user testing.
