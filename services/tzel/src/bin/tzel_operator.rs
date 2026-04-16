@@ -1349,6 +1349,120 @@ mod tests {
     }
 
     #[test]
+    fn mixed_chunk_attestation_only_republishes_the_unattested_chunk() {
+        let script_dir = make_client_script(
+            "#!/bin/sh\necho 'Operation hash is ooMixedHash123456789ABCDEFG'\necho 'Operation found in block BLMixedHash123456789ABCDEFG'\n",
+        );
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        let endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/levels/101/slots/3/status".into(),
+                (200, "{\"kind\":\"attested\",\"attestation_lag\":8}".into()),
+            ),
+            (
+                "/levels/102/slots/4/status".into(),
+                (200, "\"unattested\"".into()),
+            ),
+            (
+                "/levels/103/slots/5/status".into(),
+                (200, "{\"kind\":\"attested\",\"attestation_lag\":8}".into()),
+            ),
+            (
+                "/protocol_parameters".into(),
+                (
+                    200,
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8}}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=0&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1mixed\",\"commitment_proof\":\"proof-mixed\"}".into(),
+                ),
+            ),
+            (
+                "/chains/main/blocks/BLMixedHash123456789ABCDEFG/header".into(),
+                (200, "{\"level\":222}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let submission = RollupSubmission {
+            id: "sub-mixed".into(),
+            kind: RollupSubmissionKind::Transfer,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            status: RollupSubmissionStatus::CommitmentIncluded,
+            transport: RollupSubmissionTransport::Dal,
+            operation_hash: Some("ooCommitmentHash123456789ABCDEFG".into()),
+            dal_chunks: vec![
+                RollupDalChunk {
+                    slot_index: 3,
+                    published_level: 101,
+                    payload_len: 2,
+                    commitment: "commitment-1".into(),
+                    operation_hash: Some("ooChunkOne123456789ABCDEFG".into()),
+                },
+                RollupDalChunk {
+                    slot_index: 4,
+                    published_level: 102,
+                    payload_len: 3,
+                    commitment: "commitment-2".into(),
+                    operation_hash: Some("ooChunkTwo123456789ABCDEFG".into()),
+                },
+                RollupDalChunk {
+                    slot_index: 5,
+                    published_level: 103,
+                    payload_len: 4,
+                    commitment: "commitment-3".into(),
+                    operation_hash: Some("ooChunkThree123456789ABCD".into()),
+                },
+            ],
+            commitment: Some("commitment-1".into()),
+            published_level: Some(101),
+            slot_index: Some(3),
+            payload_hash: Some(hex::encode([0x68; 32])),
+            payload_len: 9,
+            detail: None,
+        };
+
+        let advanced = maybe_advance_submission(
+            &config,
+            stored_submission(
+                submission,
+                Some(vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xf1, 0xf2, 0xf3, 0xf4]),
+                &[1, 1, 1],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            advanced.submission.status,
+            RollupSubmissionStatus::CommitmentIncluded
+        );
+        assert_eq!(advanced.chunk_attempts, vec![1, 2, 1]);
+        assert_eq!(advanced.submission.dal_chunks[0].slot_index, 3);
+        assert_eq!(advanced.submission.dal_chunks[0].published_level, 101);
+        assert_eq!(advanced.submission.dal_chunks[1].slot_index, 0);
+        assert_eq!(advanced.submission.dal_chunks[1].published_level, 222);
+        assert_eq!(advanced.submission.dal_chunks[1].payload_len, 3);
+        assert_eq!(advanced.submission.dal_chunks[2].slot_index, 5);
+        assert_eq!(advanced.submission.dal_chunks[2].published_level, 103);
+        assert_eq!(
+            advanced.submission.commitment.as_deref(),
+            Some("commitment-1")
+        );
+        assert_eq!(advanced.submission.published_level, Some(101));
+        assert_eq!(advanced.submission.slot_index, Some(3));
+        assert!(advanced
+            .submission
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("Republished 1 unattested DAL chunk(s)"));
+    }
+
+    #[test]
     fn unattested_dal_submission_without_payload_fails_terminally() {
         let script_dir = make_client_script(
             "#!/bin/sh\necho 'Operation hash is ooUnexpected123456789ABCDEFG'\n",

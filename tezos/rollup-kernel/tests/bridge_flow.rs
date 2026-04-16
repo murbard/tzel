@@ -31,8 +31,8 @@ use tzel_core::kernel_wire::{
 #[cfg(feature = "proof-verifier")]
 use tzel_core::{ProgramHashes, Proof, ShieldReq, TransferReq, UnshieldReq, F};
 use tzel_rollup_kernel::{
-    read_last_input, read_last_result, read_ledger, read_stats, run_with_host, DalParameters,
-    Host, InputMessage, MAX_INPUT_BYTES,
+    read_last_input, read_last_result, read_ledger, read_stats, run_with_host, DalParameters, Host,
+    InputMessage, MAX_INPUT_BYTES,
 };
 
 const PATH_BRIDGE_TICKETER: &[u8] = b"/tzel/v1/state/bridge/ticketer";
@@ -481,6 +481,48 @@ fn verified_transfer_rejects_tampered_output_note_without_mutating_state() {
     }
 
     assert_ledger_state_unchanged(&before_transfer, &read_ledger(&host).unwrap());
+    assert!(host.outputs.is_empty());
+}
+
+#[cfg(feature = "proof-verifier")]
+#[test]
+fn verified_transfer_consumes_one_note_and_creates_change_and_recipient_notes() {
+    let fixture = verified_bridge_fixture();
+    let mut host = TestHost::default();
+    configure_verified_bridge(&mut host, fixture);
+    apply_fixture_deposit(&mut host, fixture, 2);
+    apply_fixture_shield(&mut host, fixture, 3);
+
+    let before_transfer = read_ledger(&host).unwrap();
+    apply_fixture_transfer(&mut host, fixture, 4);
+
+    match read_last_result(&host).unwrap() {
+        KernelResult::Transfer(resp) => assert_eq!((resp.index_1, resp.index_2), (1, 2)),
+        other => panic!("unexpected rollup result: {:?}", other),
+    }
+
+    let after_transfer = read_ledger(&host).unwrap();
+    assert_eq!(after_transfer.balances, before_transfer.balances);
+    assert_eq!(after_transfer.withdrawals, before_transfer.withdrawals);
+    assert_eq!(
+        after_transfer.tree.leaves.len(),
+        before_transfer.tree.leaves.len() + 2
+    );
+    assert_eq!(
+        after_transfer.nullifiers.len(),
+        before_transfer.nullifiers.len() + 1
+    );
+    assert_eq!(
+        after_transfer.tree.leaves,
+        vec![
+            fixture.shield.client_cm,
+            fixture.transfer.cm_1,
+            fixture.transfer.cm_2,
+        ]
+    );
+    assert!(after_transfer
+        .nullifiers
+        .contains(&fixture.transfer.nullifiers[0]));
     assert!(host.outputs.is_empty());
 }
 
