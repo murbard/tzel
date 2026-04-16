@@ -5,7 +5,7 @@ flow against a deployed rollup using the operator box.
 
 It assumes:
 
-- the code from branch `wip-rollup-octez-integration`
+- the current `main` branch
 - a public operator machine running `octez-node`, `octez-dal-node`,
   `octez-smart-rollup-node`, and `tzel-operator`
 - a live rollup `sr1...`
@@ -18,23 +18,26 @@ The goal is to end with:
 3. Alice sends a private transfer to Bob
 4. Bob syncs and sees the received note
 
-## 1. Build The Required Binaries
+## 1. Install The Required Binaries
 
 From the repo root:
 
 ```bash
-cargo build --release -p tzel-services --bin tzel-operator
-cargo build --release -p tzel-rollup-kernel --bin octez_kernel_message --bin verified_bridge_fixture_message
-cargo build --release -p tzel-wallet-app --bin tzel-wallet
-cargo build --release --bin reprove
-scarb build
+./scripts/install_tzel_binaries.sh --build-only
+
+sudo ./scripts/install_tzel_binaries.sh \
+  --skip-build \
+  --prefix /usr/local \
+  --executables-dir /opt/tzel/cairo/target/dev
 ```
 
 The wallet commands below assume:
 
-- `target/release/tzel-wallet`
-- `target/release/reprove`
-- Cairo executables in `cairo/target/dev`
+- `/usr/local/bin/tzel-wallet`
+- `/usr/local/bin/reprove`
+- `/usr/local/bin/octez_kernel_message`
+- `/usr/local/bin/verified_bridge_fixture_message`
+- Cairo executables in `/opt/tzel/cairo/target/dev`
 
 ## 2. Bring Up The Public Operator Box
 
@@ -97,7 +100,7 @@ Extract the verifier metadata from the checked-in verified fixture:
 
 ```bash
 export FIXTURE_JSON=tezos/rollup-kernel/testdata/verified_bridge_flow.json
-META_JSON="$(target/release/verified_bridge_fixture_message metadata "$FIXTURE_JSON")"
+META_JSON="$(/usr/local/bin/verified_bridge_fixture_message metadata "$FIXTURE_JSON")"
 
 export AUTH_DOMAIN="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["auth_domain"])' <<<"$META_JSON")"
 export SHIELD_HASH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["shield_program_hash"])' <<<"$META_JSON")"
@@ -108,7 +111,7 @@ export UNSHIELD_HASH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)[
 Send `configure-verifier`:
 
 ```bash
-MSG_HEX="$(target/release/octez_kernel_message configure-verifier \
+MSG_HEX="$(/usr/local/bin/octez_kernel_message configure-verifier \
   "$ROLLUP_ADDRESS" \
   "$AUTH_DOMAIN" \
   "$SHIELD_HASH" \
@@ -122,7 +125,7 @@ octez-client -d "$CLIENT_DIR" -E "$NODE_ENDPOINT" \
 Send `configure-bridge`:
 
 ```bash
-MSG_HEX="$(target/release/octez_kernel_message configure-bridge \
+MSG_HEX="$(/usr/local/bin/octez_kernel_message configure-bridge \
   "$ROLLUP_ADDRESS" \
   "$BRIDGE_TICKETER")"
 
@@ -166,14 +169,14 @@ cd /tmp/tzel-shadownet-live
 Create wallet files:
 
 ```bash
-/home/coder/workspace/tzel/target/release/tzel-wallet --wallet alice.wallet init
-/home/coder/workspace/tzel/target/release/tzel-wallet --wallet bob.wallet init
+/usr/local/bin/tzel-wallet --wallet alice.wallet init
+/usr/local/bin/tzel-wallet --wallet bob.wallet init
 ```
 
 Create Shadownet profiles:
 
 ```bash
-/home/coder/workspace/tzel/target/release/tzel-wallet \
+/usr/local/bin/tzel-wallet \
   --wallet alice.wallet \
   profile init-shadownet \
   --rollup-node-url http://127.0.0.1:28944 \
@@ -183,7 +186,7 @@ Create Shadownet profiles:
   --source-alias "$SOURCE_ALIAS" \
   --public-account alice
 
-/home/coder/workspace/tzel/target/release/tzel-wallet \
+/usr/local/bin/tzel-wallet \
   --wallet bob.wallet \
   profile init-shadownet \
   --rollup-node-url http://127.0.0.1:28944 \
@@ -204,7 +207,7 @@ Notes:
 Deposit into the bridge for Alice’s public rollup account:
 
 ```bash
-/home/coder/workspace/tzel/target/release/tzel-wallet \
+/usr/local/bin/tzel-wallet \
   --wallet alice.wallet \
   deposit \
   --amount 300000 \
@@ -214,7 +217,7 @@ Deposit into the bridge for Alice’s public rollup account:
 The wallet prints an L1 operation hash. Wait for it to land, then poll:
 
 ```bash
-/home/coder/workspace/tzel/target/release/tzel-wallet --wallet alice.wallet balance
+/usr/local/bin/tzel-wallet --wallet alice.wallet balance
 ```
 
 Do not continue until Alice shows a non-zero line like:
@@ -228,10 +231,10 @@ Public rollup balance (alice): 300000
 Shield into a self-address first:
 
 ```bash
-/home/coder/workspace/tzel/target/release/tzel-wallet \
+/usr/local/bin/tzel-wallet \
   --wallet alice.wallet \
-  --reprove-bin /home/coder/workspace/tzel/target/release/reprove \
-  --executables-dir /home/coder/workspace/tzel/cairo/target/dev \
+  --reprove-bin /usr/local/bin/reprove \
+  --executables-dir /opt/tzel/cairo/target/dev \
   shield \
   --amount 200000
 ```
@@ -244,7 +247,7 @@ Expected output includes:
 Track the submission:
 
 ```bash
-/home/coder/workspace/tzel/target/release/tzel-wallet \
+/usr/local/bin/tzel-wallet \
   --wallet alice.wallet \
   status \
   --submission-id sub-REPLACE_ME
@@ -253,8 +256,8 @@ Track the submission:
 Keep polling until the operator reports a final state. Then sync Alice:
 
 ```bash
-/home/coder/workspace/tzel/target/release/tzel-wallet --wallet alice.wallet sync
-/home/coder/workspace/tzel/target/release/tzel-wallet --wallet alice.wallet balance
+/usr/local/bin/tzel-wallet --wallet alice.wallet sync
+/usr/local/bin/tzel-wallet --wallet alice.wallet balance
 ```
 
 Acceptance:
@@ -267,7 +270,7 @@ Acceptance:
 `receive` prints one label line followed by JSON. Save the JSON part to a file:
 
 ```bash
-/home/coder/workspace/tzel/target/release/tzel-wallet \
+/usr/local/bin/tzel-wallet \
   --wallet bob.wallet \
   receive | sed -n '2,$p' > bob-address.json
 ```
@@ -281,10 +284,10 @@ cat bob-address.json
 ## 9. Send A Shielded Transfer From Alice To Bob
 
 ```bash
-/home/coder/workspace/tzel/target/release/tzel-wallet \
+/usr/local/bin/tzel-wallet \
   --wallet alice.wallet \
-  --reprove-bin /home/coder/workspace/tzel/target/release/reprove \
-  --executables-dir /home/coder/workspace/tzel/cairo/target/dev \
+  --reprove-bin /usr/local/bin/reprove \
+  --executables-dir /opt/tzel/cairo/target/dev \
   send \
   --to bob-address.json \
   --amount 50000
@@ -298,7 +301,7 @@ Expected output includes:
 Poll operator status until final:
 
 ```bash
-/home/coder/workspace/tzel/target/release/tzel-wallet \
+/usr/local/bin/tzel-wallet \
   --wallet alice.wallet \
   status \
   --submission-id sub-REPLACE_ME
@@ -307,11 +310,11 @@ Poll operator status until final:
 Then sync both wallets:
 
 ```bash
-/home/coder/workspace/tzel/target/release/tzel-wallet --wallet alice.wallet sync
-/home/coder/workspace/tzel/target/release/tzel-wallet --wallet bob.wallet sync
+/usr/local/bin/tzel-wallet --wallet alice.wallet sync
+/usr/local/bin/tzel-wallet --wallet bob.wallet sync
 
-/home/coder/workspace/tzel/target/release/tzel-wallet --wallet alice.wallet balance
-/home/coder/workspace/tzel/target/release/tzel-wallet --wallet bob.wallet balance
+/usr/local/bin/tzel-wallet --wallet alice.wallet balance
+/usr/local/bin/tzel-wallet --wallet bob.wallet balance
 ```
 
 Acceptance:

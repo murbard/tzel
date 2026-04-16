@@ -49,6 +49,12 @@ target/release/sp-client balance
 ./apps/prover/bench.sh
 ```
 
+For deployment-oriented installs with standard paths instead of a workspace checkout:
+
+- operator box: `ops/shadownet/README.md`
+- prover layout: `ops/prover/README.md`
+- shared binary installer: `./scripts/install_tzel_binaries.sh --prefix /usr/local --executables-dir /opt/tzel/cairo/target/dev`
+
 > **WARNING:** The ledger now refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `cairo/target/dev`). `--trust-me-bro` is never appropriate for real value.
 >
 > **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, and memo-hash checks. Its public-balance layer intentionally uses submitted strings such as `"alice"` as stand-ins for chain-native caller identity. It is not a network-authenticated wallet service and should not be exposed as a real public endpoint.
@@ -168,7 +174,7 @@ It currently:
 - persists path-addressed durable state for notes, bridge balances, roots, nullifiers, and the commitment-tree frontier
 - verifies proofs through the shared verifier path without linking prover code
 
-The current bridge sketch in [`minimal_tez_bridge.md`](/home/arthurb/src/starkprivacy/minimal_tez_bridge.md)
+The current bridge sketch in `minimal_tez_bridge.md`
 is informative only.
 
 Build it with:

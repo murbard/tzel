@@ -53,7 +53,7 @@ This is still intentionally narrower than the eventual TzEL rollup
 integration. The kernel now reuses the shared state-transition logic and
 verifies proofs in-kernel without linking prover code.
 
-The bridge notes in [`minimal_tez_bridge.md`](/home/arthurb/src/starkprivacy/minimal_tez_bridge.md)
+The bridge notes in `minimal_tez_bridge.md`
 are informative background for the eventual Tezos ticket plumbing, not a
 normative protocol specification.
 
@@ -80,7 +80,7 @@ type:
 Originating it as plain `bytes` is sufficient for external messages, but it does
 not allow the L1 ticketer contract to deliver ticket transfers into the inbox.
 The minimal tez bridge contract validated for this flow lives at
-[`tezos/tez_bridge_ticketer.tz`](/home/coder/workspace/tzel/tezos/tez_bridge_ticketer.tz).
+`tezos/tez_bridge_ticketer.tz`.
 
 Local Octez sandbox smokes:
 
