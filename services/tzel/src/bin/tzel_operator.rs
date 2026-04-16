@@ -43,6 +43,8 @@ struct Cli {
     state_dir: String,
     #[arg(long, default_value_t = 4096)]
     direct_max_message_bytes: usize,
+    #[arg(long)]
+    dal_max_chunk_bytes: Option<usize>,
     #[arg(long, default_value = "octez-client")]
     octez_client_bin: String,
     #[arg(long)]
@@ -67,6 +69,7 @@ struct OperatorConfig {
     source_alias: String,
     state_dir: PathBuf,
     direct_max_message_bytes: usize,
+    dal_max_chunk_bytes: Option<usize>,
     octez_client_bin: String,
     octez_client_dir: Option<String>,
     octez_node_endpoint: Option<String>,
@@ -79,6 +82,10 @@ struct OperatorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct StoredSubmission {
     submission: RollupSubmission,
+    #[serde(default, with = "tzel_core::hex_bytes_opt")]
+    payload: Option<Vec<u8>>,
+    #[serde(default)]
+    chunk_attempts: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,6 +106,17 @@ struct DalSlotPublishResp {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum DalSlotStatusResp {
+    Plain(String),
+    Detailed {
+        kind: String,
+        #[allow(dead_code)]
+        attestation_lag: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct BlockHeaderResp {
     level: i32,
 }
@@ -109,6 +127,8 @@ struct ReconcileSummary {
     updated: usize,
     errors: usize,
 }
+
+const MAX_DAL_CHUNK_ATTEMPTS: u32 = 8;
 
 fn main() {
     let cli = Cli::parse();
@@ -129,6 +149,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             source_alias: cli.source_alias,
             state_dir,
             direct_max_message_bytes: cli.direct_max_message_bytes,
+            dal_max_chunk_bytes: cli.dal_max_chunk_bytes.filter(|value| *value > 0),
             octez_client_bin: cli.octez_client_bin,
             octez_client_dir: cli.octez_client_dir,
             octez_node_endpoint: cli.octez_node_endpoint,
@@ -195,13 +216,15 @@ async fn get_rollup_submission(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<SubmitRollupMessageResp>, (StatusCode, String)> {
-    let mut submission =
-        load_submission(&state.config.state_dir, &id).map_err(map_load_submission_err)?;
-    submission = maybe_advance_submission(&state.config, submission)
+    let mut stored =
+        load_stored_submission(&state.config.state_dir, &id).map_err(map_load_submission_err)?;
+    stored = maybe_advance_submission(&state.config, stored)
         .map_err(|e| (StatusCode::BAD_GATEWAY, e))?;
-    persist_submission(&state.config, &submission)
+    persist_submission(&state.config, &stored)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(SubmitRollupMessageResp { submission }))
+    Ok(Json(SubmitRollupMessageResp {
+        submission: stored.submission,
+    }))
 }
 
 fn map_load_submission_err(err: String) -> (StatusCode, String) {
@@ -222,8 +245,8 @@ fn reconcile_pending_submissions(config: &OperatorConfig) -> Result<ReconcileSum
         else {
             continue;
         };
-        let submission = match load_submission(&config.state_dir, &id) {
-            Ok(submission) => submission,
+        let stored = match load_stored_submission(&config.state_dir, &id) {
+            Ok(stored) => stored,
             Err(err) => {
                 summary.errors += 1;
                 eprintln!("reconciler: load submission {}: {}", id, err);
@@ -231,14 +254,14 @@ fn reconcile_pending_submissions(config: &OperatorConfig) -> Result<ReconcileSum
             }
         };
         if !matches!(
-            submission.status,
+            stored.submission.status,
             RollupSubmissionStatus::CommitmentIncluded | RollupSubmissionStatus::Attested
         ) {
             continue;
         }
         summary.visited += 1;
-        let original = submission.clone();
-        match maybe_advance_submission(config, submission) {
+        let original = stored.clone();
+        match maybe_advance_submission(config, stored) {
             Ok(updated) => {
                 if updated != original {
                     persist_submission(config, &updated)?;
@@ -269,13 +292,18 @@ fn submission_paths(state_dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(paths)
 }
 
-fn load_submission(state_dir: &Path, id: &str) -> Result<RollupSubmission, String> {
+fn load_stored_submission(state_dir: &Path, id: &str) -> Result<StoredSubmission, String> {
     let path = submission_path(state_dir, id);
     let body =
         std::fs::read_to_string(&path).map_err(|e| format!("read submission {}: {}", id, e))?;
-    let stored: StoredSubmission =
+    let mut stored: StoredSubmission =
         serde_json::from_str(&body).map_err(|e| format!("parse submission {}: {}", id, e))?;
-    Ok(stored.submission)
+    align_chunk_attempts(&mut stored);
+    Ok(stored)
+}
+
+fn load_submission(state_dir: &Path, id: &str) -> Result<RollupSubmission, String> {
+    load_stored_submission(state_dir, id).map(|stored| stored.submission)
 }
 
 fn process_submission(
@@ -284,63 +312,67 @@ fn process_submission(
 ) -> Result<RollupSubmission, String> {
     let id = next_submission_id(config);
     let targeted_bytes = encode_targeted_rollup_message(&req.rollup_address, &req.payload)?;
-    let mut submission = RollupSubmission {
-        id,
-        kind: req.kind,
-        rollup_address: req.rollup_address.clone(),
-        status: RollupSubmissionStatus::PendingDal,
-        transport: RollupSubmissionTransport::Dal,
-        operation_hash: None,
-        dal_chunks: vec![],
-        commitment: None,
-        published_level: None,
-        slot_index: None,
-        payload_hash: Some(hex::encode(hash(&req.payload))),
-        payload_len: req.payload.len(),
-        detail: None,
+    let mut stored = StoredSubmission {
+        submission: RollupSubmission {
+            id,
+            kind: req.kind,
+            rollup_address: req.rollup_address.clone(),
+            status: RollupSubmissionStatus::PendingDal,
+            transport: RollupSubmissionTransport::Dal,
+            operation_hash: None,
+            dal_chunks: vec![],
+            commitment: None,
+            published_level: None,
+            slot_index: None,
+            payload_hash: Some(hex::encode(hash(&req.payload))),
+            payload_len: req.payload.len(),
+            detail: None,
+        },
+        payload: Some(req.payload.clone()),
+        chunk_attempts: vec![],
     };
 
     if targeted_bytes.len() <= config.direct_max_message_bytes {
         match inject_direct_message(config, &targeted_bytes, false) {
             Ok(output) => {
-                submission.status = RollupSubmissionStatus::SubmittedToL1;
-                submission.transport = RollupSubmissionTransport::DirectInbox;
-                submission.operation_hash = extract_operation_hash(&output);
-                submission.detail = Some(output);
-                persist_submission(config, &submission)?;
-                return Ok(submission);
+                stored.submission.status = RollupSubmissionStatus::SubmittedToL1;
+                stored.submission.transport = RollupSubmissionTransport::DirectInbox;
+                stored.submission.operation_hash = extract_operation_hash(&output);
+                stored.submission.detail = Some(output);
+                persist_submission(config, &stored)?;
+                return Ok(stored.submission);
             }
             Err(err) => {
-                submission.status = RollupSubmissionStatus::Failed;
-                submission.transport = RollupSubmissionTransport::DirectInbox;
-                submission.detail = Some(err.clone());
-                persist_submission(config, &submission)?;
+                stored.submission.status = RollupSubmissionStatus::Failed;
+                stored.submission.transport = RollupSubmissionTransport::DirectInbox;
+                stored.submission.detail = Some(err.clone());
+                persist_submission(config, &stored)?;
                 return Err(err);
             }
         }
     }
 
-    submission.transport = RollupSubmissionTransport::Dal;
+    stored.submission.transport = RollupSubmissionTransport::Dal;
     if config.dal_node_endpoint.is_none() {
-        submission.status = RollupSubmissionStatus::Failed;
-        submission.detail = Some(format!(
+        stored.submission.status = RollupSubmissionStatus::Failed;
+        stored.submission.detail = Some(format!(
             "message is {} bytes after framing, above direct inbox limit {}; DAL node endpoint is not configured",
             targeted_bytes.len(),
             config.direct_max_message_bytes
         ));
-        persist_submission(config, &submission)?;
-        return Ok(submission);
+        persist_submission(config, &stored)?;
+        return Ok(stored.submission);
     }
 
-    match publish_large_message_to_dal(config, &req, &mut submission) {
+    match publish_large_message_to_dal(config, &req.payload, &mut stored) {
         Ok(()) => {
-            persist_submission(config, &submission)?;
-            Ok(submission)
+            persist_submission(config, &stored)?;
+            Ok(stored.submission)
         }
         Err(err) => {
-            submission.status = RollupSubmissionStatus::Failed;
-            submission.detail = Some(err.clone());
-            persist_submission(config, &submission)?;
+            stored.submission.status = RollupSubmissionStatus::Failed;
+            stored.submission.detail = Some(err.clone());
+            persist_submission(config, &stored)?;
             Err(err)
         }
     }
@@ -348,70 +380,110 @@ fn process_submission(
 
 fn maybe_advance_submission(
     config: &OperatorConfig,
-    mut submission: RollupSubmission,
-) -> Result<RollupSubmission, String> {
+    mut stored: StoredSubmission,
+) -> Result<StoredSubmission, String> {
     if !matches!(
-        submission.status,
+        stored.submission.status,
         RollupSubmissionStatus::CommitmentIncluded | RollupSubmissionStatus::Attested
     ) {
-        return Ok(submission);
+        return Ok(stored);
     }
-    if submission.dal_chunks.is_empty() {
-        return Ok(submission);
+    if stored.submission.dal_chunks.is_empty() {
+        return Ok(stored);
     }
     let Some(dal_node_endpoint) = config.dal_node_endpoint.as_deref() else {
-        return Ok(submission);
+        return Ok(stored);
     };
 
-    let mut status_lines = Vec::with_capacity(submission.dal_chunks.len());
-    for chunk in &submission.dal_chunks {
+    align_chunk_attempts(&mut stored);
+    let mut status_lines = Vec::with_capacity(stored.submission.dal_chunks.len());
+    let mut unattested_indices = Vec::new();
+    let mut waiting_for_attestation = false;
+    for (idx, chunk) in stored.submission.dal_chunks.iter().enumerate() {
         let status =
             fetch_dal_slot_status(dal_node_endpoint, chunk.published_level, chunk.slot_index)?;
         status_lines.push(format!(
-            "chunk {} at level {} => {}",
+            "chunk[{idx}] slot {} at level {} => {}",
             chunk.slot_index, chunk.published_level, status
         ));
         if status == "unattested" {
-            submission.status = RollupSubmissionStatus::Failed;
-            submission.detail = Some(format!(
-                "DAL attestation failed\n{}",
-                status_lines.join("\n")
-            ));
-            return Ok(submission);
-        }
-        if status != "attested" {
-            submission.status = RollupSubmissionStatus::CommitmentIncluded;
-            submission.detail = Some(format!(
-                "Waiting for DAL attestation\n{}",
-                status_lines.join("\n")
-            ));
-            return Ok(submission);
+            unattested_indices.push(idx);
+        } else if status != "attested" {
+            waiting_for_attestation = true;
         }
     }
 
-    submission.status = RollupSubmissionStatus::Attested;
-    let pointer = dal_pointer_from_submission(&submission)?;
+    if !unattested_indices.is_empty() {
+        let payload = stored
+            .payload
+            .as_deref()
+            .ok_or_else(|| "DAL submission payload is unavailable for retry".to_string())?;
+        let mut republished_lines = Vec::with_capacity(unattested_indices.len());
+        for idx in unattested_indices {
+            let attempts = stored.chunk_attempts.get(idx).copied().unwrap_or(1);
+            if attempts >= MAX_DAL_CHUNK_ATTEMPTS {
+                stored.submission.status = RollupSubmissionStatus::Failed;
+                stored.submission.detail = Some(format!(
+                    "DAL attestation failed after {} attempts\n{}",
+                    attempts,
+                    status_lines.join("\n")
+                ));
+                return Ok(stored);
+            }
+            let chunk_bytes = submission_chunk_bytes(payload, &stored.submission, idx)?;
+            let published_chunk = publish_dal_chunk(config, chunk_bytes)?;
+            republished_lines.push(format!(
+                "republished chunk[{idx}] attempt {} -> slot {} level {}",
+                attempts + 1,
+                published_chunk.slot_index,
+                published_chunk.published_level
+            ));
+            stored.submission.dal_chunks[idx] = published_chunk;
+            stored.chunk_attempts[idx] = attempts + 1;
+        }
+        update_submission_commitment_summary(&mut stored.submission)?;
+        stored.submission.status = RollupSubmissionStatus::CommitmentIncluded;
+        stored.submission.detail = Some(format!(
+            "Republished {} unattested DAL chunk(s)\n{}\n{}",
+            republished_lines.len(),
+            republished_lines.join("\n"),
+            status_lines.join("\n")
+        ));
+        return Ok(stored);
+    }
+
+    if waiting_for_attestation {
+        stored.submission.status = RollupSubmissionStatus::CommitmentIncluded;
+        stored.submission.detail = Some(format!(
+            "Waiting for DAL attestation\n{}",
+            status_lines.join("\n")
+        ));
+        return Ok(stored);
+    }
+
+    stored.submission.status = RollupSubmissionStatus::Attested;
+    let pointer = dal_pointer_from_submission(&stored.submission)?;
     let pointer_payload = encode_kernel_inbox_message(&KernelInboxMessage::DalPointer(pointer))?;
     let targeted_bytes =
-        encode_targeted_rollup_message(&submission.rollup_address, &pointer_payload)?;
+        encode_targeted_rollup_message(&stored.submission.rollup_address, &pointer_payload)?;
     // The operator only needs successful injection here; callers can wait for
     // inclusion by tracking the returned operation hash and baking/progressing
     // the chain as needed.
     let output = inject_direct_message(config, &targeted_bytes, false)?;
-    submission.status = RollupSubmissionStatus::SubmittedToL1;
-    submission.operation_hash = extract_operation_hash(&output);
-    submission.detail = Some(format!(
+    stored.submission.status = RollupSubmissionStatus::SubmittedToL1;
+    stored.submission.operation_hash = extract_operation_hash(&output);
+    stored.submission.detail = Some(format!(
         "All DAL chunks attested\n{}\n{}",
         status_lines.join("\n"),
         output
     ));
-    Ok(submission)
+    Ok(stored)
 }
 
 fn publish_large_message_to_dal(
     config: &OperatorConfig,
-    req: &SubmitRollupMessageReq,
-    submission: &mut RollupSubmission,
+    payload: &[u8],
+    stored: &mut StoredSubmission,
 ) -> Result<(), String> {
     let dal_node_endpoint = config
         .dal_node_endpoint
@@ -429,28 +501,143 @@ fn publish_large_message_to_dal(
         .as_deref()
         .ok_or_else(|| "octez node endpoint is required for DAL submissions".to_string())?;
 
-    for chunk in req.payload.chunks(protocol.cryptobox_parameters.slot_size) {
-        let slot_index = select_slot_index(config, protocol.number_of_slots)?;
-        let publish = post_dal_slot(dal_node_endpoint, slot_index, chunk)?;
-        let output = publish_dal_commitment(
+    let chunk_size = config
+        .dal_max_chunk_bytes
+        .map(|value| value.min(protocol.cryptobox_parameters.slot_size))
+        .unwrap_or(protocol.cryptobox_parameters.slot_size);
+    if chunk_size == 0 {
+        return Err("DAL chunk size must be greater than zero".into());
+    }
+
+    for chunk in payload.chunks(chunk_size) {
+        let published_chunk = publish_dal_chunk_with_protocol(
+            config,
+            dal_node_endpoint,
+            octez_node_endpoint,
+            protocol.number_of_slots,
+            chunk,
+        )?;
+        stored.submission.dal_chunks.push(published_chunk);
+        stored.chunk_attempts.push(1);
+    }
+
+    update_submission_commitment_summary(&mut stored.submission)?;
+    stored.submission.operation_hash = stored
+        .submission
+        .dal_chunks
+        .last()
+        .and_then(|chunk| chunk.operation_hash.clone());
+    stored.submission.status = RollupSubmissionStatus::CommitmentIncluded;
+    stored.submission.detail = Some(format!(
+        "Published {} DAL chunk(s); waiting for attestation",
+        stored.submission.dal_chunks.len()
+    ));
+    Ok(())
+}
+
+fn publish_dal_chunk(config: &OperatorConfig, payload: &[u8]) -> Result<RollupDalChunk, String> {
+    let dal_node_endpoint = config
+        .dal_node_endpoint
+        .as_deref()
+        .ok_or_else(|| "DAL node endpoint is not configured".to_string())?;
+    let protocol = fetch_dal_protocol_parameters(dal_node_endpoint)?;
+    if protocol.number_of_slots == 0 {
+        return Err("DAL protocol reported zero slots".into());
+    }
+    let octez_node_endpoint = config
+        .octez_node_endpoint
+        .as_deref()
+        .ok_or_else(|| "octez node endpoint is required for DAL submissions".to_string())?;
+    publish_dal_chunk_with_protocol(
+        config,
+        dal_node_endpoint,
+        octez_node_endpoint,
+        protocol.number_of_slots,
+        payload,
+    )
+}
+
+fn publish_dal_chunk_with_protocol(
+    config: &OperatorConfig,
+    dal_node_endpoint: &str,
+    octez_node_endpoint: &str,
+    number_of_slots: u64,
+    payload: &[u8],
+) -> Result<RollupDalChunk, String> {
+    let mut last_slot_error = None;
+    for _attempt in 0..number_of_slots {
+        let slot_index = select_slot_index(config, number_of_slots)?;
+        let publish = post_dal_slot(dal_node_endpoint, slot_index, payload)?;
+        let output = match publish_dal_commitment(
             config,
             &publish.commitment,
             slot_index,
             &publish.commitment_proof,
-        )?;
+        ) {
+            Ok(output) => output,
+            Err(err) if is_slot_header_collision(&err) => {
+                last_slot_error = Some(err);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         let operation_hash = extract_operation_hash(&output);
         let block_hash = extract_block_hash(&output)
             .ok_or_else(|| format!("missing block hash in dal commitment output: {}", output))?;
         let published_level = fetch_block_level(octez_node_endpoint, &block_hash)?;
-        submission.dal_chunks.push(RollupDalChunk {
+        return Ok(RollupDalChunk {
             slot_index,
             published_level,
-            payload_len: chunk.len(),
+            payload_len: payload.len(),
             commitment: publish.commitment,
             operation_hash,
         });
     }
+    Err(last_slot_error
+        .unwrap_or_else(|| "failed to publish DAL chunk: no free slot index available".into()))
+}
 
+fn align_chunk_attempts(stored: &mut StoredSubmission) {
+    if stored.chunk_attempts.len() < stored.submission.dal_chunks.len() {
+        stored
+            .chunk_attempts
+            .resize(stored.submission.dal_chunks.len(), 1);
+    } else if stored.chunk_attempts.len() > stored.submission.dal_chunks.len() {
+        stored
+            .chunk_attempts
+            .truncate(stored.submission.dal_chunks.len());
+    }
+}
+
+fn submission_chunk_bytes<'a>(
+    payload: &'a [u8],
+    submission: &RollupSubmission,
+    index: usize,
+) -> Result<&'a [u8], String> {
+    if index >= submission.dal_chunks.len() {
+        return Err(format!("chunk index {} out of range", index));
+    }
+    let start: usize = submission
+        .dal_chunks
+        .iter()
+        .take(index)
+        .map(|chunk| chunk.payload_len)
+        .sum();
+    let end = start
+        .checked_add(submission.dal_chunks[index].payload_len)
+        .ok_or_else(|| "chunk range overflowed".to_string())?;
+    if end > payload.len() {
+        return Err(format!(
+            "chunk {} exceeds payload length: end={} payload={}",
+            index,
+            end,
+            payload.len()
+        ));
+    }
+    Ok(&payload[start..end])
+}
+
+fn update_submission_commitment_summary(submission: &mut RollupSubmission) -> Result<(), String> {
     let first = submission
         .dal_chunks
         .first()
@@ -458,21 +645,16 @@ fn publish_large_message_to_dal(
     submission.commitment = Some(first.commitment.clone());
     submission.published_level = Some(first.published_level);
     submission.slot_index = Some(first.slot_index);
-    submission.operation_hash = submission
-        .dal_chunks
-        .last()
-        .and_then(|chunk| chunk.operation_hash.clone());
-    submission.status = RollupSubmissionStatus::CommitmentIncluded;
-    submission.detail = Some(format!(
-        "Published {} DAL chunk(s); waiting for attestation",
-        submission.dal_chunks.len()
-    ));
     Ok(())
 }
 
 fn select_slot_index(config: &OperatorConfig, number_of_slots: u64) -> Result<u16, String> {
     let slot = config.slot_counter.fetch_add(1, Ordering::Relaxed) % number_of_slots;
     u16::try_from(slot).map_err(|_| format!("slot index {} does not fit in u16", slot))
+}
+
+fn is_slot_header_collision(err: &str) -> bool {
+    err.to_ascii_lowercase().contains("already proposed")
 }
 
 fn fetch_dal_protocol_parameters(endpoint: &str) -> Result<DalProtocolParametersResp, String> {
@@ -567,12 +749,19 @@ fn fetch_dal_slot_status(
         published_level,
         slot_index
     );
-    let resp = ureq::get(&url)
-        .call()
-        .map_err(|e| format!("DAL slot status request failed: {}", e))?;
-    resp.into_body()
+    let resp = match ureq::get(&url).call() {
+        Ok(resp) => resp,
+        Err(ureq::Error::StatusCode(404)) => return Ok("waiting_attestation".into()),
+        Err(err) => return Err(format!("DAL slot status request failed: {}", err)),
+    };
+    let parsed: DalSlotStatusResp = resp
+        .into_body()
         .read_json()
-        .map_err(|e| format!("parse DAL slot status: {}", e))
+        .map_err(|e| format!("parse DAL slot status: {}", e))?;
+    Ok(match parsed {
+        DalSlotStatusResp::Plain(status) => status,
+        DalSlotStatusResp::Detailed { kind, .. } => kind,
+    })
 }
 
 fn dal_pointer_from_submission(
@@ -752,19 +941,14 @@ fn submission_path(state_dir: &Path, id: &str) -> PathBuf {
     submissions_dir(state_dir).join(format!("{}.json", id))
 }
 
-fn persist_submission(
-    config: &OperatorConfig,
-    submission: &RollupSubmission,
-) -> Result<(), String> {
+fn persist_submission(config: &OperatorConfig, stored: &StoredSubmission) -> Result<(), String> {
     std::fs::create_dir_all(submissions_dir(&config.state_dir))
         .map_err(|e| format!("create submissions dir: {}", e))?;
-    let path = submission_path(&config.state_dir, &submission.id);
+    let path = submission_path(&config.state_dir, &stored.submission.id);
     let tmp = PathBuf::from(format!("{}.tmp", path.display()));
     let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {}", e))?;
-    let body = serde_json::to_string_pretty(&StoredSubmission {
-        submission: submission.clone(),
-    })
-    .map_err(|e| format!("serialize submission: {}", e))?;
+    let body =
+        serde_json::to_string_pretty(stored).map_err(|e| format!("serialize submission: {}", e))?;
     file.write_all(body.as_bytes())
         .map_err(|e| format!("write tmp: {}", e))?;
     file.sync_all().map_err(|e| format!("fsync tmp: {}", e))?;
@@ -794,6 +978,7 @@ mod tests {
             source_alias: "alice".into(),
             state_dir,
             direct_max_message_bytes: 1024,
+            dal_max_chunk_bytes: None,
             octez_client_bin: script.display().to_string(),
             octez_client_dir: None,
             octez_node_endpoint: Some("http://octez-node.invalid".into()),
@@ -801,6 +986,18 @@ mod tests {
             octez_protocol: None,
             id_counter: AtomicU64::new(0),
             slot_counter: AtomicU64::new(0),
+        }
+    }
+
+    fn stored_submission(
+        submission: RollupSubmission,
+        payload: Option<Vec<u8>>,
+        chunk_attempts: &[u32],
+    ) -> StoredSubmission {
+        StoredSubmission {
+            submission,
+            payload,
+            chunk_attempts: chunk_attempts.to_vec(),
         }
     }
 
@@ -822,7 +1019,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
-            for stream in listener.incoming().take(routes.len()) {
+            for stream in listener.incoming().take(routes.len().max(32)) {
                 let mut stream = stream.unwrap();
                 let mut buffer = [0u8; 4096];
                 let read = stream.read(&mut buffer).unwrap_or(0);
@@ -909,14 +1106,15 @@ mod tests {
         let endpoint = spawn_mock_http_server(HashMap::from([
             (
                 "/levels/101/slots/3/status".into(),
-                (200, "\"attested\"".into()),
+                (200, "{\"kind\":\"attested\",\"attestation_lag\":8}".into()),
             ),
             (
                 "/levels/102/slots/4/status".into(),
-                (200, "\"attested\"".into()),
+                (200, "{\"kind\":\"attested\",\"attestation_lag\":8}".into()),
             ),
         ]));
-        config.dal_node_endpoint = Some(endpoint);
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
 
         let submission = RollupSubmission {
             id: "sub-1".into(),
@@ -949,13 +1147,18 @@ mod tests {
             detail: None,
         };
 
-        let advanced = maybe_advance_submission(&config, submission).unwrap();
-        assert_eq!(advanced.status, RollupSubmissionStatus::SubmittedToL1);
+        let advanced =
+            maybe_advance_submission(&config, stored_submission(submission, None, &[])).unwrap();
         assert_eq!(
-            advanced.operation_hash.as_deref(),
+            advanced.submission.status,
+            RollupSubmissionStatus::SubmittedToL1
+        );
+        assert_eq!(
+            advanced.submission.operation_hash.as_deref(),
             Some("ooPointerHash123456789ABCDEFG")
         );
         assert!(advanced
+            .submission
             .detail
             .as_deref()
             .unwrap()
@@ -977,7 +1180,8 @@ mod tests {
             "/levels/101/slots/3/status".into(),
             (200, "\"waiting_attestation\"".into()),
         )]));
-        config.dal_node_endpoint = Some(endpoint);
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
 
         let submission = RollupSubmission {
             id: "sub-2".into(),
@@ -1001,10 +1205,19 @@ mod tests {
             detail: None,
         };
 
-        let advanced = maybe_advance_submission(&config, submission.clone()).unwrap();
-        assert_eq!(advanced.status, RollupSubmissionStatus::CommitmentIncluded);
-        assert_eq!(advanced.operation_hash, submission.operation_hash);
+        let advanced =
+            maybe_advance_submission(&config, stored_submission(submission.clone(), None, &[]))
+                .unwrap();
+        assert_eq!(
+            advanced.submission.status,
+            RollupSubmissionStatus::CommitmentIncluded
+        );
+        assert_eq!(
+            advanced.submission.operation_hash,
+            submission.operation_hash
+        );
         assert!(advanced
+            .submission
             .detail
             .as_deref()
             .unwrap()
@@ -1012,16 +1225,86 @@ mod tests {
     }
 
     #[test]
-    fn unattested_dal_submission_fails_terminally() {
+    fn missing_dal_status_endpoint_is_treated_as_waiting() {
         let script_dir = make_client_script(
             "#!/bin/sh\necho 'Operation hash is ooUnexpected123456789ABCDEFG'\n",
         );
         let mut config = config_with_client(&script_dir.path().join("octez-client"));
         let endpoint = spawn_mock_http_server(HashMap::from([(
-            "/levels/101/slots/3/status".into(),
-            (200, "\"unattested\"".into()),
+            "/still-alive".into(),
+            (200, "\"ok\"".into()),
         )]));
-        config.dal_node_endpoint = Some(endpoint);
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let submission = RollupSubmission {
+            id: "sub-missing".into(),
+            kind: RollupSubmissionKind::Shield,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            status: RollupSubmissionStatus::CommitmentIncluded,
+            transport: RollupSubmissionTransport::Dal,
+            operation_hash: Some("ooCommitmentHash123456789ABCDEFG".into()),
+            dal_chunks: vec![RollupDalChunk {
+                slot_index: 3,
+                published_level: 101,
+                payload_len: 128,
+                commitment: "commitment-1".into(),
+                operation_hash: Some("ooChunkOne123456789ABCDEFG".into()),
+            }],
+            commitment: Some("commitment-1".into()),
+            published_level: Some(101),
+            slot_index: Some(3),
+            payload_hash: Some(hex::encode([0x57; 32])),
+            payload_len: 128,
+            detail: None,
+        };
+
+        let advanced =
+            maybe_advance_submission(&config, stored_submission(submission, None, &[])).unwrap();
+        assert_eq!(
+            advanced.submission.status,
+            RollupSubmissionStatus::CommitmentIncluded
+        );
+        assert!(advanced
+            .submission
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("waiting_attestation"));
+    }
+
+    #[test]
+    fn unattested_dal_submission_republishes_chunk() {
+        let script_dir = make_client_script(
+            "#!/bin/sh\necho 'Operation hash is ooRetryHash123456789ABCDEFG'\necho 'Operation found in block BLRetryHash123456789ABCDEFG'\n",
+        );
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        let endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/levels/101/slots/3/status".into(),
+                (200, "\"unattested\"".into()),
+            ),
+            (
+                "/protocol_parameters".into(),
+                (
+                    200,
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8}}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=0&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1retry\",\"commitment_proof\":\"proof-retry\"}".into(),
+                ),
+            ),
+            (
+                "/chains/main/blocks/BLRetryHash123456789ABCDEFG/header".into(),
+                (200, "{\"level\":123}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
 
         let submission = RollupSubmission {
             id: "sub-3".into(),
@@ -1045,28 +1328,119 @@ mod tests {
             detail: None,
         };
 
-        let advanced = maybe_advance_submission(&config, submission.clone()).unwrap();
-        assert_eq!(advanced.status, RollupSubmissionStatus::Failed);
-        assert_eq!(advanced.operation_hash, submission.operation_hash);
+        let advanced = maybe_advance_submission(
+            &config,
+            stored_submission(submission.clone(), Some(vec![0x42; 128]), &[1]),
+        )
+        .unwrap();
+        assert_eq!(
+            advanced.submission.status,
+            RollupSubmissionStatus::CommitmentIncluded
+        );
+        assert_eq!(advanced.chunk_attempts, vec![2]);
+        assert_eq!(advanced.submission.dal_chunks[0].slot_index, 0);
+        assert_eq!(advanced.submission.dal_chunks[0].published_level, 123);
         assert!(advanced
+            .submission
             .detail
             .as_deref()
             .unwrap()
-            .contains("DAL attestation failed"));
-        assert!(advanced.detail.as_deref().unwrap().contains("unattested"));
+            .contains("Republished 1 unattested DAL chunk(s)"));
+    }
+
+    #[test]
+    fn unattested_dal_submission_without_payload_fails_terminally() {
+        let script_dir = make_client_script(
+            "#!/bin/sh\necho 'Operation hash is ooUnexpected123456789ABCDEFG'\n",
+        );
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        let endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/levels/101/slots/3/status".into(),
+                (200, "\"unattested\"".into()),
+            ),
+            (
+                "/protocol_parameters".into(),
+                (
+                    200,
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8}}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=0&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1retry2\",\"commitment_proof\":\"proof-retry-2\"}".into(),
+                ),
+            ),
+            (
+                "/chains/main/blocks/BLUnexpected123456789ABCDEFG/header".into(),
+                (200, "{\"level\":202}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let submission = RollupSubmission {
+            id: "sub-3b".into(),
+            kind: RollupSubmissionKind::Shield,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            status: RollupSubmissionStatus::CommitmentIncluded,
+            transport: RollupSubmissionTransport::Dal,
+            operation_hash: Some("ooCommitmentHash123456789ABCDEFG".into()),
+            dal_chunks: vec![RollupDalChunk {
+                slot_index: 3,
+                published_level: 101,
+                payload_len: 128,
+                commitment: "commitment-1".into(),
+                operation_hash: Some("ooChunkOne123456789ABCDEFG".into()),
+            }],
+            commitment: Some("commitment-1".into()),
+            published_level: Some(101),
+            slot_index: Some(3),
+            payload_hash: Some(hex::encode([0x67; 32])),
+            payload_len: 128,
+            detail: None,
+        };
+
+        let err = maybe_advance_submission(&config, stored_submission(submission, None, &[]))
+            .unwrap_err();
+        assert!(err.contains("payload is unavailable"));
     }
 
     #[test]
     fn reconciler_persists_updated_submission_status() {
         let script_dir = make_client_script(
-            "#!/bin/sh\necho 'Operation hash is ooUnexpected123456789ABCDEFG'\n",
+            "#!/bin/sh\necho 'Operation hash is ooUnexpected123456789ABCDEFG'\necho 'Operation found in block BLUnexpected123456789ABCDEFG'\n",
         );
         let mut config = config_with_client(&script_dir.path().join("octez-client"));
-        let endpoint = spawn_mock_http_server(HashMap::from([(
-            "/levels/101/slots/3/status".into(),
-            (200, "\"unattested\"".into()),
-        )]));
-        config.dal_node_endpoint = Some(endpoint);
+        let endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/levels/101/slots/3/status".into(),
+                (200, "\"unattested\"".into()),
+            ),
+            (
+                "/protocol_parameters".into(),
+                (
+                    200,
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8}}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=0&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1reconcile\",\"commitment_proof\":\"proof-reconcile\"}"
+                        .into(),
+                ),
+            ),
+            (
+                "/chains/main/blocks/BLUnexpected123456789ABCDEFG/header".into(),
+                (200, "{\"level\":202}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
 
         let submission = RollupSubmission {
             id: "sub-reconcile".into(),
@@ -1089,7 +1463,11 @@ mod tests {
             payload_len: 128,
             detail: None,
         };
-        persist_submission(&config, &submission).unwrap();
+        persist_submission(
+            &config,
+            &stored_submission(submission, Some(vec![0x77; 128]), &[1]),
+        )
+        .unwrap();
 
         let summary = reconcile_pending_submissions(&config).unwrap();
         assert_eq!(
@@ -1102,11 +1480,123 @@ mod tests {
         );
 
         let updated = load_submission(&config.state_dir, "sub-reconcile").unwrap();
-        assert_eq!(updated.status, RollupSubmissionStatus::Failed);
+        assert_eq!(updated.status, RollupSubmissionStatus::CommitmentIncluded);
         assert!(updated
             .detail
             .as_deref()
             .unwrap()
-            .contains("DAL attestation failed"));
+            .contains("Republished 1 unattested DAL chunk(s)"));
+    }
+
+    #[test]
+    fn dal_chunk_size_can_be_capped_below_protocol_limit() {
+        let script_dir = make_client_script(
+            "#!/bin/sh\necho 'Operation hash is ooChunkHash123456789ABCDEFG'\necho 'Operation found in block BLChunkHash123456789ABCDEFG'\n",
+        );
+        let mut config = config_with_client(&script_dir.path().join("octez-client"));
+        config.direct_max_message_bytes = 1;
+        config.dal_max_chunk_bytes = Some(3);
+        let endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/protocol_parameters".into(),
+                (
+                    200,
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8}}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=0&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1aaa\",\"commitment_proof\":\"proof-a\"}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=1&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1bbb\",\"commitment_proof\":\"proof-b\"}".into(),
+                ),
+            ),
+            (
+                "/chains/main/blocks/BLChunkHash123456789ABCDEFG/header".into(),
+                (200, "{\"level\":123}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let req = SubmitRollupMessageReq {
+            kind: RollupSubmissionKind::Shield,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            payload: vec![1, 2, 3, 4, 5],
+        };
+        let submission = process_submission(&config, req).unwrap();
+        assert_eq!(submission.transport, RollupSubmissionTransport::Dal);
+        assert_eq!(submission.dal_chunks.len(), 2);
+        assert_eq!(submission.dal_chunks[0].payload_len, 3);
+        assert_eq!(submission.dal_chunks[1].payload_len, 2);
+    }
+
+    #[test]
+    fn dal_slot_collision_retries_next_slot_index() {
+        let script_dir = tempfile::tempdir().unwrap();
+        let log_path = script_dir.path().join("client.log");
+        let client_path = script_dir.path().join("octez-client");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"{}\"\nif printf '%s ' \"$@\" | grep -q 'slot 0 '; then\n  echo 'Error: A slot header for this slot was already proposed' >&2\n  exit 1\nfi\necho 'Operation hash is ooChunkHash123456789ABCDEFG'\necho 'Operation found in block BLChunkHash123456789ABCDEFG'\n",
+            log_path.display()
+        );
+        std::fs::write(&client_path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&client_path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&client_path, perms).unwrap();
+        }
+        let mut config = config_with_client(&client_path);
+        config.direct_max_message_bytes = 1;
+        let endpoint = spawn_mock_http_server(HashMap::from([
+            (
+                "/protocol_parameters".into(),
+                (
+                    200,
+                    "{\"number_of_slots\":32,\"cryptobox_parameters\":{\"slot_size\":8}}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=0&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1aaa\",\"commitment_proof\":\"proof-a\"}".into(),
+                ),
+            ),
+            (
+                "/slots?slot_index=1&padding=%00".into(),
+                (
+                    200,
+                    "{\"commitment\":\"sh1bbb\",\"commitment_proof\":\"proof-b\"}".into(),
+                ),
+            ),
+            (
+                "/chains/main/blocks/BLChunkHash123456789ABCDEFG/header".into(),
+                (200, "{\"level\":123}".into()),
+            ),
+        ]));
+        config.dal_node_endpoint = Some(endpoint.clone());
+        config.octez_node_endpoint = Some(endpoint);
+
+        let req = SubmitRollupMessageReq {
+            kind: RollupSubmissionKind::Shield,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            payload: vec![1, 2],
+        };
+        let submission = process_submission(&config, req).unwrap();
+        assert_eq!(submission.dal_chunks.len(), 1);
+        assert_eq!(submission.dal_chunks[0].slot_index, 1);
+        let log = std::fs::read_to_string(log_path).unwrap();
+        assert!(log.contains("publish"));
+        assert!(log.contains("slot"));
     }
 }
