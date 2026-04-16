@@ -18,7 +18,10 @@ use tezos_data_encoding_05::enc::BinWriter as _;
 use tezos_smart_rollup_encoding::{
     contract::Contract as TezosContract,
     entrypoint::Entrypoint as TezosEntrypoint,
-    inbox::{InboxMessage as TezosInboxMessage, InternalInboxMessage as TezosInternalInboxMessage},
+    inbox::{
+        ExternalMessageFrame, InboxMessage as TezosInboxMessage,
+        InternalInboxMessage as TezosInternalInboxMessage,
+    },
     michelson::{
         ticket::FA2_1Ticket, MichelsonBytes, MichelsonContract, MichelsonInt, MichelsonOption,
         MichelsonPair,
@@ -42,6 +45,7 @@ use tzel_verifier::DirectProofVerifier;
 
 pub const MAX_INPUT_BYTES: usize = 16 * 1024;
 pub const MAX_LEDGER_STATE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RESULT_ERROR_MESSAGE_BYTES: usize = 4096;
 
 #[cfg(not(feature = "proof-verifier"))]
 #[derive(Debug, Clone)]
@@ -87,6 +91,9 @@ const PATH_VALID_ROOT_INDEX_PREFIX: &[u8] = b"/tzel/v1/state/roots/index/";
 const PATH_BALANCE_PREFIX: &[u8] = b"/tzel/v1/state/balances/by-key/";
 const PATH_BALANCE_INDEX_PREFIX: &[u8] = b"/tzel/v1/state/balances/index/";
 const PATH_WITHDRAWAL_PREFIX: &[u8] = b"/tzel/v1/state/withdrawals/index/";
+const MAX_STORE_STRING_BYTES: usize = 256;
+const MAX_STORE_BINARY_BYTES: usize = 1024;
+const MAX_STORED_INPUT_PAYLOAD_BYTES: usize = 2048;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputMessage {
@@ -118,6 +125,7 @@ struct ParsedBridgeDeposit {
 enum ParsedRollupMessage {
     Kernel(KernelInboxMessage),
     Deposit(ParsedBridgeDeposit),
+    Ignore,
 }
 
 pub trait Host {
@@ -126,6 +134,7 @@ pub trait Host {
     fn write_store(&mut self, path: &[u8], value: &[u8]);
     fn write_output(&mut self, value: &[u8]) -> Result<(), String>;
     fn write_debug(&mut self, message: &str);
+    fn rollup_address(&self) -> Vec<u8>;
 }
 
 struct DurableLedgerState<'a, H: Host> {
@@ -220,7 +229,7 @@ impl<'a, H: Host> DurableLedgerState<'a, H> {
     }
 
     fn read_string(&self, path: &[u8], max_bytes: usize) -> Result<Option<String>, String> {
-        match self.host.read_store(path, max_bytes) {
+        match self.host.read_store(path, max_bytes.min(MAX_STORE_STRING_BYTES)) {
             None => Ok(None),
             Some(bytes) => String::from_utf8(bytes)
                 .map(Some)
@@ -453,18 +462,33 @@ fn encode_withdrawal_outbox_message(
     Ok(bytes)
 }
 
-fn decode_rollup_message(bytes: &[u8]) -> Result<ParsedRollupMessage, String> {
+fn decode_rollup_message(
+    bytes: &[u8],
+    current_rollup: &[u8],
+) -> Result<ParsedRollupMessage, String> {
     if let Ok((rest, inbox)) = TezosInboxMessage::<BridgeDepositPayload>::parse(bytes) {
         if rest.is_empty() {
             return match inbox {
-                TezosInboxMessage::Internal(TezosInternalInboxMessage::Transfer(transfer)) => Ok(
-                    ParsedRollupMessage::Deposit(parse_bridge_deposit(transfer)?),
-                ),
-                TezosInboxMessage::Internal(_) => {
-                    Err("unsupported internal inbox message".to_string())
+                TezosInboxMessage::Internal(TezosInternalInboxMessage::Transfer(transfer)) => {
+                    if transfer.destination.hash().as_ref().as_slice() != current_rollup {
+                        Ok(ParsedRollupMessage::Ignore)
+                    } else {
+                        Ok(ParsedRollupMessage::Deposit(parse_bridge_deposit(transfer)?))
+                    }
                 }
+                TezosInboxMessage::Internal(_) => Ok(ParsedRollupMessage::Ignore),
                 TezosInboxMessage::External(payload) => {
-                    decode_kernel_inbox_message(payload).map(ParsedRollupMessage::Kernel)
+                    match ExternalMessageFrame::parse(payload) {
+                        Ok(ExternalMessageFrame::Targetted { address, contents }) => {
+                            if address.hash().as_ref().as_slice() != current_rollup {
+                                Ok(ParsedRollupMessage::Ignore)
+                            } else {
+                                decode_kernel_inbox_message(contents)
+                                    .map(ParsedRollupMessage::Kernel)
+                            }
+                        }
+                        Err(_) => Ok(ParsedRollupMessage::Ignore),
+                    }
                 }
             };
         }
@@ -511,6 +535,17 @@ fn validate_bridge_deposit<H: Host>(
         return Err("deposit sent from unexpected ticketer".into());
     }
     Ok(())
+}
+
+fn bounded_error_message(message: impl Into<String>) -> String {
+    let mut message = message.into();
+    if message.len() > MAX_RESULT_ERROR_MESSAGE_BYTES {
+        let suffix = "... [truncated]";
+        let keep = MAX_RESULT_ERROR_MESSAGE_BYTES.saturating_sub(suffix.len());
+        message.truncate(keep);
+        message.push_str(suffix);
+    }
+    message
 }
 
 pub fn run_with_host<H: Host>(host: &mut H) {
@@ -612,7 +647,7 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
     for i in 0..balance_count {
         let key_path = indexed_path(PATH_BALANCE_INDEX_PREFIX, i);
         let key_bytes = host
-            .read_store(&key_path, MAX_INPUT_BYTES)
+            .read_store(&key_path, MAX_STORE_STRING_BYTES)
             .ok_or_else(|| format!("missing persisted balance key {}", i))?;
         let addr = String::from_utf8(key_bytes)
             .map_err(|_| "stored balance key is not UTF-8".to_string())?;
@@ -623,7 +658,7 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
     for i in 0..withdrawal_count {
         let path = indexed_path(PATH_WITHDRAWAL_PREFIX, i);
         let bytes = host
-            .read_store(&path, MAX_INPUT_BYTES)
+            .read_store(&path, MAX_STORE_BINARY_BYTES)
             .ok_or_else(|| format!("missing persisted withdrawal {}", i))?;
         ledger.withdrawals.push(decode_withdrawal_record(&bytes)?);
     }
@@ -632,7 +667,7 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
 }
 
 pub fn read_verifier_config<H: Host>(host: &H) -> Result<Option<KernelVerifierConfig>, String> {
-    let Some(bytes) = host.read_store(PATH_VERIFIER_CONFIG, MAX_INPUT_BYTES) else {
+    let Some(bytes) = host.read_store(PATH_VERIFIER_CONFIG, MAX_STORE_BINARY_BYTES) else {
         return Ok(None);
     };
     decode_kernel_verifier_config(&bytes).map(Some)
@@ -644,17 +679,21 @@ pub fn read_last_result<H: Host>(host: &H) -> Option<KernelResult> {
 }
 
 fn process_input<H: Host>(host: &mut H, input: &InputMessage) {
+    let stored_payload_len = input.payload.len().min(MAX_STORED_INPUT_PAYLOAD_BYTES);
     increment_u64(host, PATH_RAW_INPUT_COUNT, 1);
     increment_u64(host, PATH_RAW_INPUT_BYTES, input.payload.len() as u64);
     host.write_store(PATH_LAST_INPUT_LEVEL, &input.level.to_le_bytes());
     host.write_store(PATH_LAST_INPUT_ID, &input.id.to_le_bytes());
     host.write_store(
         PATH_LAST_INPUT_LEN,
-        &u32::try_from(input.payload.len())
+        &u32::try_from(stored_payload_len)
             .unwrap_or(u32::MAX)
             .to_le_bytes(),
     );
-    host.write_store(PATH_LAST_INPUT_PAYLOAD, &input.payload);
+    host.write_store(
+        PATH_LAST_INPUT_PAYLOAD,
+        &input.payload[..stored_payload_len],
+    );
 
     host.write_debug(&format!(
         "tzel-rollup-kernel: inbox level={} id={} bytes={}\n",
@@ -663,35 +702,44 @@ fn process_input<H: Host>(host: &mut H, input: &InputMessage) {
         input.payload.len()
     ));
 
-    let result = apply_input_message(host, input);
-    match encode_kernel_result(&result) {
-        Ok(encoded) => host.write_store(PATH_LAST_RESULT, &encoded),
-        Err(e) => host.write_debug(&format!(
-            "tzel-rollup-kernel: failed to encode result: {}\n",
-            e
-        )),
+    if let Some(result) = apply_input_message(host, input) {
+        match encode_kernel_result(&result) {
+            Ok(encoded) => host.write_store(PATH_LAST_RESULT, &encoded),
+            Err(e) => host.write_debug(&format!(
+                "tzel-rollup-kernel: failed to encode result: {}\n",
+                e
+            )),
+        }
     }
 }
 
-fn apply_input_message<H: Host>(host: &mut H, input: &InputMessage) -> KernelResult {
-    let message = match decode_rollup_message(&input.payload) {
+fn apply_input_message<H: Host>(host: &mut H, input: &InputMessage) -> Option<KernelResult> {
+    let current_rollup = host.rollup_address();
+    let message = match decode_rollup_message(&input.payload, current_rollup.as_slice()) {
         Ok(message) => message,
         Err(e) => {
-            let msg = format!("invalid inbox message: {}", e);
+            let msg = bounded_error_message(format!("invalid inbox message: {}", e));
             host.write_debug(&format!("tzel-rollup-kernel: {}\n", msg));
-            return KernelResult::Error { message: msg };
+            return Some(KernelResult::Error { message: msg });
         }
     };
+
+    if matches!(message, ParsedRollupMessage::Ignore) {
+        return None;
+    }
 
     let mut ledger = match DurableLedgerState::new(host) {
         Ok(ledger) => ledger,
         Err(e) => {
             ledger_debug(host, &e);
-            return KernelResult::Error { message: e };
+            return Some(KernelResult::Error {
+                message: bounded_error_message(e),
+            });
         }
     };
 
     let result: Result<KernelResult, String> = match message {
+        ParsedRollupMessage::Ignore => unreachable!("ignored messages are handled above"),
         ParsedRollupMessage::Deposit(req) => (|| -> Result<KernelResult, String> {
             validate_bridge_deposit(&ledger, &req)?;
             apply_deposit(&mut ledger, &req.recipient, req.amount).map(|_| KernelResult::Deposit)
@@ -756,10 +804,11 @@ fn apply_input_message<H: Host>(host: &mut H, input: &InputMessage) -> KernelRes
     };
 
     match result {
-        Ok(success) => success,
+        Ok(success) => Some(success),
         Err(message) => {
+            let message = bounded_error_message(message);
             ledger_debug(host, &format!("transition failed: {}", message));
-            KernelResult::Error { message }
+            Some(KernelResult::Error { message })
         }
     }
 }
@@ -949,6 +998,7 @@ mod wasm_host {
             num_bytes: usize,
         ) -> i32;
         fn write_output(src: *const u8, num_bytes: usize) -> i32;
+        fn reveal_metadata(dst: *mut u8, max_bytes: usize) -> i32;
     }
 
     pub struct WasmHost;
@@ -1010,6 +1060,13 @@ mod wasm_host {
         fn write_debug(&mut self, message: &str) {
             unsafe { write_debug(message.as_ptr(), message.len()) }
         }
+
+        fn rollup_address(&self) -> Vec<u8> {
+            let mut metadata = [0u8; 24];
+            let written = unsafe { reveal_metadata(metadata.as_mut_ptr(), metadata.len()) };
+            assert_eq!(written, metadata.len() as i32, "reveal_metadata failed");
+            metadata[..20].to_vec()
+        }
     }
 
     #[no_mangle]
@@ -1059,6 +1116,7 @@ mod tests {
         outputs: Vec<Vec<u8>>,
         debug: String,
         fail_output: Option<String>,
+        rollup_address: Option<Vec<u8>>,
     }
 
     impl MockHost {
@@ -1067,6 +1125,12 @@ mod tests {
                 inputs: inputs.into(),
                 ..Self::default()
             }
+        }
+
+        fn effective_rollup_address(&self) -> Vec<u8> {
+            self.rollup_address
+                .clone()
+                .unwrap_or_else(|| sample_rollup_address().hash().as_ref().clone())
         }
     }
 
@@ -1094,6 +1158,10 @@ mod tests {
 
         fn write_debug(&mut self, message: &str) {
             self.debug.push_str(message);
+        }
+
+        fn rollup_address(&self) -> Vec<u8> {
+            self.effective_rollup_address()
         }
     }
 
@@ -1153,6 +1221,27 @@ mod tests {
     }
 
     #[test]
+    fn truncates_oversized_last_input_payload_store() {
+        let payload = vec![0xAA; MAX_STORED_INPUT_PAYLOAD_BYTES + 17];
+        let mut host = MockHost::with_inputs(vec![InputMessage {
+            level: 9,
+            id: 4,
+            payload: payload.clone(),
+        }]);
+
+        run_with_host(&mut host);
+
+        let stats = read_stats(&host);
+        assert_eq!(stats.raw_input_count, 1);
+        assert_eq!(stats.raw_input_bytes, payload.len() as u64);
+        assert_eq!(stats.last_input_len, Some(MAX_STORED_INPUT_PAYLOAD_BYTES as u32));
+        assert_eq!(
+            read_last_input(&host).unwrap().payload,
+            payload[..MAX_STORED_INPUT_PAYLOAD_BYTES].to_vec()
+        );
+    }
+
+    #[test]
     fn logs_when_inbox_is_empty() {
         let mut host = MockHost::default();
 
@@ -1162,6 +1251,75 @@ mod tests {
         assert_eq!(stats.raw_input_count, 0);
         assert_eq!(stats.raw_input_bytes, 0);
         assert!(host.debug.contains("no inbox messages"));
+    }
+
+    #[test]
+    fn ignores_protocol_and_foreign_targeted_messages() {
+        let mut host = MockHost::default();
+        let mut sol = Vec::new();
+        TezosInboxMessage::<MichelsonUnit>::Internal(TezosInternalInboxMessage::StartOfLevel)
+            .serialize(&mut sol)
+            .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 1,
+            id: 0,
+            payload: sol,
+        });
+        host.inputs.push_back(InputMessage {
+            level: 1,
+            id: 1,
+            payload: encode_external_kernel_message_for_rollup(
+                sample_other_rollup_address(),
+                KernelInboxMessage::ConfigureBridge(KernelBridgeConfig {
+                    ticketer: sample_ticketer().into(),
+                }),
+            ),
+        });
+        host.inputs.push_back(InputMessage {
+            level: 1,
+            id: 2,
+            payload: encode_ticket_deposit_message_for_rollup(
+                "alice",
+                10,
+                sample_other_rollup_address(),
+            ),
+        });
+
+        run_with_host(&mut host);
+
+        assert!(read_last_result(&host).is_none());
+        assert!(read_ledger(&host).unwrap().balances.is_empty());
+        assert!(!host.debug.contains("invalid inbox message"));
+        assert!(!host.debug.contains("transition failed"));
+    }
+
+    #[test]
+    fn truncates_oversized_targeted_decode_errors() {
+        let mut host = MockHost::default();
+        let mut framed = Vec::new();
+        ExternalMessageFrame::Targetted {
+            address: sample_rollup_address(),
+            contents: vec![0xAA; MAX_INPUT_BYTES],
+        }
+        .bin_write(&mut framed)
+        .unwrap();
+        let mut payload = Vec::new();
+        TezosInboxMessage::<MichelsonUnit>::External(framed.as_slice())
+            .serialize(&mut payload)
+            .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 2,
+            id: 0,
+            payload,
+        });
+
+        run_with_host(&mut host);
+
+        let KernelResult::Error { message } = read_last_result(&host).unwrap() else {
+            panic!("expected error result");
+        };
+        assert!(message.len() <= MAX_RESULT_ERROR_MESSAGE_BYTES);
+        assert!(message.contains("truncated"));
     }
 
     #[test]
@@ -1741,6 +1899,7 @@ mod tests {
                 sample_other_ticketer(),
                 0,
                 None,
+                sample_rollup_address(),
             ),
         });
 
@@ -1791,6 +1950,7 @@ mod tests {
                 sample_ticketer(),
                 1,
                 None,
+                sample_rollup_address(),
             ),
         }]);
 
@@ -1818,6 +1978,7 @@ mod tests {
                 sample_ticketer(),
                 0,
                 None,
+                sample_rollup_address(),
             ),
         }]);
 
@@ -1845,6 +2006,7 @@ mod tests {
                 sample_ticketer(),
                 0,
                 Some(vec![0xAA]),
+                sample_rollup_address(),
             ),
         }]);
 
@@ -1872,6 +2034,7 @@ mod tests {
                 sample_ticketer(),
                 0,
                 None,
+                sample_rollup_address(),
             ),
         }]);
 
@@ -2202,6 +2365,10 @@ mod tests {
         SmartRollupAddress::from_b58check("sr1UNDWPUYVeomgG15wn5jSw689EJ4RNnVQa").unwrap()
     }
 
+    fn sample_other_rollup_address() -> SmartRollupAddress {
+        SmartRollupAddress::from_b58check("sr1UXY5i5Z1sF8xd8ZUyzur827MAaFWREzvj").unwrap()
+    }
+
     fn install_test_bridge(host: &mut MockHost) {
         let message =
             encode_kernel_inbox_message(&KernelInboxMessage::ConfigureBridge(KernelBridgeConfig {
@@ -2217,6 +2384,14 @@ mod tests {
     }
 
     fn encode_ticket_deposit_message(recipient: &str, amount: u64) -> Vec<u8> {
+        encode_ticket_deposit_message_for_rollup(recipient, amount, sample_rollup_address())
+    }
+
+    fn encode_ticket_deposit_message_for_rollup(
+        recipient: &str,
+        amount: u64,
+        destination: SmartRollupAddress,
+    ) -> Vec<u8> {
         encode_custom_ticket_deposit_message(
             recipient.as_bytes().to_vec(),
             amount,
@@ -2224,6 +2399,7 @@ mod tests {
             sample_ticketer(),
             0,
             None,
+            destination,
         )
     }
 
@@ -2234,6 +2410,7 @@ mod tests {
         sender_ticketer: &str,
         token_id: i32,
         metadata: Option<Vec<u8>>,
+        destination: SmartRollupAddress,
     ) -> Vec<u8> {
         let creator = TezosContract::from_b58check(creator_ticketer).unwrap();
         let sender_contract = TezosContract::from_b58check(sender_ticketer).unwrap();
@@ -2257,7 +2434,7 @@ mod tests {
             payload,
             sender,
             source: sample_l1_source(),
-            destination: sample_rollup_address(),
+            destination,
         };
         let mut bytes = Vec::new();
         TezosInboxMessage::Internal(TezosInternalInboxMessage::Transfer(transfer))
@@ -2267,9 +2444,23 @@ mod tests {
     }
 
     fn encode_external_kernel_message(message: KernelInboxMessage) -> Vec<u8> {
+        encode_external_kernel_message_for_rollup(sample_rollup_address(), message)
+    }
+
+    fn encode_external_kernel_message_for_rollup(
+        rollup: SmartRollupAddress,
+        message: KernelInboxMessage,
+    ) -> Vec<u8> {
         let payload = encode_kernel_inbox_message(&message).unwrap();
+        let mut framed = Vec::new();
+        ExternalMessageFrame::Targetted {
+            address: rollup,
+            contents: payload.as_slice(),
+        }
+        .bin_write(&mut framed)
+        .unwrap();
         let mut bytes = Vec::new();
-        TezosInboxMessage::<MichelsonUnit>::External(payload.as_slice())
+        TezosInboxMessage::<MichelsonUnit>::External(framed.as_slice())
             .serialize(&mut bytes)
             .unwrap();
         bytes

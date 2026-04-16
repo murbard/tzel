@@ -15,6 +15,10 @@ path = "src/bin/gen_test_vectors.rs"
 name = "gen-interop-scenario"
 path = "src/bin/gen_interop_scenario.rs"
 
+[[bin]]
+name = "tzel-operator"
+path = "src/bin/tzel_operator.rs"
+
 [dependencies]
 tzel-core = { path = "../../core" }
 tzel-verifier = { path = "../../verifier" }
@@ -32,6 +36,8 @@ ureq = { version = "3", features = ["json"] }
 
 tempfile = "3"
 tezos_data_encoding = "0.6"
+tezos_data_encoding_05 = { package = "tezos_data_encoding", version = "0.5" }
+tezos-smart-rollup-encoding = "0.2.2"
 nom = "7"
 
 [dev-dependencies]

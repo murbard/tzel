@@ -3,6 +3,19 @@ use ml_kem::KeyExport;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use tezos_data_encoding_05::enc::BinWriter as _;
+use tezos_smart_rollup_encoding::{
+    inbox::ExternalMessageFrame,
+    smart_rollup::SmartRollupAddress,
+};
+use tzel_services::operator_api::{
+    RollupSubmissionKind, RollupSubmissionStatus, RollupSubmissionTransport,
+    SubmitRollupMessageReq, SubmitRollupMessageResp,
+};
+use tzel_services::kernel_wire::{
+    encode_kernel_inbox_message, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
+    KernelTransferReq, KernelUnshieldReq, KernelWithdrawReq,
+};
 use tzel_services::*;
 use tzel_verifier::{encode_verify_meta, ProofBundle as VerifyProofBundle};
 
@@ -512,6 +525,8 @@ struct WalletFile {
     scanned: usize,
     #[serde(default)]
     wots_key_indices: std::collections::HashMap<u32, u32>,
+    #[serde(default)]
+    pending_spends: Vec<PendingSpend>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -521,6 +536,15 @@ struct WalletXmssFloor {
     addr_counter: u32,
     #[serde(default)]
     wots_key_indices: std::collections::HashMap<u32, u32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct PendingSpend {
+    #[serde(with = "hex_f_vec")]
+    nullifiers: Vec<F>,
+    description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_hash: Option<String>,
 }
 
 impl WalletFile {
@@ -737,6 +761,44 @@ impl WalletFile {
         self.notes.iter().map(|n| n.v as u128).sum()
     }
 
+    fn pending_nullifier_set(&self) -> std::collections::HashSet<F> {
+        self.pending_spends
+            .iter()
+            .flat_map(|pending| pending.nullifiers.iter().copied())
+            .collect()
+    }
+
+    fn available_balance(&self) -> u128 {
+        let pending = self.pending_nullifier_set();
+        self.notes
+            .iter()
+            .filter(|note| !pending.contains(&note_nullifier(note)))
+            .map(|note| note.v as u128)
+            .sum()
+    }
+
+    fn pending_outgoing_balance(&self) -> u128 {
+        let pending = self.pending_nullifier_set();
+        self.notes
+            .iter()
+            .filter(|note| pending.contains(&note_nullifier(note)))
+            .map(|note| note.v as u128)
+            .sum()
+    }
+
+    fn register_pending_spend(
+        &mut self,
+        nullifiers: Vec<F>,
+        description: String,
+        operation_hash: Option<String>,
+    ) {
+        self.pending_spends.push(PendingSpend {
+            nullifiers,
+            description,
+            operation_hash,
+        });
+    }
+
     fn wallet_xmss_floor(&self) -> WalletXmssFloor {
         let mut wots_key_indices = self.wots_key_indices.clone();
         for addr in &self.addresses {
@@ -759,10 +821,12 @@ impl WalletFile {
 
     /// Select notes to cover at least `amount`. Returns indices into self.notes.
     fn select_notes(&self, amount: u64) -> Result<Vec<usize>, String> {
+        let pending = self.pending_nullifier_set();
         let mut indexed: Vec<(usize, u64)> = self
             .notes
             .iter()
             .enumerate()
+            .filter(|(_, note)| !pending.contains(&note_nullifier(note)))
             .map(|(i, n)| (i, n.v))
             .collect();
         indexed.sort_by(|a, b| b.1.cmp(&a.1)); // largest first
@@ -776,11 +840,16 @@ impl WalletFile {
             }
         }
         Err(format!(
-            "insufficient funds: have {} need {}",
-            self.balance(),
+            "insufficient funds: have {} available ({} pending) need {}",
+            self.available_balance(),
+            self.pending_outgoing_balance(),
             amount
         ))
     }
+}
+
+fn note_nullifier(note: &Note) -> F {
+    nullifier(&note.nk_spend, &note.cm, note.index as u64)
 }
 
 #[derive(Debug)]
@@ -1041,8 +1110,601 @@ fn ensure_path_matches_root(
     Ok(())
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct WalletNetworkProfile {
+    network: String,
+    rollup_node_url: String,
+    rollup_address: String,
+    bridge_ticketer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operator_url: Option<String>,
+    source_alias: String,
+    public_account: String,
+    #[serde(default = "default_octez_client_bin")]
+    octez_client_bin: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    octez_client_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    octez_node_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    octez_protocol: Option<String>,
+    #[serde(default = "default_octez_burn_cap")]
+    burn_cap: String,
+}
+
+fn default_network_profile_path(wallet_path: &str) -> PathBuf {
+    PathBuf::from(format!("{}.network.json", wallet_path))
+}
+
+fn default_octez_client_bin() -> String {
+    "octez-client".into()
+}
+
+fn default_octez_burn_cap() -> String {
+    "1".into()
+}
+
+fn shadownet_profile(
+    rollup_node_url: String,
+    rollup_address: String,
+    bridge_ticketer: String,
+    operator_url: Option<String>,
+    source_alias: String,
+    public_account: Option<String>,
+    octez_client_dir: Option<String>,
+    octez_node_endpoint: Option<String>,
+    octez_protocol: Option<String>,
+    octez_client_bin: Option<String>,
+    burn_cap: Option<String>,
+) -> WalletNetworkProfile {
+    WalletNetworkProfile {
+        network: "shadownet".into(),
+        rollup_node_url,
+        rollup_address,
+        bridge_ticketer,
+        operator_url,
+        public_account: public_account.unwrap_or_else(|| source_alias.clone()),
+        source_alias,
+        octez_client_bin: octez_client_bin.unwrap_or_else(default_octez_client_bin),
+        octez_client_dir,
+        octez_node_endpoint,
+        octez_protocol,
+        burn_cap: burn_cap.unwrap_or_else(default_octez_burn_cap),
+    }
+}
+
+fn load_network_profile(path: &Path) -> Result<WalletNetworkProfile, String> {
+    let data = std::fs::read_to_string(path).map_err(|e| format!("read network profile: {}", e))?;
+    serde_json::from_str(&data).map_err(|e| format!("parse network profile: {}", e))
+}
+
+fn save_network_profile(path: &Path, profile: &WalletNetworkProfile) -> Result<(), String> {
+    let data =
+        serde_json::to_string_pretty(profile).map_err(|e| format!("serialize profile: {}", e))?;
+    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create profile tmp: {}", e))?;
+    file.write_all(data.as_bytes())
+        .map_err(|e| format!("write profile tmp: {}", e))?;
+    file.sync_all()
+        .map_err(|e| format!("fsync profile tmp: {}", e))?;
+    drop(file);
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename profile: {}", e))?;
+    sync_parent_dir(path)
+}
+
+fn load_required_network_profile(wallet_path: &str) -> Result<WalletNetworkProfile, String> {
+    let profile_path = default_network_profile_path(wallet_path);
+    let profile = load_network_profile(&profile_path).map_err(|e| {
+        format!(
+            "network profile is not configured: {}. Run `tzel-wallet profile init-shadownet --rollup-node-url ... --rollup-address ... --bridge-ticketer ... --source-alias ...`",
+            e
+        )
+    })?;
+    if profile.network != "shadownet" {
+        return Err(format!(
+            "unsupported wallet network profile '{}'",
+            profile.network
+        ));
+    }
+    Ok(profile)
+}
+
+const DURABLE_AUTH_DOMAIN: &str = "/tzel/v1/state/auth_domain";
+const DURABLE_TREE_SIZE: &str = "/tzel/v1/state/tree/size";
+const DURABLE_TREE_ROOT: &str = "/tzel/v1/state/tree/root";
+const DURABLE_NOTE_PREFIX: &str = "/tzel/v1/state/notes/";
+const DURABLE_NULLIFIER_COUNT: &str = "/tzel/v1/state/nullifiers/count";
+const DURABLE_NULLIFIER_INDEX_PREFIX: &str = "/tzel/v1/state/nullifiers/index/";
+const DURABLE_BALANCE_COUNT: &str = "/tzel/v1/state/balances/count";
+const DURABLE_BALANCE_INDEX_PREFIX: &str = "/tzel/v1/state/balances/index/";
+const DURABLE_BALANCE_PREFIX: &str = "/tzel/v1/state/balances/by-key/";
+
+#[derive(Debug, Clone)]
+struct RollupSubmissionReceipt {
+    output: String,
+    operation_hash: Option<String>,
+    submission_id: Option<String>,
+    pending_dal: bool,
+}
+
+#[derive(Clone)]
+struct RollupStateSnapshot {
+    auth_domain: F,
+    tree: MerkleTree,
+    notes: Vec<NoteMemo>,
+}
+
+impl RollupStateSnapshot {
+    fn current_root(&self) -> F {
+        self.tree.root()
+    }
+
+    fn merkle_path(&self, index: usize) -> Result<MerklePathResp, String> {
+        if index >= self.notes.len() {
+            return Err(format!("note index {} is outside current tree", index));
+        }
+        let (siblings, root) = self.tree.auth_path(index);
+        Ok(MerklePathResp { siblings, root })
+    }
+}
+
+struct RollupRpc<'a> {
+    profile: &'a WalletNetworkProfile,
+}
+
+impl<'a> RollupRpc<'a> {
+    fn new(profile: &'a WalletNetworkProfile) -> Self {
+        Self { profile }
+    }
+
+    fn durable_value_url(&self, key: &str) -> String {
+        format!(
+            "{}/global/block/head/durable/wasm_2_0_0/value?key={}",
+            self.profile.rollup_node_url.trim_end_matches('/'),
+            key
+        )
+    }
+
+    fn read_durable_text(&self, key: &str) -> Result<String, String> {
+        let url = self.durable_value_url(key);
+        let resp = ureq::get(&url).call().map_err(|e| match e {
+            ureq::Error::StatusCode(code) => format!("rollup RPC {} returned HTTP {}", url, code),
+            other => format!("rollup RPC {} failed: {}", url, other),
+        })?;
+        resp.into_body()
+            .read_to_string()
+            .map_err(|e| format!("read rollup RPC response: {}", e))
+    }
+
+    fn read_durable_bytes(&self, key: &str) -> Result<Vec<u8>, String> {
+        let raw = self.read_durable_text(key)?;
+        parse_rollup_rpc_bytes(&raw).map_err(|e| format!("decode durable value at {}: {}", key, e))
+    }
+
+    fn read_u64(&self, key: &str) -> Result<u64, String> {
+        let bytes = self.read_durable_bytes(key)?;
+        if bytes.len() != 8 {
+            return Err(format!(
+                "durable u64 at {} has {} bytes, expected 8",
+                key,
+                bytes.len()
+            ));
+        }
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&bytes);
+        Ok(u64::from_le_bytes(out))
+    }
+
+    fn read_felt(&self, key: &str) -> Result<F, String> {
+        let bytes = self.read_durable_bytes(key)?;
+        if bytes.len() != 32 {
+            return Err(format!(
+                "durable felt at {} has {} bytes, expected 32",
+                key,
+                bytes.len()
+            ));
+        }
+        let mut out = ZERO;
+        out.copy_from_slice(&bytes);
+        Ok(out)
+    }
+
+    fn read_string(&self, key: &str) -> Result<String, String> {
+        let bytes = self.read_durable_bytes(key)?;
+        String::from_utf8(bytes).map_err(|_| format!("durable string at {} is not UTF-8", key))
+    }
+
+    fn load_notes_since(&self, cursor: usize) -> Result<NotesFeedResp, String> {
+        let count: usize = self
+            .read_u64(DURABLE_TREE_SIZE)?
+            .try_into()
+            .map_err(|_| "tree size does not fit in usize".to_string())?;
+        if cursor > count {
+            return Err(format!(
+                "wallet cursor {} is ahead of rollup tree size {}",
+                cursor, count
+            ));
+        }
+
+        let mut notes = Vec::with_capacity(count - cursor);
+        for i in cursor..count {
+            let bytes =
+                self.read_durable_bytes(&indexed_durable_key(DURABLE_NOTE_PREFIX, i as u64))?;
+            let (cm, enc) = canonical_wire::decode_published_note(&bytes)?;
+            notes.push(NoteMemo { index: i, cm, enc });
+        }
+        Ok(NotesFeedResp {
+            notes,
+            next_cursor: count,
+        })
+    }
+
+    fn load_nullifiers(&self) -> Result<Vec<F>, String> {
+        let count: usize = self
+            .read_u64(DURABLE_NULLIFIER_COUNT)?
+            .try_into()
+            .map_err(|_| "nullifier count does not fit in usize".to_string())?;
+        let mut nullifiers = Vec::with_capacity(count);
+        for i in 0..count {
+            nullifiers.push(self.read_felt(&indexed_durable_key(
+                DURABLE_NULLIFIER_INDEX_PREFIX,
+                i as u64,
+            ))?);
+        }
+        Ok(nullifiers)
+    }
+
+    fn load_balances(&self) -> Result<std::collections::HashMap<String, u64>, String> {
+        let count: usize = self
+            .read_u64(DURABLE_BALANCE_COUNT)?
+            .try_into()
+            .map_err(|_| "balance count does not fit in usize".to_string())?;
+        let mut balances = std::collections::HashMap::with_capacity(count);
+        for i in 0..count {
+            let account =
+                self.read_string(&indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, i as u64))?;
+            let amount = self.read_u64(&balance_durable_key(&account))?;
+            balances.insert(account, amount);
+        }
+        Ok(balances)
+    }
+
+    fn load_state_snapshot(&self) -> Result<RollupStateSnapshot, String> {
+        let auth_domain = self.read_felt(DURABLE_AUTH_DOMAIN)?;
+        let notes = self.load_notes_since(0)?.notes;
+        let persisted_root = self.read_felt(DURABLE_TREE_ROOT)?;
+        let tree = MerkleTree::from_leaves(notes.iter().map(|note| note.cm).collect());
+        let recomputed_root = tree.root();
+        if recomputed_root != persisted_root {
+            return Err(format!(
+                "rollup tree root mismatch: durable {} != recomputed {}",
+                short(&persisted_root),
+                short(&recomputed_root)
+            ));
+        }
+        Ok(RollupStateSnapshot {
+            auth_domain,
+            tree,
+            notes,
+        })
+    }
+
+    fn submit_kernel_message(
+        &self,
+        message: &KernelInboxMessage,
+    ) -> Result<RollupSubmissionReceipt, String> {
+        let payload = encode_kernel_inbox_message(message)?;
+        if let Some(operator_url) = &self.profile.operator_url {
+            return submit_kernel_message_via_operator(
+                operator_url,
+                &self.profile.rollup_address,
+                kernel_message_kind(message),
+                payload,
+            );
+        }
+        let encoded = encode_targeted_rollup_message(&self.profile.rollup_address, &payload)?;
+        let payload_file = write_temp_rollup_message_file(&encoded)?;
+        let payload = format!("bin:{}", payload_file.display());
+        let mut args = vec![
+            "send".to_string(),
+            "smart".to_string(),
+            "rollup".to_string(),
+            "message".to_string(),
+            payload,
+            "from".to_string(),
+            self.profile.source_alias.clone(),
+        ];
+        let result = self.run_octez_client(&mut args);
+        let _ = std::fs::remove_file(&payload_file);
+        result
+    }
+
+    fn deposit_to_bridge(
+        &self,
+        public_account: &str,
+        amount_mutez: u64,
+    ) -> Result<RollupSubmissionReceipt, String> {
+        let tez_amount = mutez_to_tez_string(amount_mutez);
+        let mint_arg = format!(
+            "Pair 0x{} \"{}\"",
+            hex::encode(public_account.as_bytes()),
+            self.profile.rollup_address
+        );
+        let mut args = vec![
+            "transfer".to_string(),
+            tez_amount,
+            "from".to_string(),
+            self.profile.source_alias.clone(),
+            "to".to_string(),
+            self.profile.bridge_ticketer.clone(),
+            "--entrypoint".to_string(),
+            "mint".to_string(),
+            "--arg".to_string(),
+            mint_arg,
+            "--burn-cap".to_string(),
+            self.profile.burn_cap.clone(),
+        ];
+        self.run_octez_client(&mut args)
+    }
+
+    fn run_octez_client(&self, args: &mut Vec<String>) -> Result<RollupSubmissionReceipt, String> {
+        let mut command = std::process::Command::new(&self.profile.octez_client_bin);
+        if let Some(dir) = &self.profile.octez_client_dir {
+            command.arg("-d").arg(dir);
+        }
+        if let Some(endpoint) = &self.profile.octez_node_endpoint {
+            command.arg("-E").arg(endpoint);
+        }
+        if let Some(protocol) = &self.profile.octez_protocol {
+            command.arg("-p").arg(protocol);
+        }
+        command.arg("-w").arg("none");
+        command.args(args);
+
+        let output = command
+            .output()
+            .map_err(|e| format!("failed to start {}: {}", self.profile.octez_client_bin, e))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let combined = match (stdout.is_empty(), stderr.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => stdout.clone(),
+            (true, false) => stderr.clone(),
+            (false, false) => format!("{}\n{}", stdout, stderr),
+        };
+
+        if !output.status.success() {
+            return Err(if combined.is_empty() {
+                format!(
+                    "{} exited with status {}",
+                    self.profile.octez_client_bin, output.status
+                )
+            } else {
+                combined
+            });
+        }
+
+        Ok(RollupSubmissionReceipt {
+            operation_hash: extract_operation_hash(&combined),
+            output: combined,
+            submission_id: None,
+            pending_dal: false,
+        })
+    }
+}
+
+fn encode_targeted_rollup_message(
+    rollup_address: &str,
+    payload: &[u8],
+) -> Result<Vec<u8>, String> {
+    let address = SmartRollupAddress::from_b58check(rollup_address)
+        .map_err(|_| format!("invalid rollup address: {}", rollup_address))?;
+    let frame = ExternalMessageFrame::Targetted {
+        address,
+        contents: payload,
+    };
+    let mut output = Vec::new();
+    frame
+        .bin_write(&mut output)
+        .map_err(|e| format!("failed to encode targeted rollup message: {}", e))?;
+    Ok(output)
+}
+
+fn write_temp_rollup_message_file(bytes: &[u8]) -> Result<std::path::PathBuf, String> {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "tzel-rollup-message-{}-{}.bin",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("system clock error: {}", e))?
+            .as_nanos()
+    ));
+    std::fs::write(&path, bytes).map_err(|e| format!("write rollup message file: {}", e))?;
+    Ok(path)
+}
+
+fn kernel_message_kind(message: &KernelInboxMessage) -> RollupSubmissionKind {
+    match message {
+        KernelInboxMessage::Shield(_) => RollupSubmissionKind::Shield,
+        KernelInboxMessage::Transfer(_) => RollupSubmissionKind::Transfer,
+        KernelInboxMessage::Unshield(_) => RollupSubmissionKind::Unshield,
+        KernelInboxMessage::Withdraw(_)
+        | KernelInboxMessage::ConfigureVerifier(_)
+        | KernelInboxMessage::ConfigureBridge(_) => RollupSubmissionKind::Withdraw,
+    }
+}
+
+fn submit_kernel_message_via_operator(
+    operator_url: &str,
+    rollup_address: &str,
+    kind: RollupSubmissionKind,
+    payload: Vec<u8>,
+) -> Result<RollupSubmissionReceipt, String> {
+    let base = operator_url.trim_end_matches('/');
+    let resp: SubmitRollupMessageResp = post_json(
+        &format!("{}/v1/rollup/submissions", base),
+        &SubmitRollupMessageReq {
+            kind,
+            rollup_address: rollup_address.to_string(),
+            payload,
+        },
+    )?;
+    let submission = resp.submission;
+    let transport = match submission.transport {
+        RollupSubmissionTransport::DirectInbox => "direct_inbox",
+        RollupSubmissionTransport::Dal => "dal",
+    };
+    let status = match submission.status {
+        RollupSubmissionStatus::SubmittedToL1 => "submitted_to_l1",
+        RollupSubmissionStatus::PendingDal => "pending_dal",
+        RollupSubmissionStatus::Failed => "failed",
+    };
+    let mut lines = vec![
+        format!("Operator submission id: {}", submission.id),
+        format!("Status: {} via {}", status, transport),
+    ];
+    if let Some(detail) = submission.detail {
+        lines.push(detail);
+    }
+    Ok(RollupSubmissionReceipt {
+        output: lines.join("\n"),
+        operation_hash: submission.operation_hash,
+        submission_id: Some(submission.id),
+        pending_dal: matches!(submission.status, RollupSubmissionStatus::PendingDal),
+    })
+}
+
+fn load_operator_submission(
+    operator_url: &str,
+    submission_id: &str,
+) -> Result<SubmitRollupMessageResp, String> {
+    let base = operator_url.trim_end_matches('/');
+    get_json(&format!(
+        "{}/v1/rollup/submissions/{}",
+        base, submission_id
+    ))
+}
+
+fn indexed_durable_key(prefix: &str, index: u64) -> String {
+    format!("{}{index:016x}", prefix)
+}
+
+fn balance_durable_key(account: &str) -> String {
+    format!("{}{}", DURABLE_BALANCE_PREFIX, hex::encode(account.as_bytes()))
+}
+
+fn parse_rollup_rpc_bytes(raw: &str) -> Result<Vec<u8>, String> {
+    let trimmed = raw.trim();
+    let unwrapped = serde_json::from_str::<String>(trimmed).unwrap_or_else(|_| trimmed.to_string());
+    let payload = unwrapped.trim();
+    let payload = payload
+        .strip_prefix("0x")
+        .or_else(|| payload.strip_prefix("0X"))
+        .unwrap_or(payload);
+
+    if !payload.is_empty()
+        && payload.len() % 2 == 0
+        && payload.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        return hex::decode(payload).map_err(|e| e.to_string());
+    }
+
+    Ok(payload.as_bytes().to_vec())
+}
+
+fn mutez_to_tez_string(amount_mutez: u64) -> String {
+    let whole = amount_mutez / 1_000_000;
+    let fractional = amount_mutez % 1_000_000;
+    if fractional == 0 {
+        return whole.to_string();
+    }
+    let mut out = format!("{}.{:06}", whole, fractional);
+    while out.ends_with('0') {
+        out.pop();
+    }
+    out
+}
+
+fn extract_operation_hash(output: &str) -> Option<String> {
+    output
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | ',' | ';' | '(' | ')'))
+        .find_map(|token| {
+            if token.starts_with('o')
+                && token.len() >= 20
+                && token.chars().all(|ch| ch.is_ascii_alphanumeric())
+            {
+                Some(token.to_string())
+            } else {
+                None
+            }
+        })
+}
+
+fn host_stark_proof_to_kernel(proof: &Proof) -> Result<KernelStarkProof, String> {
+    match proof {
+        Proof::TrustMeBro => Err("rollup submission requires a real STARK proof".into()),
+        Proof::Stark {
+            proof_bytes,
+            output_preimage,
+            verify_meta,
+        } => Ok(KernelStarkProof {
+            proof_bytes: proof_bytes.clone(),
+            output_preimage: output_preimage.clone(),
+            verify_meta: verify_meta
+                .clone()
+                .ok_or_else(|| "STARK proof is missing verify_meta".to_string())?,
+        }),
+    }
+}
+
+fn shield_req_to_kernel(req: &ShieldReq) -> Result<KernelShieldReq, String> {
+    Ok(KernelShieldReq {
+        sender: req.sender.clone(),
+        v: req.v,
+        address: req.address.clone(),
+        memo: req.memo.clone(),
+        proof: host_stark_proof_to_kernel(&req.proof)?,
+        client_cm: req.client_cm,
+        client_enc: req.client_enc.clone(),
+    })
+}
+
+fn transfer_req_to_kernel(req: &TransferReq) -> Result<KernelTransferReq, String> {
+    Ok(KernelTransferReq {
+        root: req.root,
+        nullifiers: req.nullifiers.clone(),
+        cm_1: req.cm_1,
+        cm_2: req.cm_2,
+        enc_1: req.enc_1.clone(),
+        enc_2: req.enc_2.clone(),
+        proof: host_stark_proof_to_kernel(&req.proof)?,
+    })
+}
+
+fn unshield_req_to_kernel(req: &UnshieldReq) -> Result<KernelUnshieldReq, String> {
+    Ok(KernelUnshieldReq {
+        root: req.root,
+        nullifiers: req.nullifiers.clone(),
+        v_pub: req.v_pub,
+        recipient: req.recipient.clone(),
+        cm_change: req.cm_change,
+        enc_change: req.enc_change.clone(),
+        proof: host_stark_proof_to_kernel(&req.proof)?,
+    })
+}
+
+fn withdraw_req_to_kernel(req: &WithdrawReq) -> KernelWithdrawReq {
+    KernelWithdrawReq {
+        sender: req.sender.clone(),
+        recipient: req.recipient.clone(),
+        amount: req.amount,
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
-// CLI
+// sp-client CLI
 // ═══════════════════════════════════════════════════════════════════════
 
 #[derive(Parser)]
@@ -1131,7 +1793,7 @@ enum Cmd {
     },
 }
 
-fn main() {
+pub fn sp_client_entry() {
     let cli = Cli::parse();
     if let Err(e) = run(cli) {
         eprintln!("error: {}", e);
@@ -1204,6 +1866,272 @@ fn run(cli: Cli) -> Result<(), String> {
             addr,
             amount,
         } => cmd_fund(&ledger, &addr, amount),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// tzel-wallet CLI
+// ═══════════════════════════════════════════════════════════════════════
+
+#[derive(Parser)]
+#[command(
+    name = "tzel-wallet",
+    about = "TzEL CLI wallet for rollup-backed networks such as Shadownet"
+)]
+struct UserCli {
+    #[arg(short, long, default_value = "wallet.json")]
+    wallet: String,
+
+    /// Path to the reprove binary.
+    #[arg(long, default_value = "reprove")]
+    reprove_bin: String,
+
+    /// Path to directory containing compiled .executable.json files.
+    #[arg(long, default_value = "cairo/target/dev")]
+    executables_dir: String,
+
+    #[command(subcommand)]
+    cmd: UserCmd,
+}
+
+#[derive(Subcommand)]
+enum UserCmd {
+    /// Create a new wallet file.
+    Init,
+    /// Manage the saved network profile for this wallet.
+    Profile {
+        #[command(subcommand)]
+        cmd: UserProfileCmd,
+    },
+    /// Derive a new receiving address.
+    Receive,
+    /// Sync notes and spent nullifiers directly from the rollup node durable state.
+    Sync,
+    /// Show local private balance plus live public bridge balance when configured.
+    Balance,
+    /// Deposit tez on L1 into the configured bridge ticketer for your public rollup account.
+    Deposit {
+        #[arg(long)]
+        amount: u64,
+        #[arg(long)]
+        public_account: Option<String>,
+    },
+    /// Shield public bridge balance into a private note.
+    Shield {
+        #[arg(long)]
+        amount: u64,
+        /// Override the public rollup account to shield from.
+        #[arg(long)]
+        sender: Option<String>,
+        /// Path to recipient address JSON. Defaults to a newly generated self-address.
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long)]
+        memo: Option<String>,
+    },
+    /// Send shielded funds to another payment address.
+    Send {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        amount: u64,
+        #[arg(long)]
+        memo: Option<String>,
+    },
+    /// Move private funds back into a public rollup balance.
+    Unshield {
+        #[arg(long)]
+        amount: u64,
+        /// Override the public rollup account to receive the transparent balance.
+        #[arg(long)]
+        recipient: Option<String>,
+    },
+    /// Withdraw public rollup balance back to an L1 tz1/KT1 address.
+    Withdraw {
+        #[arg(long)]
+        amount: u64,
+        /// Override the public rollup account to debit.
+        #[arg(long)]
+        sender: Option<String>,
+        /// L1 recipient for the withdrawal outbox message.
+        #[arg(long)]
+        recipient: String,
+    },
+    /// Query a submission previously accepted by the configured operator.
+    Status {
+        #[arg(long)]
+        submission_id: String,
+    },
+    /// Export detection material for delegated scanning.
+    ExportDetect,
+    /// Export viewing material for delegated scanning and decryption.
+    ExportView,
+}
+
+#[derive(Subcommand)]
+enum UserProfileCmd {
+    /// Save a Shadownet profile for this wallet.
+    InitShadownet {
+        #[arg(long)]
+        rollup_node_url: String,
+        #[arg(long)]
+        rollup_address: String,
+        #[arg(long)]
+        bridge_ticketer: String,
+        #[arg(long)]
+        operator_url: Option<String>,
+        #[arg(long)]
+        source_alias: String,
+        #[arg(long)]
+        public_account: Option<String>,
+        #[arg(long)]
+        octez_client_dir: Option<String>,
+        #[arg(long)]
+        octez_node_endpoint: Option<String>,
+        #[arg(long)]
+        octez_protocol: Option<String>,
+        #[arg(long)]
+        octez_client_bin: Option<String>,
+        #[arg(long)]
+        burn_cap: Option<String>,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the saved network profile as JSON.
+    Show,
+}
+
+pub fn tzel_wallet_entry() {
+    let cli = UserCli::parse();
+    if let Err(e) = run_user(cli) {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn run_user(cli: UserCli) -> Result<(), String> {
+    let _wallet_lock = match &cli.cmd {
+        UserCmd::Init
+        | UserCmd::Receive
+        | UserCmd::Sync
+        | UserCmd::Shield { .. }
+        | UserCmd::Send { .. }
+        | UserCmd::Unshield { .. } => Some(acquire_wallet_lock(&cli.wallet)?),
+        UserCmd::Profile { .. }
+        | UserCmd::Balance
+        | UserCmd::Deposit { .. }
+        | UserCmd::Status { .. }
+        | UserCmd::Withdraw { .. }
+        | UserCmd::ExportDetect
+        | UserCmd::ExportView => None,
+    };
+
+    let pc = ProveConfig {
+        skip_proof: false,
+        reprove_bin: cli.reprove_bin,
+        executables_dir: cli.executables_dir,
+    };
+
+    match cli.cmd {
+        UserCmd::Init => cmd_keygen(&cli.wallet),
+        UserCmd::Profile { cmd } => run_user_profile(&cli.wallet, cmd),
+        UserCmd::Receive => cmd_address(&cli.wallet),
+        UserCmd::Sync => {
+            let profile = load_required_network_profile(&cli.wallet)?;
+            cmd_rollup_sync(&cli.wallet, &profile)
+        }
+        UserCmd::Balance => cmd_user_balance(&cli.wallet),
+        UserCmd::Deposit {
+            amount,
+            public_account,
+        } => {
+            let profile = load_required_network_profile(&cli.wallet)?;
+            let public_account = public_account.unwrap_or_else(|| profile.public_account.clone());
+            cmd_bridge_deposit(&profile, amount, &public_account)
+        }
+        UserCmd::Shield {
+            amount,
+            sender,
+            to,
+            memo,
+        } => {
+            let profile = load_required_network_profile(&cli.wallet)?;
+            let sender = sender.unwrap_or_else(|| profile.public_account.clone());
+            cmd_shield_rollup(&cli.wallet, &profile, &sender, amount, to, memo, &pc)
+        }
+        UserCmd::Send { to, amount, memo } => {
+            let profile = load_required_network_profile(&cli.wallet)?;
+            cmd_transfer_rollup(&cli.wallet, &profile, &to, amount, memo, &pc)
+        }
+        UserCmd::Unshield { amount, recipient } => {
+            let profile = load_required_network_profile(&cli.wallet)?;
+            let recipient = recipient.unwrap_or_else(|| profile.public_account.clone());
+            cmd_unshield_rollup(&cli.wallet, &profile, amount, &recipient, &pc)
+        }
+        UserCmd::Withdraw {
+            amount,
+            sender,
+            recipient,
+        } => {
+            let profile = load_required_network_profile(&cli.wallet)?;
+            let sender = sender.unwrap_or_else(|| profile.public_account.clone());
+            cmd_withdraw_rollup(&profile, &sender, amount, &recipient)
+        }
+        UserCmd::Status { submission_id } => {
+            let profile = load_required_network_profile(&cli.wallet)?;
+            cmd_operator_status(&profile, &submission_id)
+        }
+        UserCmd::ExportDetect => cmd_export_detect(&cli.wallet),
+        UserCmd::ExportView => cmd_export_view(&cli.wallet),
+    }
+}
+
+fn run_user_profile(wallet_path: &str, cmd: UserProfileCmd) -> Result<(), String> {
+    let path = default_network_profile_path(wallet_path);
+    match cmd {
+        UserProfileCmd::InitShadownet {
+            rollup_node_url,
+            rollup_address,
+            bridge_ticketer,
+            operator_url,
+            source_alias,
+            public_account,
+            octez_client_dir,
+            octez_node_endpoint,
+            octez_protocol,
+            octez_client_bin,
+            burn_cap,
+            force,
+        } => {
+            if path.exists() && !force {
+                return Err(format!(
+                    "{} already exists; pass --force to overwrite it",
+                    path.display()
+                ));
+            }
+            let profile = shadownet_profile(
+                rollup_node_url,
+                rollup_address,
+                bridge_ticketer,
+                operator_url,
+                source_alias,
+                public_account,
+                octez_client_dir,
+                octez_node_endpoint,
+                octez_protocol,
+                octez_client_bin,
+                burn_cap,
+            );
+            save_network_profile(&path, &profile)?;
+            println!("Saved {} profile to {}", profile.network, path.display());
+            println!("{}", serde_json::to_string_pretty(&profile).unwrap());
+            Ok(())
+        }
+        UserProfileCmd::Show => {
+            let profile = load_network_profile(&path)?;
+            println!("{}", serde_json::to_string_pretty(&profile).unwrap());
+            Ok(())
+        }
     }
 }
 
@@ -1324,6 +2252,7 @@ fn cmd_keygen(path: &str) -> Result<(), String> {
         notes: vec![],
         scanned: 0,
         wots_key_indices: std::collections::HashMap::new(),
+        pending_spends: vec![],
     };
     save_wallet(path, &w)?;
     println!("Wallet created: {}", path);
@@ -1379,7 +2308,7 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
         "Scanned: {} new notes found, {} spent removed, balance={}",
         summary.found,
         summary.spent,
-        w.balance()
+        w.available_balance()
     );
     Ok(())
 }
@@ -1387,6 +2316,7 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
 struct ScanSummary {
     found: usize,
     spent: usize,
+    confirmed_pending: usize,
 }
 
 fn apply_scan_feed(
@@ -1414,13 +2344,17 @@ fn apply_scan_feed(
 
     let nf_set: std::collections::HashSet<F> = nullifiers.into_iter().collect();
     let before = w.notes.len();
-    w.notes.retain(|n| {
-        let nf = nullifier(&n.nk_spend, &n.cm, n.index as u64);
-        !nf_set.contains(&nf)
-    });
+    w.notes.retain(|n| !nf_set.contains(&note_nullifier(n)));
     let spent = before - w.notes.len();
+    let before_pending = w.pending_spends.len();
+    w.pending_spends
+        .retain(|pending| !pending.nullifiers.iter().all(|nf| nf_set.contains(nf)));
     w.scanned = feed.next_cursor;
-    ScanSummary { found, spent }
+    ScanSummary {
+        found,
+        spent,
+        confirmed_pending: before_pending - w.pending_spends.len(),
+    }
 }
 
 #[cfg(test)]
@@ -1494,6 +2428,14 @@ mod tests {
         })
     }
 
+    #[test]
+    fn balance_durable_key_hex_encodes_public_account() {
+        assert_eq!(
+            balance_durable_key("tzelshadownet"),
+            "/tzel/v1/state/balances/by-key/747a656c736861646f776e6574"
+        );
+    }
+
     fn small_subtree_root(ask_j: &F, pub_seed: &F, start_idx: u32, height: u32) -> F {
         if height == 0 {
             return auth_leaf_hash(ask_j, start_idx);
@@ -1519,6 +2461,7 @@ mod tests {
             notes: vec![],
             scanned: 0,
             wots_key_indices: std::collections::HashMap::new(),
+            pending_spends: vec![],
         };
         if addr_counter as usize > cached {
             wallet
@@ -2069,6 +3012,7 @@ mod tests {
             notes: vec![],
             scanned: 0,
             wots_key_indices: std::collections::HashMap::new(),
+            pending_spends: vec![],
         };
 
         let (state0, addr0) = wallet.next_address().expect("first fixture address");
@@ -2094,6 +3038,7 @@ mod tests {
             notes: vec![],
             scanned: 0,
             wots_key_indices: std::collections::HashMap::new(),
+            pending_spends: vec![],
         };
 
         wallet
@@ -2488,6 +3433,32 @@ mod tests {
     }
 
     #[test]
+    fn test_select_notes_skips_pending_spends() {
+        let mut w = test_wallet(1, None);
+        let note_0 = wallet_note_for_address(&w, 0, 40, felt_tag(b"pending-note-0"), 0);
+        let note_1 = wallet_note_for_address(&w, 0, 25, felt_tag(b"pending-note-1"), 1);
+        let pending_nf = note_nullifier(&note_0);
+        w.notes = vec![note_0, note_1];
+        w.register_pending_spend(
+            vec![pending_nf],
+            "transfer 40".into(),
+            Some("opHash".into()),
+        );
+
+        let selected = w
+            .select_notes(20)
+            .expect("unlocked note should still be selectable");
+        assert_eq!(selected, vec![1]);
+
+        let err = w
+            .select_notes(30)
+            .expect_err("pending note must not count toward spendable balance");
+        assert!(err.contains("insufficient funds"));
+        assert_eq!(w.available_balance(), 25);
+        assert_eq!(w.pending_outgoing_balance(), 40);
+    }
+
+    #[test]
     fn test_apply_scan_feed_deduplicates_new_notes_and_prunes_spent_ones() {
         let mut w = test_wallet(1, None);
         let existing = wallet_note_for_address(&w, 0, 40, felt_tag(b"wallet-scan-existing"), 5);
@@ -2541,6 +3512,27 @@ mod tests {
         );
         assert_eq!(w.notes[0].v, 25);
         assert_eq!(w.notes[0].cm, new_nm.cm);
+    }
+
+    #[test]
+    fn test_apply_scan_feed_clears_confirmed_pending_spends() {
+        let mut w = test_wallet(1, None);
+        let existing = wallet_note_for_address(&w, 0, 40, felt_tag(b"wallet-scan-pending"), 5);
+        let spent_nf = note_nullifier(&existing);
+        w.notes.push(existing);
+        w.register_pending_spend(vec![spent_nf], "transfer 40".into(), Some("opHash".into()));
+
+        let feed = NotesFeedResp {
+            notes: vec![],
+            next_cursor: 6,
+        };
+
+        let summary = apply_scan_feed(&mut w, &feed, vec![spent_nf]);
+        assert_eq!(summary.spent, 1);
+        assert_eq!(summary.confirmed_pending, 1);
+        assert!(w.pending_spends.is_empty());
+        assert!(w.notes.is_empty());
+        assert_eq!(w.scanned, 6);
     }
 
     #[test]
@@ -2857,12 +3849,133 @@ mod tests {
 
 fn cmd_balance(path: &str) -> Result<(), String> {
     let w = load_wallet(path)?;
+    let pending = w.pending_nullifier_set();
     println!("Private balance: {}", w.balance());
+    if !w.pending_spends.is_empty() {
+        println!("Private available: {}", w.available_balance());
+        println!("Pending outgoing: {}", w.pending_outgoing_balance());
+        println!("Pending operations: {}", w.pending_spends.len());
+    }
     println!("Notes: {}", w.notes.len());
     for (i, n) in w.notes.iter().enumerate() {
-        println!("  [{}] v={} cm={} index={}", i, n.v, short(&n.cm), n.index);
+        println!(
+            "  [{}] v={} cm={} index={}{}",
+            i,
+            n.v,
+            short(&n.cm),
+            n.index,
+            if pending.contains(&note_nullifier(n)) {
+                " pending"
+            } else {
+                ""
+            }
+        );
     }
     Ok(())
+}
+
+fn cmd_user_balance(path: &str) -> Result<(), String> {
+    let w = load_wallet(path)?;
+    println!("Private available: {}", w.available_balance());
+    println!("Private tracked total: {}", w.balance());
+    println!("Private pending outgoing: {}", w.pending_outgoing_balance());
+    println!("Tracked notes: {}", w.notes.len());
+    println!("Pending operations: {}", w.pending_spends.len());
+
+    let profile_path = default_network_profile_path(path);
+    if profile_path.exists() {
+        let profile = load_network_profile(&profile_path)?;
+        let rollup = RollupRpc::new(&profile);
+        let public_balance = rollup
+            .load_balances()?
+            .get(&profile.public_account)
+            .copied()
+            .unwrap_or(0);
+        println!(
+            "Public rollup balance ({}): {}",
+            profile.public_account, public_balance
+        );
+    }
+    Ok(())
+}
+
+fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), String> {
+    let mut w = load_wallet(path)?;
+    let rollup = RollupRpc::new(profile);
+    let feed = rollup.load_notes_since(w.scanned)?;
+    let nullifiers = rollup.load_nullifiers()?;
+    let summary = apply_scan_feed(&mut w, &feed, nullifiers);
+    save_wallet(path, &w)?;
+    let public_balance = rollup
+        .load_balances()?
+        .get(&profile.public_account)
+        .copied()
+        .unwrap_or(0);
+    println!(
+        "Synced: {} new notes, {} spent removed, {} pending confirmed, private_available={}, public_balance={}",
+        summary.found,
+        summary.spent,
+        summary.confirmed_pending,
+        w.available_balance(),
+        public_balance
+    );
+    Ok(())
+}
+
+fn cmd_bridge_deposit(
+    profile: &WalletNetworkProfile,
+    amount: u64,
+    public_account: &str,
+) -> Result<(), String> {
+    let rollup = RollupRpc::new(profile);
+    let submission = rollup.deposit_to_bridge(public_account, amount)?;
+    println!(
+        "Submitted L1 bridge deposit of {} mutez for public account {}",
+        amount, public_account
+    );
+    if let Some(op_hash) = submission.operation_hash {
+        println!("Operation hash: {}", op_hash);
+    }
+    if !submission.output.is_empty() {
+        println!("{}", submission.output);
+    }
+    println!("Run `tzel-wallet sync` after the deposit is included and processed by the rollup.");
+    Ok(())
+}
+
+fn cmd_operator_status(
+    profile: &WalletNetworkProfile,
+    submission_id: &str,
+) -> Result<(), String> {
+    let operator_url = profile
+        .operator_url
+        .as_deref()
+        .ok_or_else(|| "this wallet profile has no operator_url configured".to_string())?;
+    let resp = load_operator_submission(operator_url, submission_id)?;
+    println!("{}", serde_json::to_string_pretty(&resp.submission).unwrap());
+    Ok(())
+}
+
+fn print_rollup_submission(submission: &RollupSubmissionReceipt) {
+    if let Some(submission_id) = &submission.submission_id {
+        println!("Submission id: {}", submission_id);
+    }
+    if let Some(op_hash) = &submission.operation_hash {
+        println!("Operation hash: {}", op_hash);
+    }
+    if !submission.output.is_empty() {
+        println!("{}", submission.output);
+    }
+}
+
+fn print_rollup_sync_hint(submission: &RollupSubmissionReceipt) {
+    if submission.pending_dal {
+        println!(
+            "The operator has parked this message for DAL publication; wait for it to reach L1 before syncing."
+        );
+    } else {
+        println!("Run `tzel-wallet sync` after the rollup processes the message.");
+    }
 }
 
 fn cmd_shield(
@@ -3406,6 +4519,490 @@ fn cmd_unshield(
     Ok(())
 }
 
+fn cmd_shield_rollup(
+    path: &str,
+    profile: &WalletNetworkProfile,
+    sender: &str,
+    amount: u64,
+    to: Option<String>,
+    memo: Option<String>,
+    pc: &ProveConfig,
+) -> Result<(), String> {
+    let rollup = RollupRpc::new(profile);
+    let balances = rollup.load_balances()?;
+    let public_balance = balances.get(sender).copied().unwrap_or(0);
+    if public_balance < amount {
+        return Err(format!(
+            "insufficient public rollup balance for {}: have {}, need {}",
+            sender, public_balance, amount
+        ));
+    }
+
+    let mut w = load_wallet(path)?;
+    let (address, generated_self_address) = if let Some(addr_path) = to {
+        (load_address(&addr_path)?, false)
+    } else {
+        let (_state, addr) = w.next_address()?;
+        (addr, true)
+    };
+
+    let rseed = random_felt();
+    let rcm = derive_rcm(&rseed);
+    let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
+    let cm = commit(&address.d_j, amount, &rcm, &otag);
+    let sender_f = hash(sender.as_bytes());
+    let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
+        address.ek_v.as_slice().try_into().map_err(|_| "bad ek_v")?,
+    )
+    .map_err(|_| "invalid ek_v")?;
+    let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
+        address.ek_d.as_slice().try_into().map_err(|_| "bad ek_d")?,
+    )
+    .map_err(|_| "invalid ek_d")?;
+    let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
+    let enc = encrypt_note(amount, &rseed, memo_bytes, &ek_v_recv, &ek_d_recv);
+    let memo_ct_hash_f = memo_ct_hash(&enc);
+    let args: Vec<String> = vec![
+        felt_u64_to_hex(9),
+        felt_u64_to_hex(amount),
+        felt_to_hex(&cm),
+        felt_to_hex(&sender_f),
+        felt_to_hex(&memo_ct_hash_f),
+        felt_to_hex(&address.auth_root),
+        felt_to_hex(&address.auth_pub_seed),
+        felt_to_hex(&address.nk_tag),
+        felt_to_hex(&address.d_j),
+        felt_to_hex(&rseed),
+    ];
+    let proof = pc.make_proof("run_shield", &args)?;
+    let req = ShieldReq {
+        sender: sender.into(),
+        v: amount,
+        address,
+        memo,
+        proof,
+        client_cm: cm,
+        client_enc: Some(enc),
+    };
+
+    if generated_self_address {
+        save_wallet(path, &w)?;
+    }
+
+    let kernel_req = shield_req_to_kernel(&req)?;
+    let submission = rollup.submit_kernel_message(&KernelInboxMessage::Shield(kernel_req))?;
+    println!(
+        "Submitted shield of {} from {} into note {}",
+        amount,
+        sender,
+        short(&req.client_cm)
+    );
+    print_rollup_submission(&submission);
+    print_rollup_sync_hint(&submission);
+    Ok(())
+}
+
+fn cmd_transfer_rollup(
+    path: &str,
+    profile: &WalletNetworkProfile,
+    to_path: &str,
+    amount: u64,
+    memo: Option<String>,
+    pc: &ProveConfig,
+) -> Result<(), String> {
+    let rollup = RollupRpc::new(profile);
+    let snapshot = rollup.load_state_snapshot()?;
+    let root = snapshot.current_root();
+
+    let mut w = load_wallet(path)?;
+    let recipient = load_address(to_path)?;
+    let selected = w.select_notes(amount)?;
+    let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
+    let change = (sum_in - amount as u128) as u64;
+
+    let nullifiers: Vec<F> = selected
+        .iter()
+        .map(|&i| note_nullifier(&w.notes[i]))
+        .collect();
+
+    let rseed_1 = random_felt();
+    let rcm_1 = derive_rcm(&rseed_1);
+    let ek_v_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
+        recipient
+            .ek_v
+            .as_slice()
+            .try_into()
+            .map_err(|_| "bad ek_v")?,
+    )
+    .map_err(|_| "invalid ek_v")?;
+    let ek_d_recv = ml_kem::ml_kem_768::EncapsulationKey::new(
+        recipient
+            .ek_d
+            .as_slice()
+            .try_into()
+            .map_err(|_| "bad ek_d")?,
+    )
+    .map_err(|_| "invalid ek_d")?;
+    let otag_1 = owner_tag(
+        &recipient.auth_root,
+        &recipient.auth_pub_seed,
+        &recipient.nk_tag,
+    );
+    let cm_1 = commit(&recipient.d_j, amount, &rcm_1, &otag_1);
+    let memo_bytes = memo.as_deref().map(|s| s.as_bytes());
+    let enc_1 = encrypt_note(amount, &rseed_1, memo_bytes, &ek_v_recv, &ek_d_recv);
+
+    let (change_state, _change_addr) = w.next_address()?;
+    let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
+    let rseed_2 = random_felt();
+    let rcm_2 = derive_rcm(&rseed_2);
+    let otag_2 = owner_tag(
+        &change_state.auth_root,
+        &change_state.auth_pub_seed,
+        &change_state.nk_tag,
+    );
+    let cm_2 = commit(&change_state.d_j, change, &rcm_2, &otag_2);
+    let enc_2 = encrypt_note(change, &rseed_2, None, &ek_v_c, &ek_d_c);
+
+    let proof = {
+        let auth_domain = snapshot.auth_domain;
+        let n = selected.len();
+        let mut args: Vec<String> = vec![];
+        let mut cm_paths: Vec<Vec<F>> = vec![];
+        let mut auth_paths: Vec<Vec<F>> = vec![];
+        let mut wots_sigs: Vec<Vec<F>> = vec![];
+
+        let nfs_for_sh = nullifiers.clone();
+        let mh_1 = memo_ct_hash(&enc_1);
+        let mh_2 = memo_ct_hash(&enc_2);
+        let sighash =
+            transfer_sighash(&auth_domain, &root, &nfs_for_sh, &cm_1, &cm_2, &mh_1, &mh_2);
+
+        let mut wots_key_indices: Vec<u32> = vec![];
+        let mut auth_pub_seeds: Vec<F> = vec![];
+        let selected_notes: Vec<(usize, u32, F)> = selected
+            .iter()
+            .map(|&i| {
+                (
+                    w.notes[i].index,
+                    w.notes[i].addr_index,
+                    w.notes[i].auth_root,
+                )
+            })
+            .collect();
+        for &(tree_idx, addr_idx, stored_auth_root) in &selected_notes {
+            let path_resp = snapshot.merkle_path(tree_idx)?;
+            ensure_path_matches_root(&path_resp.root, &root, tree_idx)?;
+            cm_paths.push(path_resp.siblings);
+            let ask_j = derive_ask(&w.account().ask_base, addr_idx);
+            let (key_idx, auth_root, auth_pub_seed, path) = w.reserve_next_auth(addr_idx)?;
+            if auth_root != stored_auth_root {
+                return Err(format!(
+                    "auth_root mismatch for note at tree index {}",
+                    tree_idx
+                ));
+            }
+            auth_paths.push(path);
+            auth_pub_seeds.push(auth_pub_seed);
+            let (sig, _pk, _digits) = wots_sign(&ask_j, key_idx, &sighash);
+            wots_sigs.push(sig);
+            wots_key_indices.push(key_idx);
+        }
+
+        let total_fields = 3 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 16;
+        args.push(felt_u64_to_hex(total_fields as u64));
+        args.push(felt_u64_to_hex(n as u64));
+        args.push(felt_to_hex(&auth_domain));
+        args.push(felt_to_hex(&root));
+
+        for (idx, &si) in selected.iter().enumerate() {
+            let note = &w.notes[si];
+            args.push(felt_to_hex(&note_nullifier(note)));
+            args.push(felt_to_hex(&note.nk_spend));
+            args.push(felt_to_hex(&note.auth_root));
+            args.push(felt_to_hex(&auth_pub_seeds[idx]));
+            args.push(felt_u64_to_hex(wots_key_indices[idx] as u64));
+            args.push(felt_to_hex(&note.d_j));
+            args.push(felt_u64_to_hex(note.v));
+            args.push(felt_to_hex(&note.rseed));
+            args.push(felt_u64_to_hex(note.index as u64));
+        }
+
+        for path in &cm_paths {
+            for sib in path {
+                args.push(felt_to_hex(sib));
+            }
+        }
+        for path in &auth_paths {
+            for sib in path {
+                args.push(felt_to_hex(sib));
+            }
+        }
+        for sig in &wots_sigs {
+            for s in sig {
+                args.push(felt_to_hex(s));
+            }
+        }
+
+        args.push(felt_to_hex(&cm_1));
+        args.push(felt_to_hex(&recipient.d_j));
+        args.push(felt_u64_to_hex(amount));
+        args.push(felt_to_hex(&rseed_1));
+        args.push(felt_to_hex(&recipient.auth_root));
+        args.push(felt_to_hex(&recipient.auth_pub_seed));
+        args.push(felt_to_hex(&recipient.nk_tag));
+        args.push(felt_to_hex(&memo_ct_hash(&enc_1)));
+
+        args.push(felt_to_hex(&cm_2));
+        args.push(felt_to_hex(&change_state.d_j));
+        args.push(felt_u64_to_hex(change));
+        args.push(felt_to_hex(&rseed_2));
+        args.push(felt_to_hex(&change_state.auth_root));
+        args.push(felt_to_hex(&change_state.auth_pub_seed));
+        args.push(felt_to_hex(&change_state.nk_tag));
+        args.push(felt_to_hex(&memo_ct_hash(&enc_2)));
+
+        persist_wallet_and_make_proof(path, &w, pc, "run_transfer", &args)?
+    };
+
+    save_wallet(path, &w)?;
+    let req = TransferReq {
+        root,
+        nullifiers: nullifiers.clone(),
+        cm_1,
+        cm_2,
+        enc_1,
+        enc_2,
+        proof,
+    };
+    let kernel_req = transfer_req_to_kernel(&req)?;
+    let submission = rollup.submit_kernel_message(&KernelInboxMessage::Transfer(kernel_req))?;
+    w.register_pending_spend(
+        nullifiers,
+        format!("transfer {}", amount),
+        submission.operation_hash.clone(),
+    );
+    save_wallet(path, &w)?;
+
+    println!("Submitted transfer of {} with change {}", amount, change);
+    print_rollup_submission(&submission);
+    print_rollup_sync_hint(&submission);
+    Ok(())
+}
+
+fn cmd_unshield_rollup(
+    path: &str,
+    profile: &WalletNetworkProfile,
+    amount: u64,
+    recipient: &str,
+    pc: &ProveConfig,
+) -> Result<(), String> {
+    let rollup = RollupRpc::new(profile);
+    let snapshot = rollup.load_state_snapshot()?;
+    let root = snapshot.current_root();
+
+    let mut w = load_wallet(path)?;
+    let selected = w.select_notes(amount)?;
+    let sum_in: u128 = selected.iter().map(|&i| w.notes[i].v as u128).sum();
+    let change = (sum_in - amount as u128) as u64;
+
+    let nullifiers: Vec<F> = selected
+        .iter()
+        .map(|&i| note_nullifier(&w.notes[i]))
+        .collect();
+
+    let (cm_change, enc_change, change_data) = if change > 0 {
+        let (change_state, _change_addr) = w.next_address()?;
+        let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
+        let rseed_c = random_felt();
+        let rcm_c = derive_rcm(&rseed_c);
+        let otag_c = owner_tag(
+            &change_state.auth_root,
+            &change_state.auth_pub_seed,
+            &change_state.nk_tag,
+        );
+        let cm = commit(&change_state.d_j, change, &rcm_c, &otag_c);
+        let enc = encrypt_note(change, &rseed_c, None, &ek_v_c, &ek_d_c);
+        let mh = memo_ct_hash(&enc);
+        let cd = ChangeData {
+            d_j: change_state.d_j,
+            rseed: rseed_c,
+            auth_root: change_state.auth_root,
+            auth_pub_seed: change_state.auth_pub_seed,
+            nk_tag: change_state.nk_tag,
+            mh,
+        };
+        (cm, Some(enc), Some(cd))
+    } else {
+        (ZERO, None, None)
+    };
+
+    let proof = {
+        let auth_domain = snapshot.auth_domain;
+        let n = selected.len();
+        let mut args: Vec<String> = vec![];
+        let mut cm_paths: Vec<Vec<F>> = vec![];
+        let mut auth_paths: Vec<Vec<F>> = vec![];
+        let mut wots_sigs: Vec<Vec<F>> = vec![];
+        let mut auth_pub_seeds: Vec<F> = vec![];
+
+        let has_change_val: u64 = if change > 0 { 1 } else { 0 };
+        let recipient_f = hash(recipient.as_bytes());
+        let mh_change_f = change_data.as_ref().map(|cd| cd.mh).unwrap_or(ZERO);
+        let sighash = unshield_sighash(
+            &auth_domain,
+            &root,
+            &nullifiers,
+            amount,
+            &recipient_f,
+            &cm_change,
+            &mh_change_f,
+        );
+
+        let mut wots_key_indices: Vec<u32> = vec![];
+        let selected_notes: Vec<(usize, u32, F)> = selected
+            .iter()
+            .map(|&i| {
+                (
+                    w.notes[i].index,
+                    w.notes[i].addr_index,
+                    w.notes[i].auth_root,
+                )
+            })
+            .collect();
+        for &(tree_idx, addr_idx, stored_auth_root) in &selected_notes {
+            let path_resp = snapshot.merkle_path(tree_idx)?;
+            ensure_path_matches_root(&path_resp.root, &root, tree_idx)?;
+            cm_paths.push(path_resp.siblings);
+            let ask_j = derive_ask(&w.account().ask_base, addr_idx);
+            let (key_idx, auth_root, auth_pub_seed, path) = w.reserve_next_auth(addr_idx)?;
+            if auth_root != stored_auth_root {
+                return Err(format!(
+                    "auth_root mismatch for note at tree index {}",
+                    tree_idx
+                ));
+            }
+            auth_paths.push(path);
+            auth_pub_seeds.push(auth_pub_seed);
+            let (sig, _pk, _digits) = wots_sign(&ask_j, key_idx, &sighash);
+            wots_sigs.push(sig);
+            wots_key_indices.push(key_idx);
+        }
+
+        let total = 5 + 9 * n + n * DEPTH + n * AUTH_DEPTH + n * WOTS_CHAINS + 8;
+        args.push(felt_u64_to_hex(total as u64));
+        args.push(felt_u64_to_hex(n as u64));
+        args.push(felt_to_hex(&auth_domain));
+        args.push(felt_to_hex(&root));
+        args.push(felt_u64_to_hex(amount));
+        args.push(felt_to_hex(&recipient_f));
+
+        for (idx, &si) in selected.iter().enumerate() {
+            let note = &w.notes[si];
+            args.push(felt_to_hex(&note_nullifier(note)));
+            args.push(felt_to_hex(&note.nk_spend));
+            args.push(felt_to_hex(&note.auth_root));
+            args.push(felt_to_hex(&auth_pub_seeds[idx]));
+            args.push(felt_u64_to_hex(wots_key_indices[idx] as u64));
+            args.push(felt_to_hex(&note.d_j));
+            args.push(felt_u64_to_hex(note.v));
+            args.push(felt_to_hex(&note.rseed));
+            args.push(felt_u64_to_hex(note.index as u64));
+        }
+
+        for path in &cm_paths {
+            for sib in path {
+                args.push(felt_to_hex(sib));
+            }
+        }
+        for path in &auth_paths {
+            for sib in path {
+                args.push(felt_to_hex(sib));
+            }
+        }
+        for sig in &wots_sigs {
+            for s in sig {
+                args.push(felt_to_hex(s));
+            }
+        }
+
+        args.push(felt_u64_to_hex(has_change_val));
+        if let Some(cd) = &change_data {
+            args.push(felt_to_hex(&cd.d_j));
+            args.push(felt_u64_to_hex(change));
+            args.push(felt_to_hex(&cd.rseed));
+            args.push(felt_to_hex(&cd.auth_root));
+            args.push(felt_to_hex(&cd.auth_pub_seed));
+            args.push(felt_to_hex(&cd.nk_tag));
+            args.push(felt_to_hex(&cd.mh));
+        } else {
+            for _ in 0..7 {
+                args.push("0x0".to_string());
+            }
+        }
+
+        persist_wallet_and_make_proof(path, &w, pc, "run_unshield", &args)?
+    };
+
+    save_wallet(path, &w)?;
+    let req = UnshieldReq {
+        root,
+        nullifiers: nullifiers.clone(),
+        v_pub: amount,
+        recipient: recipient.into(),
+        cm_change,
+        enc_change,
+        proof,
+    };
+    let kernel_req = unshield_req_to_kernel(&req)?;
+    let submission = rollup.submit_kernel_message(&KernelInboxMessage::Unshield(kernel_req))?;
+    w.register_pending_spend(
+        nullifiers,
+        format!("unshield {}", amount),
+        submission.operation_hash.clone(),
+    );
+    save_wallet(path, &w)?;
+
+    println!(
+        "Submitted unshield of {} into public account {}",
+        amount, recipient
+    );
+    print_rollup_submission(&submission);
+    print_rollup_sync_hint(&submission);
+    Ok(())
+}
+
+fn cmd_withdraw_rollup(
+    profile: &WalletNetworkProfile,
+    sender: &str,
+    amount: u64,
+    recipient: &str,
+) -> Result<(), String> {
+    let rollup = RollupRpc::new(profile);
+    let balances = rollup.load_balances()?;
+    let public_balance = balances.get(sender).copied().unwrap_or(0);
+    if public_balance < amount {
+        return Err(format!(
+            "insufficient public rollup balance for {}: have {}, need {}",
+            sender, public_balance, amount
+        ));
+    }
+    let req = WithdrawReq {
+        sender: sender.into(),
+        recipient: recipient.into(),
+        amount,
+    };
+    let submission = rollup
+        .submit_kernel_message(&KernelInboxMessage::Withdraw(withdraw_req_to_kernel(&req)))?;
+    println!(
+        "Submitted withdrawal of {} from {} to {}",
+        amount, sender, recipient
+    );
+    print_rollup_submission(&submission);
+    println!("The L1 release still requires the normal smart-rollup outbox/cementation flow.");
+    Ok(())
+}
+
 struct PreparedTransferSubmit {
     selected: Vec<usize>,
     change: u64,
@@ -3578,4 +5175,79 @@ fn cmd_fund(ledger: &str, addr: &str, amount: u64) -> Result<(), String> {
     let _: serde_json::Value = post_json(&format!("{}/fund", ledger), &req)?;
     println!("Funded {} with {}", addr, amount);
     Ok(())
+}
+
+#[cfg(test)]
+mod network_profile_tests {
+    use super::*;
+
+    #[test]
+    fn network_profile_roundtrip_persists_shadownet_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let profile_path = default_network_profile_path(wallet_path.to_str().unwrap());
+        let profile = shadownet_profile(
+            "https://rollup.shadownet.example".into(),
+            "sr1ExampleRollup".into(),
+            "KT1ExampleTicketer".into(),
+            Some("https://operator.shadownet.example".into()),
+            "alice".into(),
+            Some("tz1alicepublicaccount".into()),
+            Some("/tmp/octez-client".into()),
+            Some("https://rpc.shadownet.example".into()),
+            Some("ProtoExample".into()),
+            Some("octez-client".into()),
+            Some("2".into()),
+        );
+
+        save_network_profile(&profile_path, &profile).expect("save profile");
+        let loaded = load_network_profile(&profile_path).expect("load profile");
+        assert_eq!(loaded, profile);
+    }
+
+    #[test]
+    fn load_required_network_profile_reads_saved_shadownet_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let profile_path = default_network_profile_path(wallet_path_str);
+        let saved = shadownet_profile(
+            "https://saved-rollup.example".into(),
+            "sr1SavedRollup".into(),
+            "KT1SavedTicketer".into(),
+            None,
+            "bootstrap1".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        save_network_profile(&profile_path, &saved).expect("save profile");
+
+        let loaded = load_required_network_profile(wallet_path_str).expect("saved profile");
+        assert_eq!(loaded, saved);
+        assert_eq!(loaded.public_account, "bootstrap1");
+    }
+
+    #[test]
+    fn parse_rollup_rpc_bytes_accepts_json_hex_and_utf8() {
+        assert_eq!(
+            parse_rollup_rpc_bytes("\"0x616263\"").expect("json hex"),
+            b"abc"
+        );
+        assert_eq!(parse_rollup_rpc_bytes("646566").expect("bare hex"), b"def");
+        assert_eq!(
+            parse_rollup_rpc_bytes("\"tz1Alice\"").expect("utf8"),
+            b"tz1Alice"
+        );
+    }
+
+    #[test]
+    fn mutez_to_tez_string_formats_exact_tezos_amounts() {
+        assert_eq!(mutez_to_tez_string(1), "0.000001");
+        assert_eq!(mutez_to_tez_string(1_500_000), "1.5");
+        assert_eq!(mutez_to_tez_string(2_000_000), "2");
+    }
 }

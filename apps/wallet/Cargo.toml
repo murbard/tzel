@@ -5,7 +5,11 @@ edition = "2021"
 
 [[bin]]
 name = "sp-client"
-path = "src/main.rs"
+path = "src/bin/sp-client.rs"
+
+[[bin]]
+name = "tzel-wallet"
+path = "src/bin/tzel-wallet.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -14,6 +18,8 @@ ml-kem = { version = "=0.3.0-rc.2", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
+tezos-smart-rollup-encoding = "0.2.2"
+tezos_data_encoding_05 = { package = "tezos_data_encoding", version = "0.5" }
 tzel-services = { path = "../../services/tzel" }
 tzel-verifier = { path = "../../verifier" }
 ureq = { version = "3", features = ["json"] }

@@ -2,6 +2,7 @@
 
 pub mod canonical_wire;
 pub mod kernel_wire;
+pub mod operator_api;
 
 use blake2s_simd::Params;
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};

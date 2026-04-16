@@ -5,12 +5,12 @@ use std::sync::OnceLock;
 
 #[cfg(feature = "proof-verifier")]
 use serde::Deserialize;
-use tezos_data_encoding_05::nom::NomReader as _;
+use tezos_data_encoding_05::{enc::BinWriter as _, nom::NomReader as _};
 use tezos_smart_rollup_encoding::{
     contract::Contract as TezosContract,
     inbox::{
-        InboxMessage as TezosInboxMessage, InternalInboxMessage as TezosInternalInboxMessage,
-        Transfer as TezosTransfer,
+        ExternalMessageFrame, InboxMessage as TezosInboxMessage,
+        InternalInboxMessage as TezosInternalInboxMessage, Transfer as TezosTransfer,
     },
     michelson::{
         ticket::FA2_1Ticket, MichelsonBytes, MichelsonContract, MichelsonInt, MichelsonOption,
@@ -80,6 +80,10 @@ impl Host for TestHost {
 
     fn write_debug(&mut self, message: &str) {
         self.debug.push_str(message);
+    }
+
+    fn rollup_address(&self) -> Vec<u8> {
+        sample_rollup_address().hash().as_ref().clone()
     }
 }
 
@@ -501,8 +505,15 @@ fn verified_unshield_rejects_tampered_recipient_without_mutating_state() {
 
 fn encode_external_kernel_message(message: KernelInboxMessage) -> Vec<u8> {
     let payload = encode_kernel_inbox_message(&message).unwrap();
+    let mut framed = Vec::new();
+    ExternalMessageFrame::Targetted {
+        address: sample_rollup_address(),
+        contents: payload.as_slice(),
+    }
+    .bin_write(&mut framed)
+    .unwrap();
     let mut bytes = Vec::new();
-    TezosInboxMessage::<MichelsonUnit>::External(payload.as_slice())
+    TezosInboxMessage::<MichelsonUnit>::External(framed.as_slice())
         .serialize(&mut bytes)
         .unwrap();
     bytes

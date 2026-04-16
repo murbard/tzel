@@ -70,5 +70,17 @@ The resulting kernel is at:
 target/wasm32-unknown-unknown/release/tzel_rollup_kernel.wasm
 ```
 
+For live bridge deposits, originate the rollup with a ticket-bearing parameter
+type:
+
+```text
+(pair bytes (ticket (pair nat (option bytes))))
+```
+
+Originating it as plain `bytes` is sufficient for external messages, but it does
+not allow the L1 ticketer contract to deliver ticket transfers into the inbox.
+The minimal tez bridge contract validated for this flow lives at
+[`tezos/tez_bridge_ticketer.tz`](/home/coder/workspace/tzel/tezos/tez_bridge_ticketer.tz).
+
 You can then strip it and run it with the Octez smart-rollup debugger as
 described in the Tezos smart-rollup tutorial.

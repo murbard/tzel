@@ -211,7 +211,7 @@ originate_rollup() {
     -o "${INSTALLER_HEX}" >/dev/null
   boot_sector="$(tr -d '\n' < "${INSTALLER_HEX}")"
   out="$(octez-client -d "${CLIENT_DIR}" -E "${NODE_ENDPOINT}" -w none \
-    originate smart rollup tzel from operator of kind wasm_2_0_0 of type bytes with kernel "${boot_sector}" --burn-cap 999)"
+    originate smart rollup tzel from operator of kind wasm_2_0_0 of type '(pair bytes (ticket (pair nat (option bytes))))' with kernel "${boot_sector}" --burn-cap 999)"
   printf '%s\n' "${out}" > "${LOG_DIR}/originate-smart-rollup.out"
   octez-client -d "${CLIENT_DIR}" -E "${NODE_ENDPOINT}" bake for operator --minimal-timestamp >/dev/null
   octez-client -d "${CLIENT_DIR}" show known smart rollup tzel | rg -o 'sr1[1-9A-HJ-NP-Za-km-z]+' | head -n1
@@ -237,7 +237,7 @@ start_rollup_node() {
 
 send_configure_bridge_message() {
   local message_hex
-  message_hex="$("${ROOT}/target/debug/octez_kernel_message" configure-bridge "${SAMPLE_TICKETER}")"
+  message_hex="$("${ROOT}/target/debug/octez_kernel_message" configure-bridge "${ROLLUP_ADDRESS}" "${SAMPLE_TICKETER}")"
   octez-client -d "${CLIENT_DIR}" -E "${NODE_ENDPOINT}" -p "${ALPHA_HASH}" -w none \
     send smart rollup message "hex:[ \"${message_hex}\" ]" from operator >/dev/null
   octez-client -d "${CLIENT_DIR}" -E "${NODE_ENDPOINT}" bake for operator --minimal-timestamp >/dev/null
