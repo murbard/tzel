@@ -1,17 +1,16 @@
-# Shadownet Live Shielded Tx Runbook
+# Shadownet Tutorial
 
-This is the exact next-step runbook for a real Shadownet `deposit -> shield -> send`
-flow against a deployed rollup using the operator box.
+This tutorial covers a Shadownet `deposit -> shield -> send` flow against a
+deployed rollup using the operator box.
 
 It assumes:
 
-- the current `main` branch
 - a public operator machine running `octez-node`, `octez-dal-node`,
   `octez-smart-rollup-node`, and `tzel-operator`
 - a live rollup `sr1...`
 - a live bridge ticketer `KT1...`
 
-The goal is to end with:
+It ends with:
 
 1. Alice deposits on L1 and shields into a private note
 2. Bob derives a receive address
@@ -26,7 +25,7 @@ Before you start, make sure the deployed rollup passes:
 
 If `check` reports missing durable note payloads while the tree size is non-zero,
 that deployment cannot support private note sync and should be replaced with a
-fresh rollup origination using the current kernel.
+fresh rollup origination using the committed kernel build.
 
 ## 1. Install The Required Binaries
 
@@ -335,8 +334,8 @@ Then sync both wallets:
 
 Acceptance:
 
-- Alice still has a private balance, reduced by the sent amount
-- Bob now has a private balance equal to the received note
+- Alice has a private balance reduced by the sent amount
+- Bob has a private balance equal to the received note
 
 ## 10. Evidence To Keep
 

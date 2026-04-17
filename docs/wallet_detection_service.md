@@ -1,6 +1,6 @@
 # Wallet Detection And Viewing Service
 
-This repo now supports a delegated watch-only flow built on top of `tzel-wallet`
+This repo supports a delegated watch-only flow built on top of `tzel-wallet`
 and a small HTTP detection service in `tzel-detect`.
 
 The intended separation is:
@@ -82,7 +82,7 @@ Endpoints:
 
 ## Installed Deployment
 
-The shared installer now places `tzel-detect` alongside the other deployable
+The shared installer places `tzel-detect` alongside the other deployable
 TzEL binaries:
 
 ```bash

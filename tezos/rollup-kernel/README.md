@@ -1,15 +1,15 @@
 # TzEL rollup kernel MVP
 
-This crate is the first Tezos smart-rollup kernel scaffold for TzEL.
+This crate is a Tezos smart-rollup kernel scaffold for TzEL.
 
-Current scope:
+Scope:
 - raw WASM host-function bindings
 - shared-ledger integration through `tzel-core`
 - verifier-only proof checks through `tzel-verifier`
 - durable storage for inbox accounting plus path-addressed rollup state
 - host-mock unit tests for the kernel loop
 
-The kernel currently consumes Tezos Data Encoding inbox messages, records:
+The kernel consumes Tezos Data Encoding inbox messages and records:
 - total inbox message count
 - total inbox bytes seen
 - last inbox message level/id
@@ -49,13 +49,8 @@ Durable storage paths:
 - `/tzel/v1/state/verifier_config.bin`
 - `/tzel/v1/state/last_result.bin`
 
-This is still intentionally narrower than the eventual TzEL rollup
-integration. The kernel now reuses the shared state-transition logic and
-verifies proofs in-kernel without linking prover code.
-
-The bridge notes in `minimal_tez_bridge.md`
-are informative background for the eventual Tezos ticket plumbing, not a
-normative protocol specification.
+This crate reuses the shared state-transition logic and verifies proofs
+in-kernel without linking prover code.
 
 Build the kernel WASM:
 

@@ -4,15 +4,15 @@
 
 **Post-quantum private transactions with STARK proofs.**
 
-> **WARNING: This project is under active development. Neither the cryptographic scheme nor the implementation should be assumed secure. Do not use for real value. The protocol design is evolving — see `specs/spec.md` for the current state.**
+> **WARNING: This project is under active development. Neither the cryptographic scheme nor the implementation should be assumed secure. Do not use for real value. See `specs/spec.md` for the protocol definition used by the code in this repository.**
 
-Privacy on blockchains today relies on elliptic curve cryptography that quantum computers will break. TzEL replaces every elliptic curve with post-quantum alternatives — BLAKE2s hashing, ML-KEM-768 lattice-based encryption, Winternitz-style one-time spend authorization verified inside the STARK, and recursive STARK proofs — with current reference proofs around 300 KB and verification around 35 ms.
+Privacy on blockchains today relies on elliptic curve cryptography that quantum computers will break. TzEL replaces every elliptic curve with post-quantum alternatives — BLAKE2s hashing, ML-KEM-768 lattice-based encryption, Winternitz-style one-time spend authorization verified inside the STARK, and recursive STARK proofs — with reference proofs around 300 KB and verification around 35 ms.
 
 ### Features
 
 - **Post-quantum end-to-end.** No elliptic curves anywhere. BLAKE2s for commitments and nullifiers, ML-KEM-768 for encrypted memos, Winternitz-style one-time signatures for spend authorization (verified inside the STARK), and recursive STARKs for proofs.
 - **~300 KB recursive zero-knowledge proofs.** Two-level recursive STARKs (Cairo AIR -> Stwo circuit reprover) with ZK blinding.
-- **Delegated proving with spend-bound authorization.** Outsource proof generation to an untrusted server. Each spend uses a fresh one-time hash-signature key from a Merkle tree, and the signature is verified inside the STARK, so the prover cannot redirect funds by changing outputs. On the current reference stack, proof generation is measured in tens of seconds rather than milliseconds.
+- **Delegated proving with spend-bound authorization.** Outsource proof generation to an untrusted server. Each spend uses a fresh one-time hash-signature key from a Merkle tree, and the signature is verified inside the STARK, so the prover cannot redirect funds by changing outputs. On the reference stack, proof generation is measured in tens of seconds rather than milliseconds.
 - **Fuzzy message detection.** ML-KEM-based detection keys let a lightweight indexer flag likely-incoming transactions without being able to read them.
 - **Diversified addresses.** Generate unlimited unlinkable addresses from a single master key.
 - **1 KB encrypted memos.** End-to-end encrypted with ML-KEM-768 + ChaCha20-Poly1305.
@@ -51,19 +51,20 @@ target/release/sp-client balance
 
 For deployment-oriented installs with standard paths instead of a workspace checkout:
 
+- docs map: `docs/README.md`
 - operator box: `ops/shadownet/README.md`
 - prover layout: `ops/prover/README.md`
 - watch-only detection service: `docs/wallet_detection_service.md`
 - shared binary installer: `./scripts/install_tzel_binaries.sh --prefix /usr/local --executables-dir /opt/tzel/cairo/target/dev`
 - live public-box smoke: `TZEL_SMOKE_L1_RECIPIENT=tz1... ./scripts/shadownet_live_e2e_smoke.sh /etc/tzel/shadownet.env`
 
-> **WARNING:** The ledger now refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `cairo/target/dev`). `--trust-me-bro` is never appropriate for real value.
+> **WARNING:** The ledger refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `cairo/target/dev`). `--trust-me-bro` is never appropriate for real value.
 >
 > **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, and memo-hash checks. Its public-balance layer intentionally uses submitted strings such as `"alice"` as stand-ins for chain-native caller identity. It is not a network-authenticated wallet service and should not be exposed as a real public endpoint.
 >
 > **DEVELOPER WALLET NOTE:** `sp-client` is a developer/reference CLI used for local testing, demos, and integration flows. It persists plaintext secrets and wallet state in local JSON files and is not intended to be a hardened end-user wallet.
 
-For local testing and fast integration loops, `--trust-me-bro` is still useful: `sp-client` skips STARK proving and `sp-ledger` accepts unverified bundles so you can exercise the state-transition checks quickly. Keep that mode on localhost only and switch back to `--reprove-bin` for any path where proof verification actually matters.
+For local testing and fast integration loops, `--trust-me-bro` is useful: `sp-client` skips STARK proving and `sp-ledger` accepts unverified bundles so you can exercise the state-transition checks quickly. Keep that mode on localhost only and switch back to `--reprove-bin` for any path where proof verification actually matters.
 
 ## Architecture
 
@@ -160,14 +161,14 @@ ocaml/                  Independent OCaml implementation
 
 ## Rollup kernel MVP
 
-The shared deterministic Rust layer now lives in `core/`.
+The shared deterministic Rust layer is in `core/`.
 Both the HTTP ledger path and the rollup-kernel MVP are meant to call that same
 logic rather than fork state-transition code.
 
-The first Tezos smart-rollup kernel scaffold lives in
+The Tezos smart-rollup kernel scaffold lives in
 `tezos/rollup-kernel/`.
 
-It currently:
+It:
 - reads raw inbox messages from the WASM host
 - persists basic durable state for inbox stats and the last message seen
 - decodes Tezos Data Encoding inbox messages into shared TzEL request types
@@ -175,9 +176,6 @@ It currently:
 - applies the shared transition logic from `tzel-core`
 - persists path-addressed durable state for notes, bridge balances, roots, nullifiers, and the commitment-tree frontier
 - verifies proofs through the shared verifier path without linking prover code
-
-The current bridge sketch in `minimal_tez_bridge.md`
-is informative only.
 
 Build it with:
 

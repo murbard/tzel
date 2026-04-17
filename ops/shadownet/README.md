@@ -11,12 +11,6 @@ operator machine that runs:
 
 ## Why A Public Box Matters
 
-Live testing from this VM showed the following failure mode:
-
-- DAL commitments were published successfully
-- the slots later became `unattested`
-- the rollup node then revealed `0` bytes for the DAL pages
-
 For real shielded traffic, the DAL node that publishes slots must be reachable
 by the rest of the DAL network. In practice that means:
 
@@ -128,5 +122,5 @@ the rollup state:
 ```
 
 If `check` reports missing durable note payloads while the tree size is non-zero,
-the live rollup was likely originated with an older kernel and should be
-redeployed before user testing.
+that rollup deployment does not support private note sync and should be
+reoriginated before user testing.

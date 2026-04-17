@@ -15,3 +15,8 @@ bob.json
 mutants.out*/
 aws_creds
 third_party/patched-git/
+
+# Local agent/editor scratch
+.claude/
+.attic/
+VM_HANDOFF_*.md

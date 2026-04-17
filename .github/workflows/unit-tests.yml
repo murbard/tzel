@@ -6,11 +6,9 @@ on:
       - main
       - wip-xmss-depth16-migration
     paths-ignore:
-      - "docs/spec.html"
       - "docs/pq.png"
   pull_request:
     paths-ignore:
-      - "docs/spec.html"
       - "docs/pq.png"
   workflow_dispatch:
 

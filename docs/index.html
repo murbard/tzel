@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>TzEL — Tezos Encrypted Ledger</title>
-  <meta name="description" content="Post-quantum private transactions for Tezos. No elliptic curves. STARK proofs. Future-proof privacy today.">
+  <meta name="description" content="Post-quantum private transactions for Tezos. Experimental smart rollup with open wallet and operator tooling.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
@@ -589,23 +589,22 @@
         </a>
         <div class="nav-links">
           <a href="#why">Why PQ</a>
-          <a href="#features">Features</a>
-          <a href="spec.html">Spec</a>
-          <a href="https://github.com/murbard/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">GitHub</a>
+          <a href="#live">Status</a>
+          <a href="https://github.com/murbard/tzel/tree/main/docs" target="_blank" rel="noreferrer">Docs</a>
+          <a href="https://github.com/murbard/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">View on GitHub</a>
         </div>
       </div>
     </nav>
 
     <section class="hero">
       <div class="hero-content">
-        <div class="hero-badge">Experimental Smart Rollup</div>
         <h1>Tezos Encrypted Ledger.<br><span class="gradient-text">Private. Post-quantum. Now.</span></h1>
         <p class="hero-sub">
-          Post-quantum private transactions for Tezos, currently being developed as an experimental smart rollup. No elliptic curves anywhere in the stack. Designed for Tezos X.
+          TzEL is an experimental Tezos smart rollup for private, post-quantum transactions. It replaces elliptic-curve cryptography with hashes, ML-KEM, and STARK proofs.
         </p>
         <div class="hero-actions">
           <a href="https://github.com/murbard/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">View on GitHub</a>
-          <a href="spec.html" class="btn btn-outline">Read the spec</a>
+          <a href="https://github.com/murbard/tzel/blob/main/docs/shadownet_tutorial.md" class="btn btn-outline" target="_blank" rel="noreferrer">Open the tutorial</a>
         </div>
       </div>
     </section>
@@ -664,8 +663,8 @@
               <path d="M17 14v6"></path>
             </svg>
           </div>
-          <div class="stat-value">Curve-free by design</div>
-          <div class="stat-label">The privacy stack avoids elliptic curves end to end.</div>
+          <div class="stat-value">Live on Shadownet</div>
+          <div class="stat-label">Shield and private-send transactions already execute on a public Tezos test network.</div>
         </div>
         <div class="stat">
           <div class="stat-icon" aria-hidden="true">
@@ -676,8 +675,8 @@
               <path d="M13.75 10.75 17 14l3.25-3.25"></path>
             </svg>
           </div>
-          <div class="stat-value">Delegated proving</div>
-          <div class="stat-label">Authorize on constrained hardware and prove on larger machines.</div>
+          <div class="stat-value">No elliptic curves</div>
+          <div class="stat-label">The privacy stack uses hashes, ML-KEM, and STARK proofs instead of elliptic-curve cryptography.</div>
         </div>
         <div class="stat">
           <div class="stat-icon" aria-hidden="true">
@@ -687,8 +686,8 @@
               <path d="M12 13.5v3"></path>
             </svg>
           </div>
-          <div class="stat-value">Encrypted by default</div>
-          <div class="stat-label">Notes, balances, and memos are private unless you choose to disclose them.</div>
+          <div class="stat-value">Authorize locally</div>
+          <div class="stat-label">Spending authority stays in the wallet while proof generation can run on a larger machine.</div>
         </div>
         <div class="stat">
           <div class="stat-icon" aria-hidden="true">
@@ -698,17 +697,55 @@
               <path d="M13.5 5 10.5 19"></path>
             </svg>
           </div>
-          <div class="stat-value">Public development</div>
-          <div class="stat-label">Spec, circuits, wallet, and prover are developed in the open.</div>
+          <div class="stat-value">Open stack</div>
+          <div class="stat-label">Wallet, prover, operator, and rollup code are all developed in the open.</div>
         </div>
       </div>
     </section>
+
+    <div class="features" id="live">
+      <div class="feature">
+        <div>
+          <h3>How far along is it?<br>Experimental, but already running.</h3>
+          <p>TzEL is still R&amp;D code and not suitable for real value. It already runs as a Tezos smart rollup on Shadownet, with proof-bearing shield and private-send transactions going through the DAL.</p>
+          <p>Today there is a real testnet path from wallet to rollup execution, not just isolated proofs or local demos.</p>
+        </div>
+        <div class="feature-visual">
+          <span class="dim">live shield:</span><br>
+          <a href="https://shadownet.tzkt.io/ooAbD9iupmH8daZW9t31s5FzpmiYMiYoU6FzPXAPHuyGXQqhPBH" target="_blank" rel="noreferrer"><span class="hl">ooAbD9...QqhPBH</span></a><br>
+          <br>
+          <span class="dim">live private send:</span><br>
+          <a href="https://shadownet.tzkt.io/ooTMBvzqUY1mkjNoLK2VVqY1r6Z47qf4UDbN2ivg22xeSTTFs4j" target="_blank" rel="noreferrer"><span class="hl">ooTMBv...TTFs4j</span></a><br>
+          <br>
+          <span class="dim">status:</span><br>
+          experimental rollup<br>
+          <span class="hl">working testnet path</span><br>
+          not production-ready
+        </div>
+      </div>
+
+      <div class="feature">
+        <div>
+          <h3>How the stack runs.<br>Smart rollup plus DAL.</h3>
+          <p>TzEL runs as a Tezos smart rollup. Shielded transactions carry STARK proofs, and those proofs are large enough that Tezos's data availability layer is a natural place to post them.</p>
+        </div>
+        <div class="feature-visual">
+          <span class="dim">execution:</span> <span class="hl">Tezos smart rollup</span><br>
+          <span class="dim">proof system:</span> <span class="hl">recursive STARKs</span><br>
+          <span class="dim">availability:</span> <span class="hl">Tezos DAL</span><br>
+          <span class="dim">transactions:</span> <span class="hl">shielded rollup txs</span><br>
+          <br>
+          <span class="hl">large proofs, live rollup execution</span>
+        </div>
+      </div>
+
+    </div>
 
     <div class="features" id="features">
       <div class="feature">
         <div>
           <h3>No elliptic curves.<br>Anywhere.</h3>
-          <p>TzEL doesn't patch curves with a post-quantum layer&mdash;it eliminates them entirely. BLAKE2s for hashing, ML-KEM-768 for encryption, hash-based one-time signatures for spend authorization, and STARKs for proofs.</p>
+          <p>TzEL does not add a post-quantum wrapper around a curve-based privacy system. It removes elliptic curves from the privacy stack entirely: BLAKE2s for hashing, ML-KEM-768 for encryption, hash-based one-time signatures for spend authorization, and STARKs for proofs.</p>
           <p>Fund safety relies on hash collision resistance and STARK soundness. Note confidentiality relies on ML-KEM (NIST FIPS 203) and authenticated encryption. No component depends on the hardness of discrete log or factoring.</p>
         </div>
         <div class="feature-visual">
@@ -718,57 +755,50 @@
           <span class="dim">spend auth</span> = <span class="hl">hash-based OTS</span> verified in-STARK<br>
           <span class="dim">proof</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; = <span class="hl">recursive STARK</span> (Cairo + Stwo)
         </div>
+        </div>
+
+      <div class="feature">
+        <div>
+          <h3>Authorize locally.<br>Prove elsewhere.</h3>
+          <p>TzEL separates spending authority from proving. A wallet authorizes a transaction locally with a hash-based signature, while proof generation can run on a larger machine.</p>
+          <p>The signature is checked <em>inside</em> the STARK itself. An untrusted prover can help produce the proof, but it cannot change the transaction or gain spend authority.</p>
+          <p>That makes the system easier to operate: wallets stay small, proving can be delegated, and the rollup still verifies the exact transaction the wallet approved.</p>
+        </div>
+        <div class="feature-visual">
+          <span class="dim">wallet:</span><br>
+          &nbsp;&nbsp;approve transaction<br>
+          &nbsp;&nbsp;&rarr; <span class="hl">hash-based signature</span><br>
+          <br>
+          <span class="dim">prover:</span><br>
+          &nbsp;&nbsp;build <span class="hl">STARK proof</span><br>
+          <br>
+          <span class="dim">rollup:</span><br>
+          &nbsp;&nbsp;verify proof and transaction<br>
+          <br>
+          <span class="hl">no spend key leaves the wallet</span>
+        </div>
       </div>
 
       <div class="feature">
         <div>
-          <h3>Sign on your hardware wallet.<br>Prove anywhere.</h3>
-          <p>TzEL separates signing from proving. Even the most lightweight device&mdash;a hardware wallet, a phone, a smart card&mdash;can authorize a transaction by producing a single hash-based signature. The heavy proof generation is outsourced to any untrusted machine.</p>
-          <p>The signature is verified <em>inside</em> the STARK circuit. A malicious prover cannot redirect funds&mdash;the signature binds to the exact outputs. The prover never sees your signing key, and the chain never sees auth leaves, public keys, or spend signatures.</p>
-          <p>Run the prover on your own machine, or delegate to a third-party service running a TEE. In the worst case&mdash;a TEE breach&mdash;the attacker learns which transaction you made, but still cannot steal funds or forge spends. Proving is a pure computation with no secret key access.</p>
+          <h3>Watch without spending.<br>Share visibility, not control.</h3>
+          <p>TzEL separates detection, viewing, and spending. Detection material can flag likely incoming notes. Viewing material can validate and decrypt them. Spending authority stays separate.</p>
+          <p>That makes a contained watch-only service possible: a delegated scanner can follow the chain and report incoming activity without being able to move funds.</p>
         </div>
         <div class="feature-visual">
-          <span class="dim">hardware wallet:</span><br>
-          &nbsp;&nbsp;sign(sighash) &rarr; <span class="hl">wots_signature</span><br>
+          <span class="dim">detection key:</span><br>
+          &nbsp;&nbsp;<span class="hl">candidate matches</span><br>
           <br>
-          <span class="dim">untrusted prover:</span><br>
-          &nbsp;&nbsp;witness + signature &rarr; <span class="hl">STARK proof</span><br>
+          <span class="dim">viewing key:</span><br>
+          &nbsp;&nbsp;<span class="hl">incoming notes and memos</span><br>
           <br>
-          <span class="dim">on-chain verifier sees:</span><br>
-          &nbsp;&nbsp;proof, nullifiers, commitments<br>
-          &nbsp;&nbsp;<span class="hl">no keys, no signatures, no auth leaves</span>
-        </div>
-      </div>
-
-      <div class="feature">
-        <div>
-          <h3>Your transactions.<br>Your choice who sees them.</h3>
-          <p>Private notes and memos are encrypted on-chain by default. The chain still reveals transaction shape and timing, but not note plaintexts, auth paths, or spend signatures.</p>
-          <p>TzEL gives you fine-grained viewing keys you can share selectively. Give an auditor read access to a single address. Let a portfolio tracker see balances without spending power. Disclose exactly what you choose, to exactly who you choose, and nothing more.</p>
-        </div>
-        <div class="feature-visual">
-          <span class="dim">on-chain:</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span class="hl">encrypted</span> note data<br>
+          <span class="dim">spending key:</span><br>
+          &nbsp;&nbsp;move funds<br>
           <br>
-          <span class="dim">detection key:</span> flag incoming txs<br>
-          <span class="dim">viewing key:</span>&nbsp;&nbsp; read balances + memos<br>
-          <span class="dim">spending key:</span>&nbsp; full control<br>
-          <br>
-          <span class="hl">you choose who gets what</span>
+          <span class="hl">watch services can observe, not spend</span>
         </div>
       </div>
     </div>
-
-    <section class="cta-section">
-      <div class="cta-inner">
-        <h2>Follow the development</h2>
-        <p>TzEL is under active development as a Tezos smart rollup, with the goal of merging into Tezos X.</p>
-        <div class="cta-actions">
-          <a href="https://github.com/murbard/tzel" class="btn btn-primary" target="_blank" rel="noreferrer">GitHub Repository</a>
-          <a href="spec.html" class="btn btn-outline">Protocol Specification</a>
-        </div>
-      </div>
-    </section>
-
     <footer>
       <p>TzEL &mdash; Tezos Encrypted Ledger &mdash; <a href="https://github.com/murbard/tzel" target="_blank" rel="noreferrer">github.com/murbard/tzel</a></p>
     </footer>
