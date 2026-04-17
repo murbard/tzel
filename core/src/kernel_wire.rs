@@ -3,15 +3,17 @@ use crate::canonical_wire::{
     wire_to_u64, WireEncryptedNote, WireFelt, WirePaymentAddress, WireU16Le, WireU64Le,
 };
 use crate::{
-    EncryptedNote, PaymentAddress, ProgramHashes, Proof, ShieldReq, ShieldResp, TransferReq,
-    TransferResp, UnshieldReq, UnshieldResp, WithdrawReq, WithdrawResp, ENCRYPTED_NOTE_BYTES, F,
-    ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES,
+    hash, wots_sign, EncryptedNote, PaymentAddress, ProgramHashes, Proof, ShieldReq, ShieldResp,
+    TransferReq, TransferResp, UnshieldReq, UnshieldResp, WithdrawReq, WithdrawResp,
+    ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES,
 };
 use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const KERNEL_WIRE_VERSION: u16 = 6;
+pub const KERNEL_WIRE_VERSION: u16 = 7;
+pub const KERNEL_VERIFIER_CONFIG_KEY_INDEX: u32 = 0;
+pub const KERNEL_BRIDGE_CONFIG_KEY_INDEX: u32 = 1;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
 const MAX_MEMO_BYTES: usize = 4096;
 const MAX_PROOF_BYTES: usize = 8 * 1024 * 1024;
@@ -30,15 +32,27 @@ const MAX_TRANSFER_PAYLOAD_BYTES: usize =
 const MAX_UNSHIELD_PAYLOAD_BYTES: usize =
     (3 * 32) + MAX_ENCODED_PROOF_WIRE_BYTES + MAX_ENCODED_NOTE_WIRE_BYTES + 65536;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelVerifierConfig {
     pub auth_domain: F,
     pub verified_program_hashes: ProgramHashes,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelSignedVerifierConfig {
+    pub config: KernelVerifierConfig,
+    pub signature: Vec<F>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KernelBridgeConfig {
     pub ticketer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelSignedBridgeConfig {
+    pub config: KernelBridgeConfig,
+    pub signature: Vec<F>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,8 +126,8 @@ pub struct KernelDalPayloadPointer {
 
 #[derive(Debug, Clone)]
 pub enum KernelInboxMessage {
-    ConfigureVerifier(KernelVerifierConfig),
-    ConfigureBridge(KernelBridgeConfig),
+    ConfigureVerifier(KernelSignedVerifierConfig),
+    ConfigureBridge(KernelSignedBridgeConfig),
     Shield(KernelShieldReq),
     Transfer(KernelTransferReq),
     Unshield(KernelUnshieldReq),
@@ -181,9 +195,21 @@ struct WireKernelVerifierConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireSignedKernelVerifierConfig {
+    config: WireKernelVerifierConfig,
+    signature: WireEncodedFeltList,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireKernelBridgeConfig {
     #[encoding(string = "MAX_ACCOUNT_ID_BYTES")]
     ticketer: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireSignedKernelBridgeConfig {
+    config: WireKernelBridgeConfig,
+    signature: WireEncodedFeltList,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -295,9 +321,9 @@ struct WireOptionalEncodedNote {
 #[encoding(tags = "u8")]
 enum WireKernelInboxMessage {
     #[encoding(tag = 0)]
-    ConfigureVerifier(WireKernelVerifierConfig),
+    ConfigureVerifier(WireSignedKernelVerifierConfig),
     #[encoding(tag = 1)]
-    ConfigureBridge(WireKernelBridgeConfig),
+    ConfigureBridge(WireSignedKernelBridgeConfig),
     #[encoding(tag = 2)]
     Shield(WireKernelShieldReq),
     #[encoding(tag = 3)]
@@ -346,10 +372,10 @@ pub fn encode_kernel_inbox_message(message: &KernelInboxMessage) -> Result<Vec<u
         version: u16_to_wire(KERNEL_WIRE_VERSION),
         message: match message {
             KernelInboxMessage::ConfigureVerifier(cfg) => {
-                WireKernelInboxMessage::ConfigureVerifier(config_to_wire(cfg))
+                WireKernelInboxMessage::ConfigureVerifier(signed_config_to_wire(cfg)?)
             }
             KernelInboxMessage::ConfigureBridge(cfg) => {
-                WireKernelInboxMessage::ConfigureBridge(bridge_config_to_wire(cfg))
+                WireKernelInboxMessage::ConfigureBridge(signed_bridge_config_to_wire(cfg)?)
             }
             KernelInboxMessage::Shield(req) => {
                 WireKernelInboxMessage::Shield(kernel_shield_req_to_wire(req)?)
@@ -381,10 +407,10 @@ pub fn decode_kernel_inbox_message(bytes: &[u8]) -> Result<KernelInboxMessage, S
     }
     match wire.message {
         WireKernelInboxMessage::ConfigureVerifier(cfg) => Ok(
-            KernelInboxMessage::ConfigureVerifier(config_from_wire(cfg)?),
+            KernelInboxMessage::ConfigureVerifier(signed_config_from_wire(cfg)?),
         ),
         WireKernelInboxMessage::ConfigureBridge(cfg) => Ok(KernelInboxMessage::ConfigureBridge(
-            bridge_config_from_wire(cfg)?,
+            signed_bridge_config_from_wire(cfg)?,
         )),
         WireKernelInboxMessage::Shield(req) => Ok(KernelInboxMessage::Shield(
             kernel_shield_req_from_wire(req)?,
@@ -457,6 +483,42 @@ pub fn decode_kernel_result(bytes: &[u8]) -> Result<KernelResult, String> {
 
 pub fn encode_kernel_verifier_config(config: &KernelVerifierConfig) -> Result<Vec<u8>, String> {
     encode_tze(&config_to_wire(config))
+}
+
+pub fn kernel_verifier_config_sighash(config: &KernelVerifierConfig) -> Result<F, String> {
+    let encoded = encode_kernel_verifier_config(config)?;
+    let mut payload = b"tzel-config-verifier".to_vec();
+    payload.extend_from_slice(&encoded);
+    Ok(hash(&payload))
+}
+
+pub fn kernel_bridge_config_sighash(config: &KernelBridgeConfig) -> Result<F, String> {
+    let encoded = encode_tze(&bridge_config_to_wire(config))?;
+    let mut payload = b"tzel-config-bridge".to_vec();
+    payload.extend_from_slice(&encoded);
+    Ok(hash(&payload))
+}
+
+pub fn sign_kernel_verifier_config(
+    ask: &F,
+    config: KernelVerifierConfig,
+) -> Result<KernelSignedVerifierConfig, String> {
+    let sighash = kernel_verifier_config_sighash(&config)?;
+    Ok(KernelSignedVerifierConfig {
+        config,
+        signature: wots_sign(ask, KERNEL_VERIFIER_CONFIG_KEY_INDEX, &sighash).0,
+    })
+}
+
+pub fn sign_kernel_bridge_config(
+    ask: &F,
+    config: KernelBridgeConfig,
+) -> Result<KernelSignedBridgeConfig, String> {
+    let sighash = kernel_bridge_config_sighash(&config)?;
+    Ok(KernelSignedBridgeConfig {
+        config,
+        signature: wots_sign(ask, KERNEL_BRIDGE_CONFIG_KEY_INDEX, &sighash).0,
+    })
 }
 
 pub fn decode_kernel_verifier_config(bytes: &[u8]) -> Result<KernelVerifierConfig, String> {
@@ -551,10 +613,28 @@ fn config_to_wire(config: &KernelVerifierConfig) -> WireKernelVerifierConfig {
     }
 }
 
+fn signed_config_to_wire(
+    config: &KernelSignedVerifierConfig,
+) -> Result<WireSignedKernelVerifierConfig, String> {
+    Ok(WireSignedKernelVerifierConfig {
+        config: config_to_wire(&config.config),
+        signature: encoded_felt_list_to_wire(&config.signature)?,
+    })
+}
+
 fn config_from_wire(wire: WireKernelVerifierConfig) -> Result<KernelVerifierConfig, String> {
     Ok(KernelVerifierConfig {
         auth_domain: wire_to_felt(wire.auth_domain)?,
         verified_program_hashes: program_hashes_from_wire(wire.verified_program_hashes)?,
+    })
+}
+
+fn signed_config_from_wire(
+    wire: WireSignedKernelVerifierConfig,
+) -> Result<KernelSignedVerifierConfig, String> {
+    Ok(KernelSignedVerifierConfig {
+        config: config_from_wire(wire.config)?,
+        signature: encoded_felt_list_from_wire(wire.signature)?,
     })
 }
 
@@ -564,9 +644,27 @@ fn bridge_config_to_wire(config: &KernelBridgeConfig) -> WireKernelBridgeConfig 
     }
 }
 
+fn signed_bridge_config_to_wire(
+    config: &KernelSignedBridgeConfig,
+) -> Result<WireSignedKernelBridgeConfig, String> {
+    Ok(WireSignedKernelBridgeConfig {
+        config: bridge_config_to_wire(&config.config),
+        signature: encoded_felt_list_to_wire(&config.signature)?,
+    })
+}
+
 fn bridge_config_from_wire(wire: WireKernelBridgeConfig) -> Result<KernelBridgeConfig, String> {
     Ok(KernelBridgeConfig {
         ticketer: wire.ticketer,
+    })
+}
+
+fn signed_bridge_config_from_wire(
+    wire: WireSignedKernelBridgeConfig,
+) -> Result<KernelSignedBridgeConfig, String> {
+    Ok(KernelSignedBridgeConfig {
+        config: bridge_config_from_wire(wire.config)?,
+        signature: encoded_felt_list_from_wire(wire.signature)?,
     })
 }
 
@@ -1756,11 +1854,12 @@ mod tests {
         }
 
         #[test]
-        fn prop_kernel_verifier_config_roundtrip_preserves_fields(
+        fn prop_signed_kernel_verifier_config_roundtrip_preserves_fields(
             auth_domain in arb_felt(),
             shield in arb_felt(),
             transfer in arb_felt(),
             unshield in arb_felt(),
+            ask in arb_felt(),
         ) {
             let config = KernelVerifierConfig {
                 auth_domain,
@@ -1771,12 +1870,17 @@ mod tests {
                 },
             };
 
-            let encoded = encode_kernel_verifier_config(&config).unwrap();
-            let decoded = decode_kernel_verifier_config(&encoded).unwrap();
-            prop_assert_eq!(decoded.auth_domain, auth_domain);
-            prop_assert_eq!(decoded.verified_program_hashes.shield, shield);
-            prop_assert_eq!(decoded.verified_program_hashes.transfer, transfer);
-            prop_assert_eq!(decoded.verified_program_hashes.unshield, unshield);
+            let signed = sign_kernel_verifier_config(&ask, config).unwrap();
+            let encoded = encode_kernel_inbox_message(&KernelInboxMessage::ConfigureVerifier(
+                signed.clone(),
+            ))
+            .unwrap();
+            let decoded = decode_kernel_inbox_message(&encoded).unwrap();
+            let KernelInboxMessage::ConfigureVerifier(decoded) = decoded else {
+                prop_assert!(false, "decoded message variant mismatch");
+                unreachable!();
+            };
+            prop_assert_eq!(decoded, signed);
         }
 
         #[test]
@@ -1980,8 +2084,11 @@ mod tests {
     fn decode_kernel_inbox_message_rejects_wrong_version() {
         let bytes = encode_tze(&WireKernelInboxEnvelope {
             version: u16_to_wire(KERNEL_WIRE_VERSION + 1),
-            message: WireKernelInboxMessage::ConfigureBridge(WireKernelBridgeConfig {
-                ticketer: "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc".into(),
+            message: WireKernelInboxMessage::ConfigureBridge(WireSignedKernelBridgeConfig {
+                config: WireKernelBridgeConfig {
+                    ticketer: "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc".into(),
+                },
+                signature: WireEncodedFeltList { bytes: Vec::new() },
             }),
         })
         .unwrap();

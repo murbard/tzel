@@ -21,15 +21,17 @@ use tezos_smart_rollup_encoding::{
     smart_rollup::SmartRollupAddress,
 };
 use tzel_core::kernel_wire::{
-    encode_kernel_inbox_message, KernelBridgeConfig, KernelInboxMessage, KernelResult,
-    KernelWithdrawReq,
+    encode_kernel_inbox_message, sign_kernel_bridge_config, KernelBridgeConfig,
+    KernelInboxMessage, KernelResult, KernelWithdrawReq,
 };
 #[cfg(feature = "proof-verifier")]
 use tzel_core::kernel_wire::{
-    KernelShieldReq, KernelStarkProof, KernelTransferReq, KernelUnshieldReq, KernelVerifierConfig,
+    sign_kernel_verifier_config, KernelShieldReq, KernelStarkProof, KernelTransferReq,
+    KernelUnshieldReq, KernelVerifierConfig,
 };
+use tzel_core::{hash, F};
 #[cfg(feature = "proof-verifier")]
-use tzel_core::{ProgramHashes, Proof, ShieldReq, TransferReq, UnshieldReq, F};
+use tzel_core::{ProgramHashes, Proof, ShieldReq, TransferReq, UnshieldReq};
 use tzel_rollup_kernel::{
     read_last_input, read_last_result, read_ledger, read_stats, run_with_host, DalParameters, Host,
     InputMessage, MAX_INPUT_BYTES,
@@ -101,13 +103,30 @@ impl Host for TestHost {
     }
 }
 
+fn sample_config_admin_ask() -> F {
+    hash(b"tzel-dev-rollup-config-admin")
+}
+
+fn signed_bridge_message(config: KernelBridgeConfig) -> KernelInboxMessage {
+    KernelInboxMessage::ConfigureBridge(
+        sign_kernel_bridge_config(&sample_config_admin_ask(), config).unwrap(),
+    )
+}
+
+#[cfg(feature = "proof-verifier")]
+fn signed_verifier_message(config: KernelVerifierConfig) -> KernelInboxMessage {
+    KernelInboxMessage::ConfigureVerifier(
+        sign_kernel_verifier_config(&sample_config_admin_ask(), config).unwrap(),
+    )
+}
+
 #[test]
 fn bridge_roundtrip_survives_restarts_and_preserves_append_only_withdrawals() {
     let mut host = TestHost::default();
     host.push_input(
         0,
         0,
-        encode_external_kernel_message(KernelInboxMessage::ConfigureBridge(KernelBridgeConfig {
+        encode_external_kernel_message(signed_bridge_message(KernelBridgeConfig {
             ticketer: sample_ticketer().into(),
         })),
     );
@@ -232,7 +251,7 @@ fn bridge_deposit_requires_configuration_and_recovers_after_external_configurati
     host.push_input(
         1,
         0,
-        encode_external_kernel_message(KernelInboxMessage::ConfigureBridge(KernelBridgeConfig {
+        encode_external_kernel_message(signed_bridge_message(KernelBridgeConfig {
             ticketer: sample_ticketer().into(),
         })),
     );
@@ -754,17 +773,15 @@ fn configure_verified_bridge_with_hashes(
     host.push_input(
         0,
         0,
-        encode_external_kernel_message(KernelInboxMessage::ConfigureVerifier(
-            KernelVerifierConfig {
-                auth_domain: fixture.auth_domain,
-                verified_program_hashes: hashes,
-            },
-        )),
+        encode_external_kernel_message(signed_verifier_message(KernelVerifierConfig {
+            auth_domain: fixture.auth_domain,
+            verified_program_hashes: hashes,
+        })),
     );
     host.push_input(
         1,
         0,
-        encode_external_kernel_message(KernelInboxMessage::ConfigureBridge(KernelBridgeConfig {
+        encode_external_kernel_message(signed_bridge_message(KernelBridgeConfig {
             ticketer: fixture.bridge_ticketer.clone(),
         })),
     );

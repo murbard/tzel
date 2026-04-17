@@ -4,16 +4,18 @@ use hex::encode as hex_encode;
 use tezos_data_encoding_05::enc::BinWriter as _;
 use tezos_smart_rollup_encoding::{inbox::ExternalMessageFrame, smart_rollup::SmartRollupAddress};
 use tzel_core::{
+    auth_leaf_hash, derive_auth_pub_seed, hash,
     kernel_wire::{
-        encode_kernel_inbox_message, KernelBridgeConfig, KernelDalChunkPointer,
-        KernelDalPayloadKind, KernelDalPayloadPointer, KernelInboxMessage, KernelVerifierConfig,
+        encode_kernel_inbox_message, sign_kernel_bridge_config, sign_kernel_verifier_config,
+        KernelBridgeConfig, KernelDalChunkPointer, KernelDalPayloadKind, KernelDalPayloadPointer,
+        KernelInboxMessage, KernelVerifierConfig,
     },
     ProgramHashes, F,
 };
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  octez_kernel_message configure-bridge <sr1...> <KT1...>\n  octez_kernel_message configure-verifier <sr1...> <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message dal-pointer <sr1...> <shield|transfer|unshield> <payload_hash_hex> <payload_len> (<published_level> <slot_index> <chunk_len>)+"
+        "usage:\n  octez_kernel_message admin-material\n  octez_kernel_message configure-bridge <sr1...> <KT1...>\n  octez_kernel_message configure-verifier <sr1...> <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message dal-pointer <sr1...> <shield|transfer|unshield> <payload_hash_hex> <payload_len> (<published_level> <slot_index> <chunk_len>)+"
     );
     std::process::exit(2);
 }
@@ -41,6 +43,16 @@ fn emit_targeted_message(rollup_address: &str, message: &KernelInboxMessage) {
     println!("{}", hex_encode(framed));
 }
 
+fn config_admin_ask() -> F {
+    if let Ok(hex) = env::var("TZEL_ROLLUP_CONFIG_ADMIN_ASK_HEX") {
+        return parse_felt(&hex);
+    }
+    if cfg!(debug_assertions) {
+        return hash(b"tzel-dev-rollup-config-admin");
+    }
+    panic!("set TZEL_ROLLUP_CONFIG_ADMIN_ASK_HEX to sign config messages");
+}
+
 fn parse_dal_kind(kind: &str) -> KernelDalPayloadKind {
     match kind {
         "shield" => KernelDalPayloadKind::Shield,
@@ -57,6 +69,24 @@ fn main() {
     };
 
     match cmd.as_str() {
+        "admin-material" => {
+            if args.next().is_some() {
+                usage();
+            }
+            let ask = config_admin_ask();
+            let pub_seed = derive_auth_pub_seed(&ask);
+            let verifier_leaf = auth_leaf_hash(&ask, tzel_core::kernel_wire::KERNEL_VERIFIER_CONFIG_KEY_INDEX);
+            let bridge_leaf = auth_leaf_hash(&ask, tzel_core::kernel_wire::KERNEL_BRIDGE_CONFIG_KEY_INDEX);
+            println!("TZEL_ROLLUP_CONFIG_ADMIN_PUB_SEED_HEX={}", hex_encode(pub_seed));
+            println!(
+                "TZEL_ROLLUP_VERIFIER_CONFIG_ADMIN_LEAF_HEX={}",
+                hex_encode(verifier_leaf)
+            );
+            println!(
+                "TZEL_ROLLUP_BRIDGE_CONFIG_ADMIN_LEAF_HEX={}",
+                hex_encode(bridge_leaf)
+            );
+        }
         "configure-bridge" => {
             let Some(rollup_address) = args.next() else {
                 usage();
@@ -67,9 +97,13 @@ fn main() {
             if args.next().is_some() {
                 usage();
             }
+            let ask = config_admin_ask();
             emit_targeted_message(
                 &rollup_address,
-                &KernelInboxMessage::ConfigureBridge(KernelBridgeConfig { ticketer }),
+                &KernelInboxMessage::ConfigureBridge(
+                    sign_kernel_bridge_config(&ask, KernelBridgeConfig { ticketer })
+                        .expect("bridge config should sign"),
+                ),
             );
         }
         "configure-verifier" => {
@@ -91,16 +125,23 @@ fn main() {
             if args.next().is_some() {
                 usage();
             }
+            let ask = config_admin_ask();
             emit_targeted_message(
                 &rollup_address,
-                &KernelInboxMessage::ConfigureVerifier(KernelVerifierConfig {
-                    auth_domain: parse_felt(&auth_domain),
-                    verified_program_hashes: ProgramHashes {
-                        shield: parse_felt(&shield),
-                        transfer: parse_felt(&transfer),
-                        unshield: parse_felt(&unshield),
-                    },
-                }),
+                &KernelInboxMessage::ConfigureVerifier(
+                    sign_kernel_verifier_config(
+                        &ask,
+                        KernelVerifierConfig {
+                            auth_domain: parse_felt(&auth_domain),
+                            verified_program_hashes: ProgramHashes {
+                                shield: parse_felt(&shield),
+                                transfer: parse_felt(&transfer),
+                                unshield: parse_felt(&unshield),
+                            },
+                        },
+                    )
+                    .expect("verifier config should sign"),
+                ),
             );
         }
         "dal-pointer" => {

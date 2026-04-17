@@ -44,8 +44,14 @@ jobs:
           cargo test -p tzel-core --lib
           cargo +nightly-2025-07-14 test -p tzel-verifier --lib
           cargo test --lib -p tzel-services
+          cargo test --test integration -p tzel-services
+          cargo test --test cross_impl_interop -p tzel-services
+          cargo test --manifest-path services/tzel/Cargo.toml --bin tzel-operator
           cargo +nightly-2025-07-14 test -p tzel-rollup-kernel --lib
-          cargo test -p tzel-wallet-app --bin sp-client
+          cargo +nightly-2025-07-14 test -p tzel-rollup-kernel --test bridge_flow
+          cargo +nightly-2025-07-14 test -p tzel-rollup-kernel --no-default-features --lib
+          cargo +nightly-2025-07-14 test -p tzel-rollup-kernel --no-default-features --test bridge_flow
+          cargo test -p tzel-wallet-app --lib
           cargo test -p tzel-ledger-app --bin sp-ledger
           cargo test -p tzel-demo
 

@@ -31,15 +31,18 @@ use tezos_smart_rollup_encoding::{
 use tzel_core::{
     apply_deposit, apply_shield, apply_transfer, apply_unshield, apply_withdraw,
     canonical_wire::{decode_published_note, encode_published_note},
-    default_auth_domain, hash, hash_merkle,
+    auth_leaf_hash, default_auth_domain, derive_auth_pub_seed, hash, hash_merkle,
     kernel_wire::{
         decode_kernel_inbox_message, decode_kernel_result, decode_kernel_verifier_config,
-        encode_kernel_result, encode_kernel_verifier_config, kernel_shield_req_to_host,
-        kernel_transfer_req_to_host, kernel_unshield_req_to_host, kernel_withdraw_req_to_host,
-        KernelBridgeConfig, KernelDalPayloadKind, KernelDalPayloadPointer, KernelInboxMessage,
-        KernelResult, KernelVerifierConfig,
+        encode_kernel_result, encode_kernel_verifier_config, kernel_bridge_config_sighash,
+        kernel_shield_req_to_host, kernel_transfer_req_to_host, kernel_unshield_req_to_host,
+        kernel_verifier_config_sighash, kernel_withdraw_req_to_host, KernelDalPayloadKind,
+        KernelDalPayloadPointer, KernelBridgeConfig, KernelInboxMessage, KernelResult,
+        KernelSignedBridgeConfig, KernelSignedVerifierConfig, KernelVerifierConfig,
+        KERNEL_BRIDGE_CONFIG_KEY_INDEX, KERNEL_VERIFIER_CONFIG_KEY_INDEX,
     },
-    EncryptedNote, Ledger, LedgerState, WithdrawalRecord, DEPTH, F, ZERO,
+    verify_wots_signature_against_leaf, EncryptedNote, Ledger, LedgerState, WithdrawalRecord,
+    DEPTH, F, ZERO,
 };
 #[cfg(feature = "proof-verifier")]
 use tzel_verifier::DirectProofVerifier;
@@ -901,10 +904,12 @@ fn apply_kernel_message<H: Host>(
 ) -> Result<KernelResult, String> {
     match message {
         KernelInboxMessage::ConfigureVerifier(config) => {
-            configure_verifier(ledger, &config).map(|_| KernelResult::Configured)
+            authenticate_verifier_config(&config)?;
+            configure_verifier(ledger, &config.config).map(|_| KernelResult::Configured)
         }
         KernelInboxMessage::ConfigureBridge(config) => {
-            configure_bridge(ledger, &config).map(|_| KernelResult::Configured)
+            authenticate_bridge_config(&config)?;
+            configure_bridge(ledger, &config.config).map(|_| KernelResult::Configured)
         }
         KernelInboxMessage::Shield(req) => {
             validate_transition_proof(ledger.host, &req.proof, tzel_core::CircuitKind::Shield)?;
@@ -1036,6 +1041,94 @@ fn load_verifier<H: Host>(host: &H) -> Result<DirectProofVerifier, String> {
     DirectProofVerifier::from_kernel_config(&config)
 }
 
+fn parse_compiled_felt_hex(hex_value: &str, label: &str) -> Result<F, String> {
+    let bytes =
+        hex::decode(hex_value).map_err(|e| format!("invalid {} hex in kernel build: {}", label, e))?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "invalid {} length in kernel build: got {} bytes, expected 32",
+            label,
+            bytes.len()
+        ));
+    }
+    let mut felt = [0u8; 32];
+    felt.copy_from_slice(&bytes);
+    Ok(felt)
+}
+
+#[cfg(any(test, debug_assertions))]
+fn dev_config_admin_ask() -> F {
+    hash(b"tzel-dev-rollup-config-admin")
+}
+
+fn compiled_config_admin_pub_seed() -> Result<F, String> {
+    if let Some(hex_value) = option_env!("TZEL_ROLLUP_CONFIG_ADMIN_PUB_SEED_HEX") {
+        return parse_compiled_felt_hex(hex_value, "TZEL_ROLLUP_CONFIG_ADMIN_PUB_SEED_HEX");
+    }
+    #[cfg(any(test, debug_assertions))]
+    {
+        return Ok(derive_auth_pub_seed(&dev_config_admin_ask()));
+    }
+    #[allow(unreachable_code)]
+    Err("kernel built without TZEL_ROLLUP_CONFIG_ADMIN_PUB_SEED_HEX".into())
+}
+
+fn compiled_verifier_config_leaf() -> Result<F, String> {
+    if let Some(hex_value) = option_env!("TZEL_ROLLUP_VERIFIER_CONFIG_ADMIN_LEAF_HEX") {
+        return parse_compiled_felt_hex(hex_value, "TZEL_ROLLUP_VERIFIER_CONFIG_ADMIN_LEAF_HEX");
+    }
+    #[cfg(any(test, debug_assertions))]
+    {
+        return Ok(auth_leaf_hash(
+            &dev_config_admin_ask(),
+            KERNEL_VERIFIER_CONFIG_KEY_INDEX,
+        ));
+    }
+    #[allow(unreachable_code)]
+    Err("kernel built without TZEL_ROLLUP_VERIFIER_CONFIG_ADMIN_LEAF_HEX".into())
+}
+
+fn compiled_bridge_config_leaf() -> Result<F, String> {
+    if let Some(hex_value) = option_env!("TZEL_ROLLUP_BRIDGE_CONFIG_ADMIN_LEAF_HEX") {
+        return parse_compiled_felt_hex(hex_value, "TZEL_ROLLUP_BRIDGE_CONFIG_ADMIN_LEAF_HEX");
+    }
+    #[cfg(any(test, debug_assertions))]
+    {
+        return Ok(auth_leaf_hash(
+            &dev_config_admin_ask(),
+            KERNEL_BRIDGE_CONFIG_KEY_INDEX,
+        ));
+    }
+    #[allow(unreachable_code)]
+    Err("kernel built without TZEL_ROLLUP_BRIDGE_CONFIG_ADMIN_LEAF_HEX".into())
+}
+
+fn authenticate_verifier_config(config: &KernelSignedVerifierConfig) -> Result<(), String> {
+    let pub_seed = compiled_config_admin_pub_seed()?;
+    let expected_leaf = compiled_verifier_config_leaf()?;
+    let sighash = kernel_verifier_config_sighash(&config.config)?;
+    verify_wots_signature_against_leaf(
+        &sighash,
+        &pub_seed,
+        KERNEL_VERIFIER_CONFIG_KEY_INDEX,
+        &config.signature,
+        &expected_leaf,
+    )
+}
+
+fn authenticate_bridge_config(config: &KernelSignedBridgeConfig) -> Result<(), String> {
+    let pub_seed = compiled_config_admin_pub_seed()?;
+    let expected_leaf = compiled_bridge_config_leaf()?;
+    let sighash = kernel_bridge_config_sighash(&config.config)?;
+    verify_wots_signature_against_leaf(
+        &sighash,
+        &pub_seed,
+        KERNEL_BRIDGE_CONFIG_KEY_INDEX,
+        &config.signature,
+        &expected_leaf,
+    )
+}
+
 #[cfg(not(test))]
 fn host_shield_req_for_transition(
     req: &tzel_core::kernel_wire::KernelShieldReq,
@@ -1120,8 +1213,14 @@ fn configure_verifier<H: Host>(
     #[cfg(feature = "proof-verifier")]
     DirectProofVerifier::from_kernel_config(config)?;
 
-    if !ledger.is_pristine()? && ledger.auth_domain()? != config.auth_domain {
-        return Err("cannot change auth_domain after ledger state exists".into());
+    if !ledger.is_pristine()? {
+        if let Some(existing) = read_verifier_config(ledger.host)? {
+            if existing != *config {
+                return Err("cannot change verifier configuration after ledger state exists".into());
+            }
+        } else {
+            return Err("cannot configure verifier after ledger state exists".into());
+        }
     }
 
     ledger.write_felt(PATH_AUTH_DOMAIN, &config.auth_domain);
@@ -1385,11 +1484,11 @@ mod tests {
     use tzel_core::{
         commit, default_auth_domain, derive_account, derive_address, derive_ask,
         derive_auth_pub_seed, derive_kem_keys, derive_nk_spend, derive_nk_tag, derive_rcm,
-        encrypt_note_deterministic, felt_tag, hash_two,
+        encrypt_note_deterministic, felt_tag, hash, hash_two,
         kernel_wire::{
-            encode_kernel_inbox_message, KernelBridgeConfig, KernelInboxMessage, KernelShieldReq,
-            KernelStarkProof, KernelTransferReq, KernelUnshieldReq, KernelVerifierConfig,
-            KernelWithdrawReq,
+            encode_kernel_inbox_message, sign_kernel_bridge_config, sign_kernel_verifier_config,
+            KernelBridgeConfig, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
+            KernelTransferReq, KernelUnshieldReq, KernelVerifierConfig, KernelWithdrawReq,
         },
         owner_tag, PaymentAddress, ProgramHashes, ShieldResp, TransferResp, UnshieldResp,
         WithdrawResp, ZERO,
@@ -1583,7 +1682,7 @@ mod tests {
             id: 1,
             payload: encode_external_kernel_message_for_rollup(
                 sample_other_rollup_address(),
-                KernelInboxMessage::ConfigureBridge(KernelBridgeConfig {
+                signed_bridge_message(KernelBridgeConfig {
                     ticketer: sample_ticketer().into(),
                 }),
             ),
@@ -2171,11 +2270,10 @@ mod tests {
     #[test]
     fn configures_bridge_ticketer_via_kernel_message() {
         let mut host = MockHost::default();
-        let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::ConfigureBridge(KernelBridgeConfig {
-                ticketer: sample_ticketer().into(),
-            }))
-            .unwrap();
+        let message = encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
+            ticketer: sample_ticketer().into(),
+        }))
+        .unwrap();
         host.inputs.push_back(InputMessage {
             level: 1,
             id: 0,
@@ -2200,11 +2298,9 @@ mod tests {
         host.inputs.push_back(InputMessage {
             level: 1,
             id: 5,
-            payload: encode_external_kernel_message(KernelInboxMessage::ConfigureBridge(
-                KernelBridgeConfig {
-                    ticketer: sample_ticketer().into(),
-                },
-            )),
+            payload: encode_external_kernel_message(signed_bridge_message(KernelBridgeConfig {
+                ticketer: sample_ticketer().into(),
+            })),
         });
 
         run_with_host(&mut host);
@@ -2222,18 +2318,29 @@ mod tests {
     #[test]
     fn rejects_auth_domain_reconfiguration_after_state_exists() {
         let mut host = MockHost::default();
+        let original = KernelVerifierConfig {
+            auth_domain: sample_felt(0x33),
+            verified_program_hashes: sample_program_hashes(),
+        };
+        host.inputs.push_back(InputMessage {
+            level: 6,
+            id: 1,
+            payload: encode_kernel_inbox_message(&signed_verifier_message(original.clone()))
+                .unwrap(),
+        });
+        run_with_host(&mut host);
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
             apply_deposit(&mut state, "alice", 1).unwrap();
         }
 
         let new_domain = sample_felt(0x44);
-        let config = KernelVerifierConfig {
+        let reconfigured = KernelVerifierConfig {
             auth_domain: new_domain,
             verified_program_hashes: sample_program_hashes(),
         };
         let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::ConfigureVerifier(config)).unwrap();
+            encode_kernel_inbox_message(&signed_verifier_message(reconfigured)).unwrap();
         host.inputs.push_back(InputMessage {
             level: 7,
             id: 2,
@@ -2246,7 +2353,7 @@ mod tests {
         assert_ne!(ledger.auth_domain, new_domain);
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
-                assert!(message.contains("cannot change auth_domain"))
+                assert!(message.contains("cannot change verifier configuration"))
             }
             other => panic!("unexpected rollup result: {:?}", other),
         }
@@ -2260,8 +2367,7 @@ mod tests {
             auth_domain: new_domain,
             verified_program_hashes: sample_program_hashes(),
         };
-        let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::ConfigureVerifier(config)).unwrap();
+        let message = encode_kernel_inbox_message(&signed_verifier_message(config)).unwrap();
         host.inputs.push_back(InputMessage {
             level: 8,
             id: 1,
@@ -2276,6 +2382,111 @@ mod tests {
             read_last_result(&host).unwrap(),
             KernelResult::Configured
         ));
+    }
+
+    #[test]
+    fn rejects_unauthenticated_verifier_configuration_on_pristine_ledger() {
+        let mut signed = sign_kernel_verifier_config(
+            &sample_config_admin_ask(),
+            KernelVerifierConfig {
+                auth_domain: sample_felt(0x56),
+                verified_program_hashes: sample_program_hashes(),
+            },
+        )
+        .unwrap();
+        signed.config.auth_domain[0] ^= 0x01;
+
+        let mut host = MockHost::with_inputs(vec![InputMessage {
+            level: 8,
+            id: 1,
+            payload: encode_kernel_inbox_message(&KernelInboxMessage::ConfigureVerifier(signed))
+                .unwrap(),
+        }]);
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.auth_domain, default_auth_domain());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("configuration signature verification failed"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_verifier_hash_reconfiguration_after_state_exists() {
+        let mut host = MockHost::default();
+        let original = KernelVerifierConfig {
+            auth_domain: default_auth_domain(),
+            verified_program_hashes: sample_program_hashes(),
+        };
+        host.inputs.push_back(InputMessage {
+            level: 6,
+            id: 1,
+            payload: encode_kernel_inbox_message(&signed_verifier_message(original.clone()))
+                .unwrap(),
+        });
+        run_with_host(&mut host);
+        {
+            let mut state = DurableLedgerState::new(&mut host).unwrap();
+            apply_deposit(&mut state, "alice", 1).unwrap();
+        }
+        let mut changed_hashes = original.verified_program_hashes;
+        changed_hashes.transfer = sample_felt(0x99);
+        host.inputs.push_back(InputMessage {
+            level: 8,
+            id: 3,
+            payload: encode_kernel_inbox_message(&signed_verifier_message(
+                KernelVerifierConfig {
+                    auth_domain: original.auth_domain,
+                    verified_program_hashes: changed_hashes,
+                },
+            ))
+            .unwrap(),
+        });
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.auth_domain, original.auth_domain);
+        assert_eq!(ledger.balances.get("alice"), Some(&1));
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("cannot change verifier configuration"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_unauthenticated_bridge_configuration_on_pristine_ledger() {
+        let mut signed = sign_kernel_bridge_config(
+            &sample_config_admin_ask(),
+            KernelBridgeConfig {
+                ticketer: sample_ticketer().into(),
+            },
+        )
+        .unwrap();
+        signed.config.ticketer = "KT1XnKX3m3GGdcRGi8HAY3N3H6LrZb6bS4wQ".into();
+
+        let mut host = MockHost::with_inputs(vec![InputMessage {
+            level: 5,
+            id: 1,
+            payload: encode_kernel_inbox_message(&KernelInboxMessage::ConfigureBridge(signed))
+                .unwrap(),
+        }]);
+
+        run_with_host(&mut host);
+
+        assert!(host.read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES).is_none());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("configuration signature verification failed"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
     }
 
     #[test]
@@ -2339,9 +2550,7 @@ mod tests {
             InputMessage {
                 level: 8,
                 id: 1,
-                payload: encode_kernel_inbox_message(&KernelInboxMessage::ConfigureVerifier(
-                    config.clone(),
-                ))
+                payload: encode_kernel_inbox_message(&signed_verifier_message(config.clone()))
                 .unwrap(),
             },
             InputMessage {
@@ -2568,11 +2777,10 @@ mod tests {
     #[test]
     fn rejects_implicit_bridge_ticketer_configuration() {
         let mut host = MockHost::default();
-        let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::ConfigureBridge(KernelBridgeConfig {
-                ticketer: sample_l1_receiver().into(),
-            }))
-            .unwrap();
+        let message = encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
+            ticketer: sample_l1_receiver().into(),
+        }))
+        .unwrap();
         host.inputs.push_back(InputMessage {
             level: 11,
             id: 0,
@@ -2601,11 +2809,10 @@ mod tests {
             apply_deposit(&mut state, "alice", 3).unwrap();
         }
 
-        let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::ConfigureBridge(KernelBridgeConfig {
-                ticketer: sample_other_ticketer().into(),
-            }))
-            .unwrap();
+        let message = encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
+            ticketer: sample_other_ticketer().into(),
+        }))
+        .unwrap();
         host.inputs.push_back(InputMessage {
             level: 12,
             id: 0,
@@ -2635,11 +2842,10 @@ mod tests {
             apply_deposit(&mut state, "alice", 3).unwrap();
         }
 
-        let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::ConfigureBridge(KernelBridgeConfig {
-                ticketer: sample_ticketer().into(),
-            }))
-            .unwrap();
+        let message = encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
+            ticketer: sample_ticketer().into(),
+        }))
+        .unwrap();
         host.inputs.push_back(InputMessage {
             level: 12,
             id: 1,
@@ -2885,11 +3091,10 @@ mod tests {
     }
 
     fn install_test_bridge(host: &mut MockHost) {
-        let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::ConfigureBridge(KernelBridgeConfig {
-                ticketer: sample_ticketer().into(),
-            }))
-            .unwrap();
+        let message = encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
+            ticketer: sample_ticketer().into(),
+        }))
+        .unwrap();
         host.inputs.push_back(InputMessage {
             level: 0,
             id: 0,
@@ -3101,6 +3306,22 @@ mod tests {
         let mut out = [fill; 32];
         out[31] &= 0x07;
         out
+    }
+
+    fn sample_config_admin_ask() -> F {
+        hash(b"tzel-dev-rollup-config-admin")
+    }
+
+    fn signed_bridge_message(config: KernelBridgeConfig) -> KernelInboxMessage {
+        KernelInboxMessage::ConfigureBridge(
+            sign_kernel_bridge_config(&sample_config_admin_ask(), config).unwrap(),
+        )
+    }
+
+    fn signed_verifier_message(config: KernelVerifierConfig) -> KernelInboxMessage {
+        KernelInboxMessage::ConfigureVerifier(
+            sign_kernel_verifier_config(&sample_config_admin_ask(), config).unwrap(),
+        )
     }
 
     fn sample_encrypted_note(

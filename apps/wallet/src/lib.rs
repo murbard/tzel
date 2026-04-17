@@ -1222,9 +1222,7 @@ fn save_private_json<T: Serialize>(path: &str, value: &T, label: &str) -> Result
     let data =
         serde_json::to_string_pretty(value).map_err(|e| format!("serialize {}: {}", label, e))?;
     let output_path = std::path::Path::new(path);
-    let tmp = std::path::PathBuf::from(format!("{}.tmp", path));
-    let mut file =
-        std::fs::File::create(&tmp).map_err(|e| format!("create {} tmp: {}", label, e))?;
+    let (tmp, mut file) = create_private_temp_file(output_path, label)?;
     file.write_all(data.as_bytes())
         .map_err(|e| format!("write {} tmp: {}", label, e))?;
     file.sync_all()
@@ -1240,8 +1238,7 @@ fn save_wallet(path: &str, w: &WalletFile) -> Result<(), String> {
     // Durable write: fsync temp file, rename atomically, then fsync the parent
     // directory so one-time WOTS state survives crashes before submit returns.
     let wallet_path = std::path::Path::new(path);
-    let tmp = std::path::PathBuf::from(format!("{}.tmp", path));
-    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create tmp: {}", e))?;
+    let (tmp, mut file) = create_private_temp_file(wallet_path, "wallet")?;
     file.write_all(data.as_bytes())
         .map_err(|e| format!("write tmp: {}", e))?;
     file.sync_all().map_err(|e| format!("fsync tmp: {}", e))?;
@@ -1264,8 +1261,7 @@ fn save_wallet_xmss_floor(path: &str, floor: &WalletXmssFloor) -> Result<(), Str
     let data =
         serde_json::to_string_pretty(floor).map_err(|e| format!("serialize floor: {}", e))?;
     let floor_path = wallet_xmss_floor_path(path);
-    let tmp = PathBuf::from(format!("{}.tmp", floor_path.display()));
-    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create floor tmp: {}", e))?;
+    let (tmp, mut file) = create_private_temp_file(&floor_path, "wallet xmss floor")?;
     file.write_all(data.as_bytes())
         .map_err(|e| format!("write floor tmp: {}", e))?;
     file.sync_all()
@@ -1296,6 +1292,37 @@ fn current_wallet_wots_floor(wallet: &WalletFile, addr_index: u32) -> u32 {
         .unwrap_or(0)
 }
 
+fn create_private_temp_file(
+    output_path: &std::path::Path,
+    label: &str,
+) -> Result<(PathBuf, std::fs::File), String> {
+    let parent = output_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let base_name = output_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wallet");
+    for attempt in 0..16u32 {
+        let tmp = parent.join(format!(
+            ".{}.tmp.{}.{}.{}",
+            base_name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| format!("system clock error: {}", e))?
+                .as_nanos(),
+            attempt
+        ));
+        match create_private_file(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(format!("create {} tmp: {}", label, err)),
+        }
+    }
+    Err(format!("create {} tmp: too many collisions", label))
+}
+
 fn enforce_wallet_xmss_floor(path: &str, wallet: &WalletFile) -> Result<(), String> {
     let floor_path = wallet_xmss_floor_path(path);
     let Ok(data) = std::fs::read_to_string(&floor_path) else {
@@ -1322,6 +1349,25 @@ fn enforce_wallet_xmss_floor(path: &str, wallet: &WalletFile) -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn create_private_file(path: &std::path::Path) -> Result<std::fs::File, std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &std::path::Path) -> Result<std::fs::File, std::io::Error> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
 }
 
 #[cfg(unix)]
@@ -1398,10 +1444,46 @@ fn post_json<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
         .map_err(|e| format!("parse response: {}", e))
 }
 
+fn post_json_with_bearer<Req: Serialize, Resp: for<'de> Deserialize<'de>>(
+    url: &str,
+    body: &Req,
+    bearer_token: Option<&str>,
+) -> Result<Resp, String> {
+    let mut req = ureq::post(url);
+    if let Some(token) = bearer_token {
+        req = req.header("Authorization", &format!("Bearer {}", token));
+    }
+    let resp = req
+        .send_json(serde_json::to_value(body).unwrap())
+        .map_err(|e| format!("HTTP error: {}", e))?;
+    let status = resp.status();
+    if status != 200 {
+        let body = resp.into_body().read_to_string().unwrap_or_default();
+        return Err(format!("HTTP {}: {}", status, body));
+    }
+    resp.into_body()
+        .read_json()
+        .map_err(|e| format!("parse response: {}", e))
+}
+
 fn get_json<Resp: for<'de> Deserialize<'de>>(url: &str) -> Result<Resp, String> {
     let resp = ureq::get(url)
         .call()
         .map_err(|e| format!("HTTP error: {}", e))?;
+    resp.into_body()
+        .read_json()
+        .map_err(|e| format!("parse response: {}", e))
+}
+
+fn get_json_with_bearer<Resp: for<'de> Deserialize<'de>>(
+    url: &str,
+    bearer_token: Option<&str>,
+) -> Result<Resp, String> {
+    let mut req = ureq::get(url);
+    if let Some(token) = bearer_token {
+        req = req.header("Authorization", &format!("Bearer {}", token));
+    }
+    let resp = req.call().map_err(|e| format!("HTTP error: {}", e))?;
     resp.into_body()
         .read_json()
         .map_err(|e| format!("parse response: {}", e))
@@ -1440,6 +1522,8 @@ struct WalletNetworkProfile {
     bridge_ticketer: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operator_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operator_bearer_token: Option<String>,
     source_alias: String,
     public_account: String,
     #[serde(default = "default_octez_client_bin")]
@@ -1471,6 +1555,7 @@ fn shadownet_profile(
     rollup_address: String,
     bridge_ticketer: String,
     operator_url: Option<String>,
+    operator_bearer_token: Option<String>,
     source_alias: String,
     public_account: Option<String>,
     octez_client_dir: Option<String>,
@@ -1485,6 +1570,7 @@ fn shadownet_profile(
         rollup_address,
         bridge_ticketer,
         operator_url,
+        operator_bearer_token,
         public_account: public_account.unwrap_or_else(|| source_alias.clone()),
         source_alias,
         octez_client_bin: octez_client_bin.unwrap_or_else(default_octez_client_bin),
@@ -1503,8 +1589,7 @@ fn load_network_profile(path: &Path) -> Result<WalletNetworkProfile, String> {
 fn save_network_profile(path: &Path, profile: &WalletNetworkProfile) -> Result<(), String> {
     let data =
         serde_json::to_string_pretty(profile).map_err(|e| format!("serialize profile: {}", e))?;
-    let tmp = PathBuf::from(format!("{}.tmp", path.display()));
-    let mut file = std::fs::File::create(&tmp).map_err(|e| format!("create profile tmp: {}", e))?;
+    let (tmp, mut file) = create_private_temp_file(path, "network profile")?;
     file.write_all(data.as_bytes())
         .map_err(|e| format!("write profile tmp: {}", e))?;
     file.sync_all()
@@ -1821,6 +1906,7 @@ impl<'a> RollupRpc<'a> {
         if let Some(operator_url) = &self.profile.operator_url {
             return submit_kernel_message_via_operator(
                 operator_url,
+                self.profile.operator_bearer_token.as_deref(),
                 &self.profile.rollup_address,
                 kernel_message_kind(message),
                 payload,
@@ -1962,18 +2048,20 @@ fn kernel_message_kind(message: &KernelInboxMessage) -> RollupSubmissionKind {
 
 fn submit_kernel_message_via_operator(
     operator_url: &str,
+    operator_bearer_token: Option<&str>,
     rollup_address: &str,
     kind: RollupSubmissionKind,
     payload: Vec<u8>,
 ) -> Result<RollupSubmissionReceipt, String> {
     let base = operator_url.trim_end_matches('/');
-    let resp: SubmitRollupMessageResp = post_json(
+    let resp: SubmitRollupMessageResp = post_json_with_bearer(
         &format!("{}/v1/rollup/submissions", base),
         &SubmitRollupMessageReq {
             kind,
             rollup_address: rollup_address.to_string(),
             payload,
         },
+        operator_bearer_token,
     )?;
     let submission = resp.submission;
     Ok(RollupSubmissionReceipt {
@@ -1991,10 +2079,14 @@ fn submit_kernel_message_via_operator(
 
 fn load_operator_submission(
     operator_url: &str,
+    operator_bearer_token: Option<&str>,
     submission_id: &str,
 ) -> Result<SubmitRollupMessageResp, String> {
     let base = operator_url.trim_end_matches('/');
-    get_json(&format!("{}/v1/rollup/submissions/{}", base, submission_id))
+    get_json_with_bearer(
+        &format!("{}/v1/rollup/submissions/{}", base, submission_id),
+        operator_bearer_token,
+    )
 }
 
 fn format_rollup_submission(submission: &RollupSubmission) -> String {
@@ -2494,6 +2586,8 @@ enum UserProfileCmd {
         #[arg(long)]
         operator_url: Option<String>,
         #[arg(long)]
+        operator_bearer_token: Option<String>,
+        #[arg(long)]
         source_alias: String,
         #[arg(long)]
         public_account: Option<String>,
@@ -2719,6 +2813,7 @@ fn run_user_profile(wallet_path: &str, cmd: UserProfileCmd) -> Result<(), String
             rollup_address,
             bridge_ticketer,
             operator_url,
+            operator_bearer_token,
             source_alias,
             public_account,
             octez_client_dir,
@@ -2739,6 +2834,7 @@ fn run_user_profile(wallet_path: &str, cmd: UserProfileCmd) -> Result<(), String
                 rollup_address,
                 bridge_ticketer,
                 operator_url,
+                operator_bearer_token,
                 source_alias,
                 public_account,
                 octez_client_dir,
@@ -3193,6 +3289,7 @@ mod tests {
             bridge_ticketer: "KT1Jg4fj5wwnKHuW8aa9uDX6dRYBdjXhm2sJ".into(),
             public_account: "alice".into(),
             operator_url: None,
+            operator_bearer_token: None,
             source_alias: "alice".into(),
             octez_client_bin: "octez-client".into(),
             octez_client_dir: None,
@@ -4174,6 +4271,24 @@ mod tests {
         save_wallet(wallet_path.to_str().unwrap(), &w).expect("wallet should save");
 
         let mode = std::fs::metadata(&wallet_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_private_temp_files_start_with_private_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let (tmp_path, _file) =
+            create_private_temp_file(&wallet_path, "wallet").expect("create private temp file");
+
+        let mode = std::fs::metadata(&tmp_path)
             .unwrap()
             .permissions()
             .mode()
@@ -5375,7 +5490,11 @@ fn cmd_operator_status(profile: &WalletNetworkProfile, submission_id: &str) -> R
         .operator_url
         .as_deref()
         .ok_or_else(|| "this wallet profile has no operator_url configured".to_string())?;
-    let resp = load_operator_submission(operator_url, submission_id)?;
+    let resp = load_operator_submission(
+        operator_url,
+        profile.operator_bearer_token.as_deref(),
+        submission_id,
+    )?;
     println!("{}", format_rollup_submission(&resp.submission));
     Ok(())
 }
@@ -6616,6 +6735,7 @@ mod network_profile_tests {
             "sr1ExampleRollup".into(),
             "KT1ExampleTicketer".into(),
             Some("https://operator.shadownet.example".into()),
+            Some("operator-secret".into()),
             "alice".into(),
             Some("tz1alicepublicaccount".into()),
             Some("/tmp/octez-client".into()),
@@ -6641,6 +6761,7 @@ mod network_profile_tests {
             "sr1SavedRollup".into(),
             "KT1SavedTicketer".into(),
             None,
+            None,
             "bootstrap1".into(),
             None,
             None,
@@ -6654,6 +6775,38 @@ mod network_profile_tests {
         let loaded = load_required_network_profile(wallet_path_str).expect("saved profile");
         assert_eq!(loaded, saved);
         assert_eq!(loaded.public_account, "bootstrap1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn network_profile_is_saved_with_private_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile_path = dir.path().join("wallet.network.json");
+        let profile = shadownet_profile(
+            "https://saved-rollup.example".into(),
+            "sr1SavedRollup".into(),
+            "KT1SavedTicketer".into(),
+            Some("https://operator.shadownet.example".into()),
+            Some("operator-secret".into()),
+            "bootstrap1".into(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        save_network_profile(&profile_path, &profile).expect("save profile");
+
+        let mode = std::fs::metadata(&profile_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

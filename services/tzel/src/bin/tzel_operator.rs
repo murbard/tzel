@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path as AxumPath, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -55,6 +55,10 @@ struct Cli {
     dal_node_endpoint: Option<String>,
     #[arg(long)]
     octez_protocol: Option<String>,
+    #[arg(long)]
+    bearer_token: Option<String>,
+    #[arg(long)]
+    bearer_token_file: Option<String>,
     #[arg(long, default_value_t = 5)]
     reconcile_interval_secs: u64,
 }
@@ -68,6 +72,7 @@ struct AppState {
 #[derive(Debug)]
 struct OperatorConfig {
     source_alias: String,
+    bearer_token: String,
     state_dir: PathBuf,
     direct_max_message_bytes: usize,
     dal_max_chunk_bytes: Option<usize>,
@@ -142,6 +147,20 @@ fn main() {
 
 #[tokio::main(flavor = "multi_thread")]
 async fn run(cli: Cli) -> Result<(), String> {
+    let bearer_token = match (&cli.bearer_token, &cli.bearer_token_file) {
+        (Some(_), Some(_)) => {
+            return Err("specify only one of --bearer-token or --bearer-token-file".into())
+        }
+        (Some(token), None) => token.clone(),
+        (None, Some(path)) => std::fs::read_to_string(path)
+            .map_err(|e| format!("read bearer token file: {}", e))?
+            .trim()
+            .to_string(),
+        (None, None) => return Err("operator requires --bearer-token or --bearer-token-file".into()),
+    };
+    if bearer_token.is_empty() {
+        return Err("operator bearer token must not be empty".into());
+    }
     let state_dir = PathBuf::from(&cli.state_dir);
     std::fs::create_dir_all(submissions_dir(&state_dir))
         .map_err(|e| format!("create state dir: {}", e))?;
@@ -149,6 +168,7 @@ async fn run(cli: Cli) -> Result<(), String> {
     let state = AppState {
         config: Arc::new(OperatorConfig {
             source_alias: cli.source_alias,
+            bearer_token,
             state_dir,
             direct_max_message_bytes: cli.direct_max_message_bytes,
             dal_max_chunk_bytes: cli.dal_max_chunk_bytes.filter(|value| *value > 0),
@@ -187,6 +207,22 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
+fn require_bearer_auth(headers: &HeaderMap, config: &OperatorConfig) -> Result<(), (StatusCode, String)> {
+    let Some(raw) = headers.get(axum::http::header::AUTHORIZATION) else {
+        return Err((StatusCode::UNAUTHORIZED, "missing Authorization header".into()));
+    };
+    let auth = raw
+        .to_str()
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid Authorization header".into()))?;
+    let Some(token) = auth.strip_prefix("Bearer ") else {
+        return Err((StatusCode::UNAUTHORIZED, "expected Bearer token".into()));
+    };
+    if token != config.bearer_token {
+        return Err((StatusCode::UNAUTHORIZED, "invalid bearer token".into()));
+    }
+    Ok(())
+}
+
 async fn reconcile_loop(
     config: Arc<OperatorConfig>,
     advance_lock: Arc<tokio::sync::Mutex<()>>,
@@ -219,8 +255,10 @@ async fn reconcile_loop(
 
 async fn submit_rollup_message(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<SubmitRollupMessageReq>,
 ) -> Result<Json<SubmitRollupMessageResp>, (StatusCode, String)> {
+    require_bearer_auth(&headers, &state.config)?;
     let _guard = state.advance_lock.lock().await;
     let config = state.config.clone();
     let submission = tokio::task::spawn_blocking(move || process_submission(&config, req))
@@ -237,8 +275,10 @@ async fn submit_rollup_message(
 
 async fn get_rollup_submission(
     State(state): State<AppState>,
+    headers: HeaderMap,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<SubmitRollupMessageResp>, (StatusCode, String)> {
+    require_bearer_auth(&headers, &state.config)?;
     let config = state.config.clone();
     let stored = tokio::task::spawn_blocking({
         let config = config.clone();
@@ -1079,6 +1119,7 @@ fn persist_submission(config: &OperatorConfig, stored: &StoredSubmission) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::header::AUTHORIZATION;
     use std::collections::HashMap;
     use std::io::Read;
     use std::net::TcpListener;
@@ -1095,6 +1136,7 @@ mod tests {
         std::fs::create_dir_all(&state_dir).unwrap();
         OperatorConfig {
             source_alias: "alice".into(),
+            bearer_token: "test-token".into(),
             state_dir,
             direct_max_message_bytes: 1024,
             dal_max_chunk_bytes: None,
@@ -1106,6 +1148,93 @@ mod tests {
             id_counter: AtomicU64::new(0),
             slot_counter: AtomicU64::new(0),
         }
+    }
+
+    #[test]
+    fn require_bearer_auth_rejects_missing_and_invalid_tokens() {
+        let config = config_with_client(Path::new("/bin/true"));
+
+        let missing = HeaderMap::new();
+        let err = require_bearer_auth(&missing, &config).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+
+        let mut invalid = HeaderMap::new();
+        invalid.insert(AUTHORIZATION, "Bearer wrong-token".parse().unwrap());
+        let err = require_bearer_auth(&invalid, &config).unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn require_bearer_auth_accepts_matching_token() {
+        let config = config_with_client(Path::new("/bin/true"));
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer test-token".parse().unwrap());
+        require_bearer_auth(&headers, &config).expect("matching token should authenticate");
+    }
+
+    fn app_state_with_config(config: OperatorConfig) -> AppState {
+        AppState {
+            config: Arc::new(config),
+            advance_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+
+    fn sample_submit_req() -> SubmitRollupMessageReq {
+        SubmitRollupMessageReq {
+            kind: RollupSubmissionKind::Withdraw,
+            rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+            payload: vec![1, 2, 3, 4],
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_route_rejects_missing_bearer_auth() {
+        let script_dir = make_client_script("#!/bin/sh\necho 'Operation hash is ooShouldNotRun'\n");
+        let state = app_state_with_config(config_with_client(&script_dir.path().join("octez-client")));
+
+        let err = submit_rollup_message(
+            State(state),
+            HeaderMap::new(),
+            Json(sample_submit_req()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_route_rejects_missing_bearer_auth() {
+        let state = app_state_with_config(config_with_client(Path::new("/bin/true")));
+
+        let err = get_rollup_submission(
+            State(state),
+            HeaderMap::new(),
+            AxumPath("sub-missing-auth".into()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn submit_route_accepts_matching_bearer_auth() {
+        let script_dir =
+            make_client_script("#!/bin/sh\necho 'Operation hash is ooRouteAuthHash123456789AB'\n");
+        let state = app_state_with_config(config_with_client(&script_dir.path().join("octez-client")));
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, "Bearer test-token".parse().unwrap());
+
+        let resp = submit_rollup_message(
+            State(state),
+            headers,
+            Json(sample_submit_req()),
+        )
+        .await
+        .expect("matching token should pass route auth");
+        assert_eq!(
+            resp.0.submission.status,
+            RollupSubmissionStatus::SubmittedToL1
+        );
     }
 
     fn stored_submission(
