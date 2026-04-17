@@ -69,6 +69,8 @@ jobs:
 
   ocaml:
     runs-on: ubuntu-latest
+    env:
+      LIBRARY_PATH: ${{ github.workspace }}/ocaml/vendor/mlkem-native/test/build
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -97,6 +99,4 @@ jobs:
         run: opam exec -- ./scripts/ocaml_unit_tests.sh
 
       - name: Run cross-implementation interop test
-        env:
-          LIBRARY_PATH: ${{ github.workspace }}/ocaml/vendor/mlkem-native/test/build
         run: opam exec -- cargo test --test cross_impl_interop -p tzel-services
