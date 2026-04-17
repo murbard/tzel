@@ -257,27 +257,30 @@ pub fn decode_published_note(bytes: &[u8]) -> Result<(F, EncryptedNote), String>
     Ok((wire_to_felt(wire.cm)?, enc))
 }
 
-pub fn ml_kem_768_public_key_size() -> usize {
-    let seed = [0u8; 64];
-    let (ek, _) = crate::kem_keygen_from_seed(&seed);
-    ek.to_bytes().len()
-}
-
+#[cfg(any(test, not(target_arch = "wasm32")))]
 const VECTOR_ADDRESS_INDEX: u32 = 0;
+#[cfg(any(test, not(target_arch = "wasm32")))]
 const VECTOR_NOTE_VALUE: u64 = 77;
+#[cfg(any(test, not(target_arch = "wasm32")))]
 const VECTOR_NULLIFIER_POS: u64 = 42;
+#[cfg(any(test, not(target_arch = "wasm32")))]
 const VECTOR_DETECT_EPHEMERAL: [u8; 32] = [0x11; 32];
+#[cfg(any(test, not(target_arch = "wasm32")))]
 const VECTOR_VIEW_EPHEMERAL: [u8; 32] = [0x22; 32];
+#[cfg(any(test, not(target_arch = "wasm32")))]
 const VECTOR_MEMO: &[u8] = b"canonical-wire-vector";
+#[cfg(any(test, not(target_arch = "wasm32")))]
 const VECTOR_AUTH_ROOT_HEX: &str =
     "e912b13056ff9b95542bdf9086d8082e2df9a915a12c6111ee0313fa0ad28507";
 
+#[cfg(any(test, not(target_arch = "wasm32")))]
 fn sample_felt(fill: u8) -> F {
     let mut out = [fill; 32];
     out[31] &= 0x07;
     out
 }
 
+#[cfg(any(test, not(target_arch = "wasm32")))]
 fn hex_to_felt(s: &str) -> F {
     let bytes = hex::decode(s).expect("valid felt hex");
     assert_eq!(bytes.len(), 32, "felt hex must decode to 32 bytes");
@@ -286,6 +289,7 @@ fn hex_to_felt(s: &str) -> F {
     out
 }
 
+#[cfg(any(test, not(target_arch = "wasm32")))]
 fn sample_data() -> (PaymentAddress, EncryptedNote, F, NoteMemo, F, F, u64) {
     let mut master_sk = crate::ZERO;
     master_sk[..8].copy_from_slice(&0x0123_4567_89ab_cdefu64.to_le_bytes());
@@ -396,10 +400,9 @@ mod tests {
 
     #[test]
     fn test_ml_kem_768_public_key_size_constant() {
-        assert_eq!(
-            ml_kem_768_public_key_size(),
-            ML_KEM768_ENCAPSULATION_KEY_BYTES
-        );
+        let seed = [0u8; 64];
+        let (ek, _) = crate::kem_keygen_from_seed(&seed);
+        assert_eq!(ek.to_bytes().len(), ML_KEM768_ENCAPSULATION_KEY_BYTES);
     }
 
     #[test]
