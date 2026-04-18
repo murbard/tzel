@@ -335,6 +335,20 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
         Ok(())
     }
 
+    fn ensure_note_capacity(&self, additional: usize) -> Result<(), String> {
+        let count = self.read_u64(PATH_TREE_SIZE)?.unwrap_or(0);
+        let additional =
+            u64::try_from(additional).map_err(|_| "note capacity does not fit in u64".to_string())?;
+        let limit = 1u64 << DEPTH;
+        let next = count
+            .checked_add(additional)
+            .ok_or_else(|| "Merkle tree size overflow".to_string())?;
+        if next > limit {
+            return Err(format!("Merkle tree full: 2^{} leaves", DEPTH));
+        }
+        Ok(())
+    }
+
     fn append_note(&mut self, cm: F, enc: EncryptedNote) -> Result<usize, String> {
         let count = self.read_u64(PATH_TREE_SIZE)?.unwrap_or(0);
         if count >= (1u64 << DEPTH) {

@@ -1495,6 +1495,7 @@ pub trait LedgerState {
     fn has_valid_root(&self, root: &F) -> Result<bool, String>;
     fn has_nullifier(&self, nf: &F) -> Result<bool, String>;
     fn insert_nullifier(&mut self, nf: F) -> Result<(), String>;
+    fn ensure_note_capacity(&self, additional: usize) -> Result<(), String>;
     fn append_note(&mut self, cm: F, enc: EncryptedNote) -> Result<usize, String>;
     fn snapshot_root(&mut self) -> Result<(), String>;
     fn enqueue_withdrawal(&mut self, recipient: &str, amount: u64) -> Result<usize, String>;
@@ -1599,6 +1600,22 @@ impl LedgerState for Ledger {
 
     fn insert_nullifier(&mut self, nf: F) -> Result<(), String> {
         self.nullifiers.insert(nf);
+        Ok(())
+    }
+
+    fn ensure_note_capacity(&self, additional: usize) -> Result<(), String> {
+        let limit = (1usize)
+            .checked_shl(DEPTH as u32)
+            .ok_or_else(|| format!("Merkle tree capacity exceeds usize for depth {}", DEPTH))?;
+        let next = self
+            .tree
+            .leaves
+            .len()
+            .checked_add(additional)
+            .ok_or_else(|| "Merkle tree size overflow".to_string())?;
+        if next > limit {
+            return Err(format!("Merkle tree full: 2^{} leaves", DEPTH));
+        }
         Ok(())
     }
 
@@ -1764,6 +1781,7 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
         }
     };
 
+    state.ensure_note_capacity(2)?;
     state.set_balance(&req.sender, bal - debit)?;
     let index = state.append_note(cm, enc)?;
     let producer_index = state.append_note(req.producer_cm, producer_enc.clone())?;
@@ -1870,6 +1888,7 @@ pub fn apply_transfer<S: LedgerState>(
         }
     }
 
+    state.ensure_note_capacity(3)?;
     let index_1 = state.append_note(req.cm_1, req.enc_1.clone())?;
     let index_2 = state.append_note(req.cm_2, req.enc_2.clone())?;
     let index_3 = state.append_note(req.cm_3, req.enc_3.clone())?;
@@ -1981,6 +2000,9 @@ pub fn apply_unshield<S: LedgerState>(
             }
         }
     }
+
+    let additional_notes = usize::from(req.cm_change != ZERO) + 1;
+    state.ensure_note_capacity(additional_notes)?;
 
     let next_balance = state
         .balance(&req.recipient)?
@@ -2185,6 +2207,69 @@ mod tests {
         let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &addr.nk_tag);
         let cm = commit(&addr.d_j, v, &rcm, &otag);
         (enc, cm)
+    }
+
+    struct LimitedAppendLedgerState {
+        inner: Ledger,
+        remaining_note_capacity: usize,
+    }
+
+    impl LimitedAppendLedgerState {
+        fn new(inner: Ledger, remaining_note_capacity: usize) -> Self {
+            Self {
+                inner,
+                remaining_note_capacity,
+            }
+        }
+    }
+
+    impl LedgerState for LimitedAppendLedgerState {
+        fn auth_domain(&self) -> Result<F, String> {
+            self.inner.auth_domain()
+        }
+
+        fn balance(&self, addr: &str) -> Result<u64, String> {
+            self.inner.balance(addr)
+        }
+
+        fn set_balance(&mut self, addr: &str, amount: u64) -> Result<(), String> {
+            self.inner.set_balance(addr, amount)
+        }
+
+        fn has_valid_root(&self, root: &F) -> Result<bool, String> {
+            self.inner.has_valid_root(root)
+        }
+
+        fn has_nullifier(&self, nf: &F) -> Result<bool, String> {
+            self.inner.has_nullifier(nf)
+        }
+
+        fn insert_nullifier(&mut self, nf: F) -> Result<(), String> {
+            self.inner.insert_nullifier(nf)
+        }
+
+        fn ensure_note_capacity(&self, additional: usize) -> Result<(), String> {
+            if self.remaining_note_capacity < additional {
+                return Err(format!("Merkle tree full: 2^{} leaves", DEPTH));
+            }
+            Ok(())
+        }
+
+        fn append_note(&mut self, cm: F, enc: EncryptedNote) -> Result<usize, String> {
+            if self.remaining_note_capacity == 0 {
+                return Err(format!("Merkle tree full: 2^{} leaves", DEPTH));
+            }
+            self.remaining_note_capacity -= 1;
+            self.inner.append_note(cm, enc)
+        }
+
+        fn snapshot_root(&mut self) -> Result<(), String> {
+            self.inner.snapshot_root()
+        }
+
+        fn enqueue_withdrawal(&mut self, recipient: &str, amount: u64) -> Result<usize, String> {
+            self.inner.enqueue_withdrawal(recipient, amount)
+        }
     }
 
     fn fake_stark(output_preimage: Vec<F>) -> Proof {
@@ -3258,6 +3343,42 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_shield_preflights_two_note_capacity_before_debiting_sender() {
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x90, 0);
+        let mut state = LimitedAppendLedgerState::new(Ledger::new(), 1);
+        state.inner.fund("alice", MIN_TX_FEE + 126).unwrap();
+        let (client_enc, client_cm) = deterministic_note(&addr, 125, u(91), Some(b"shield"));
+        let (producer_enc, producer_cm) = deterministic_note(&addr, 1, u(92), Some(b"dal"));
+
+        let balance_before = state.inner.balance("alice").unwrap();
+        let leaves_before = state.inner.tree.leaves.clone();
+        let memos_before = state.inner.memos.len();
+
+        let err = apply_shield(
+            &mut state,
+            &ShieldReq {
+                sender: "alice".into(),
+                fee: MIN_TX_FEE,
+                v: 125,
+                producer_fee: 1,
+                address: addr,
+                memo: None,
+                proof: Proof::TrustMeBro,
+                client_cm,
+                client_enc: Some(client_enc),
+                producer_cm,
+                producer_enc: Some(producer_enc),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("Merkle tree full"));
+        assert_eq!(state.inner.balance("alice").unwrap(), balance_before);
+        assert_eq!(state.inner.tree.leaves, leaves_before);
+        assert_eq!(state.inner.memos.len(), memos_before);
+    }
+
+    #[test]
     fn test_apply_transfer_rejects_fee_below_minimum() {
         let (mut ledger, _addr, nk_spend, shield_resp) =
             shielded_note_setup(0x77, "alice", 150_000);
@@ -3291,6 +3412,43 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_transfer_preflights_three_note_capacity_before_mutation() {
+        let (ledger, _addr, nk_spend, shield_resp) = shielded_note_setup(0x91, "alice", 150_000);
+        let root = ledger.tree.root();
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend_unused) = sample_address_bundle(0x92, 0);
+        let (enc_1, cm_1) = deterministic_note(&addr, 20_000, u(93), Some(b"out-1"));
+        let (enc_2, cm_2) = deterministic_note(&addr, 29_999, u(94), Some(b"out-2"));
+        let (enc_3, cm_3) = deterministic_note(&addr, 1, u(95), Some(b"dal"));
+        let mut state = LimitedAppendLedgerState::new(ledger, 2);
+
+        let leaves_before = state.inner.tree.leaves.clone();
+        let memos_before = state.inner.memos.len();
+
+        let err = apply_transfer(
+            &mut state,
+            &TransferReq {
+                root,
+                nullifiers: vec![nf],
+                fee: MIN_TX_FEE,
+                cm_1,
+                cm_2,
+                cm_3,
+                enc_1,
+                enc_2,
+                enc_3,
+                proof: Proof::TrustMeBro,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("Merkle tree full"));
+        assert!(!state.inner.nullifiers.contains(&nf));
+        assert_eq!(state.inner.tree.leaves, leaves_before);
+        assert_eq!(state.inner.memos.len(), memos_before);
+    }
+
+    #[test]
     fn test_apply_unshield_rejects_fee_below_minimum() {
         let (mut ledger, _addr, nk_spend, shield_resp) =
             shielded_note_setup(0x79, "alice", 150_000);
@@ -3319,6 +3477,43 @@ mod tests {
         assert!(err.contains("fee below minimum"));
         assert_eq!(ledger.balance("bob").unwrap(), 0);
         assert!(!ledger.nullifiers.contains(&nf));
+    }
+
+    #[test]
+    fn test_apply_unshield_preflights_change_and_fee_capacity_before_mutation() {
+        let (ledger, _addr, nk_spend, shield_resp) = shielded_note_setup(0x93, "alice", 150_000);
+        let root = ledger.tree.root();
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend_unused) = sample_address_bundle(0x94, 0);
+        let (enc_change, cm_change) = deterministic_note(&addr, 30, u(96), Some(b"change"));
+        let (enc_fee, cm_fee) = deterministic_note(&addr, 29_970, u(97), Some(b"dal"));
+        let mut state = LimitedAppendLedgerState::new(ledger, 1);
+
+        let leaves_before = state.inner.tree.leaves.clone();
+        let memos_before = state.inner.memos.len();
+
+        let err = apply_unshield(
+            &mut state,
+            &UnshieldReq {
+                root,
+                nullifiers: vec![nf],
+                v_pub: 20,
+                fee: MIN_TX_FEE,
+                recipient: "bob".into(),
+                cm_change,
+                enc_change: Some(enc_change),
+                cm_fee,
+                enc_fee,
+                proof: Proof::TrustMeBro,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("Merkle tree full"));
+        assert_eq!(state.inner.balance("bob").unwrap(), 0);
+        assert!(!state.inner.nullifiers.contains(&nf));
+        assert_eq!(state.inner.tree.leaves, leaves_before);
+        assert_eq!(state.inner.memos.len(), memos_before);
     }
 
     #[test]
