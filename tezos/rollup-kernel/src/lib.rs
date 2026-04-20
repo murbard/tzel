@@ -779,9 +779,39 @@ fn dal_payload_kind_name(kind: &KernelDalPayloadKind) -> &'static str {
         KernelDalPayloadKind::Shield => "shield",
         KernelDalPayloadKind::Transfer => "transfer",
         KernelDalPayloadKind::Unshield => "unshield",
+        KernelDalPayloadKind::ConfigureVerifier => "configure_verifier",
+        KernelDalPayloadKind::ConfigureBridge => "configure_bridge",
     }
 }
 
+/// Fetch and decode a kernel inbox message that was too large to fit in
+/// the L1 inbox and was therefore published via DAL.
+///
+/// Invariant enforced here: the `pointer.kind` must match the decoded
+/// message's variant.  Adding a new oversized message type requires:
+///   1. A new `KernelDalPayloadKind` variant in `core/src/kernel_wire.rs`.
+///   2. A matching arm below.
+///   3. (If the message is relayed through tzel-operator for user ops.)
+///      A `RollupSubmissionKind` variant and the corresponding
+///      `dal_pointer_from_submission` mapping.  Admin-only kinds stay out
+///      of the operator interface by design.
+///   4. A size-sentinel test in `core/src/kernel_wire.rs::tests` to catch
+///      future encoding changes.
+///
+/// Authentication model:
+///   - The `kind`-vs-content consistency check is a **defense-in-depth**
+///     control: a malicious or buggy publisher could otherwise submit a
+///     DAL pointer declaring `kind=Shield` while the actual payload is a
+///     `ConfigureBridge`, confusing any audit tooling that relies on the
+///     declared kind.  Rejecting the inconsistency forces publishers to
+///     label submissions honestly.
+///   - The **authenticity** of the decoded message comes from the
+///     signature / STARK proof inside the payload itself, verified
+///     against the admin leaves baked into the WASM at build time
+///     (config messages) or against the compiled verifier config
+///     (shield / transfer / unshield).  DAL is a public bulletin board
+///     — anyone can publish — so transport-level authentication is
+///     neither available nor relied upon.
 fn fetch_kernel_message_from_dal<H: Host>(
     host: &H,
     pointer: &KernelDalPayloadPointer,
@@ -899,18 +929,52 @@ fn fetch_kernel_message_from_dal<H: Host>(
     }
 
     let message = decode_kernel_inbox_message(&payload)?;
-    match (&pointer.kind, &message) {
-        (KernelDalPayloadKind::Shield, KernelInboxMessage::Shield(_))
-        | (KernelDalPayloadKind::Transfer, KernelInboxMessage::Transfer(_))
-        | (KernelDalPayloadKind::Unshield, KernelInboxMessage::Unshield(_)) => Ok(message),
-        (_, KernelInboxMessage::DalPointer(_)) => {
-            Err("nested DAL pointer messages are not supported".into())
-        }
-        _ => Err(format!(
-            "DAL payload kind mismatch: pointer declared {}, decoded {:?}",
-            dal_payload_kind_name(&pointer.kind),
-            message
-        )),
+    // Nested DAL pointers are never legal, regardless of the declared kind.
+    if matches!(message, KernelInboxMessage::DalPointer(_)) {
+        return Err("nested DAL pointer messages are not supported".into());
+    }
+    // Match on `pointer.kind` with no catch-all so that adding a new variant
+    // to `KernelDalPayloadKind` is a compile error until this dispatcher is
+    // updated.  The inner message match is the runtime guard: if the payload
+    // decoded to an unrelated variant, we fail loudly rather than applying
+    // the wrong kernel message.
+    let kind_name = dal_payload_kind_name(&pointer.kind);
+    match pointer.kind {
+        KernelDalPayloadKind::Shield => match message {
+            KernelInboxMessage::Shield(_) => Ok(message),
+            other => Err(format!(
+                "DAL payload kind mismatch: pointer declared {}, decoded {:?}",
+                kind_name, other
+            )),
+        },
+        KernelDalPayloadKind::Transfer => match message {
+            KernelInboxMessage::Transfer(_) => Ok(message),
+            other => Err(format!(
+                "DAL payload kind mismatch: pointer declared {}, decoded {:?}",
+                kind_name, other
+            )),
+        },
+        KernelDalPayloadKind::Unshield => match message {
+            KernelInboxMessage::Unshield(_) => Ok(message),
+            other => Err(format!(
+                "DAL payload kind mismatch: pointer declared {}, decoded {:?}",
+                kind_name, other
+            )),
+        },
+        KernelDalPayloadKind::ConfigureVerifier => match message {
+            KernelInboxMessage::ConfigureVerifier(_) => Ok(message),
+            other => Err(format!(
+                "DAL payload kind mismatch: pointer declared {}, decoded {:?}",
+                kind_name, other
+            )),
+        },
+        KernelDalPayloadKind::ConfigureBridge => match message {
+            KernelInboxMessage::ConfigureBridge(_) => Ok(message),
+            other => Err(format!(
+                "DAL payload kind mismatch: pointer declared {}, decoded {:?}",
+                kind_name, other
+            )),
+        },
     }
 }
 

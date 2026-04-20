@@ -15,7 +15,7 @@ use tzel_core::{
 
 fn usage() -> ! {
     eprintln!(
-        "usage:\n  octez_kernel_message admin-material\n  octez_kernel_message configure-bridge <sr1...> <KT1...>\n  octez_kernel_message configure-verifier <sr1...> <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message dal-pointer <sr1...> <shield|transfer|unshield> <payload_hash_hex> <payload_len> (<published_level> <slot_index> <chunk_len>)+"
+        "usage:\n  octez_kernel_message admin-material\n  octez_kernel_message configure-bridge <sr1...> <KT1...>\n  octez_kernel_message configure-bridge-payload <KT1...>\n  octez_kernel_message configure-verifier <sr1...> <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message configure-verifier-payload <auth_domain_hex> <shield_hash_hex> <transfer_hash_hex> <unshield_hash_hex>\n  octez_kernel_message dal-pointer <sr1...> <shield|transfer|unshield|configure_verifier|configure_bridge> <payload_hash_hex> <payload_len> (<published_level> <slot_index> <chunk_len>)+"
     );
     std::process::exit(2);
 }
@@ -48,6 +48,14 @@ fn config_admin_ask() -> F {
         return parse_felt(&hex);
     }
     if cfg!(debug_assertions) {
+        // Public, reproducible dev ask.  Signs with a value that any
+        // release-profile kernel baked without admin material will accept
+        // via its `debug_assertions` fallback — convenient for tests but a
+        // footgun in any non-debug deployment.  Make the fallback visible.
+        eprintln!(
+            "octez_kernel_message: WARNING: TZEL_ROLLUP_CONFIG_ADMIN_ASK_HEX not set, \
+             falling back to the public dev ask.  This is only safe for local sandbox / tests."
+        );
         return hash(b"tzel-dev-rollup-config-admin");
     }
     panic!("set TZEL_ROLLUP_CONFIG_ADMIN_ASK_HEX to sign config messages");
@@ -58,6 +66,8 @@ fn parse_dal_kind(kind: &str) -> KernelDalPayloadKind {
         "shield" => KernelDalPayloadKind::Shield,
         "transfer" => KernelDalPayloadKind::Transfer,
         "unshield" => KernelDalPayloadKind::Unshield,
+        "configure_verifier" => KernelDalPayloadKind::ConfigureVerifier,
+        "configure_bridge" => KernelDalPayloadKind::ConfigureBridge,
         _ => usage(),
     }
 }
@@ -113,6 +123,27 @@ fn main() {
                 ),
             );
         }
+        "configure-bridge-payload" => {
+            // Emit the raw unframed KernelInboxMessage hex.  Same reason as
+            // configure-verifier-payload: the WOTS-signed message exceeds
+            // sc_rollup_message_size_limit = 4096 bytes and must therefore
+            // be chunked and routed via DAL, referenced from L1 via a
+            // KernelDalPayloadPointer with kind = ConfigureBridge.
+            let Some(ticketer) = args.next() else {
+                usage();
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            let ask = config_admin_ask();
+            let signed = sign_kernel_bridge_config(&ask, KernelBridgeConfig { ticketer })
+                .expect("bridge config should sign");
+            let payload = encode_kernel_inbox_message(
+                &KernelInboxMessage::ConfigureBridge(signed),
+            )
+            .expect("kernel message should encode");
+            println!("{}", hex_encode(payload));
+        }
         "configure-verifier" => {
             let Some(rollup_address) = args.next() else {
                 usage();
@@ -150,6 +181,47 @@ fn main() {
                     .expect("verifier config should sign"),
                 ),
             );
+        }
+        "configure-verifier-payload" => {
+            // Emit the raw unframed KernelInboxMessage hex.  The signed
+            // WOTS-authenticated message exceeds the L1 inbox size limit
+            // (sc_rollup_message_size_limit = 4096), so it cannot be sent
+            // as a direct external message — it must be chunked and
+            // published as DAL slot(s), then referenced from L1 via a
+            // KernelDalPayloadPointer with kind = ConfigureVerifier.
+            let Some(auth_domain) = args.next() else {
+                usage();
+            };
+            let Some(shield) = args.next() else {
+                usage();
+            };
+            let Some(transfer) = args.next() else {
+                usage();
+            };
+            let Some(unshield) = args.next() else {
+                usage();
+            };
+            if args.next().is_some() {
+                usage();
+            }
+            let ask = config_admin_ask();
+            let signed = sign_kernel_verifier_config(
+                &ask,
+                KernelVerifierConfig {
+                    auth_domain: parse_felt(&auth_domain),
+                    verified_program_hashes: ProgramHashes {
+                        shield: parse_felt(&shield),
+                        transfer: parse_felt(&transfer),
+                        unshield: parse_felt(&unshield),
+                    },
+                },
+            )
+            .expect("verifier config should sign");
+            let payload = encode_kernel_inbox_message(
+                &KernelInboxMessage::ConfigureVerifier(signed),
+            )
+            .expect("kernel message should encode");
+            println!("{}", hex_encode(payload));
         }
         "dal-pointer" => {
             let Some(rollup_address) = args.next() else {

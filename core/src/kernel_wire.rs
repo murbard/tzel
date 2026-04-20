@@ -11,7 +11,9 @@ use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const KERNEL_WIRE_VERSION: u16 = 9;
+// v10: KernelDalPayloadKind gained ConfigureVerifier (tag 3) and
+//      ConfigureBridge (tag 4) variants.
+pub const KERNEL_WIRE_VERSION: u16 = 10;
 pub const KERNEL_VERIFIER_CONFIG_KEY_INDEX: u32 = 0;
 pub const KERNEL_BRIDGE_CONFIG_KEY_INDEX: u32 = 1;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
@@ -117,6 +119,14 @@ pub enum KernelDalPayloadKind {
     Shield,
     Transfer,
     Unshield,
+    /// Admin configuration of the STARK verifier.  Carried via DAL because
+    /// the WOTS-signed payload exceeds `sc_rollup_message_size_limit`
+    /// (4096 bytes).  See the size sentinel in the `tests` module.
+    ConfigureVerifier,
+    /// Admin configuration of the bridge ticketer.  Also WOTS-signed and
+    /// therefore oversized for the L1 inbox — routed via DAL for the same
+    /// reason.
+    ConfigureBridge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +287,11 @@ struct WireKernelWithdrawReq {
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 #[encoding(tags = "u8")]
+// Tag assignments here are independent of `WireKernelInboxMessage` below:
+// a `KernelDalPayloadKind` labels a *DAL-routed* message by category,
+// whereas `WireKernelInboxMessage` tags every kernel inbox message
+// including ones that never transit through DAL (Withdraw, DalPointer).
+// Do not assume numeric correspondence between the two spaces.
 enum WireKernelDalPayloadKind {
     #[encoding(tag = 0)]
     Shield,
@@ -284,6 +299,10 @@ enum WireKernelDalPayloadKind {
     Transfer,
     #[encoding(tag = 2)]
     Unshield,
+    #[encoding(tag = 3)]
+    ConfigureVerifier,
+    #[encoding(tag = 4)]
+    ConfigureBridge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -701,6 +720,8 @@ fn kernel_dal_payload_kind_to_wire(kind: &KernelDalPayloadKind) -> WireKernelDal
         KernelDalPayloadKind::Shield => WireKernelDalPayloadKind::Shield,
         KernelDalPayloadKind::Transfer => WireKernelDalPayloadKind::Transfer,
         KernelDalPayloadKind::Unshield => WireKernelDalPayloadKind::Unshield,
+        KernelDalPayloadKind::ConfigureVerifier => WireKernelDalPayloadKind::ConfigureVerifier,
+        KernelDalPayloadKind::ConfigureBridge => WireKernelDalPayloadKind::ConfigureBridge,
     }
 }
 
@@ -711,6 +732,8 @@ fn kernel_dal_payload_kind_from_wire(
         WireKernelDalPayloadKind::Shield => KernelDalPayloadKind::Shield,
         WireKernelDalPayloadKind::Transfer => KernelDalPayloadKind::Transfer,
         WireKernelDalPayloadKind::Unshield => KernelDalPayloadKind::Unshield,
+        WireKernelDalPayloadKind::ConfigureVerifier => KernelDalPayloadKind::ConfigureVerifier,
+        WireKernelDalPayloadKind::ConfigureBridge => KernelDalPayloadKind::ConfigureBridge,
     })
 }
 
@@ -2399,5 +2422,102 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("bad ct_d length"));
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Size sentinels for admin config messages.
+    //
+    // These tests lock the serialized byte length of a typical
+    // `ConfigureVerifier` / `ConfigureBridge` `KernelInboxMessage`.  They
+    // are expected to pass in the current tree; they exist to trigger a
+    // review when the encoding changes (new field in the config, WOTS
+    // parameter change, struct reshuffling, etc.).
+    //
+    // Why the byte budget matters:
+    // - Messages routed through the L1 inbox are subject to the protocol
+    //   constant `sc_rollup_message_size_limit = 4096`.
+    // - Messages routed through DAL can go up to `MAX_DAL_PAYLOAD_BYTES`
+    //   (several hundred kB), and the kernel recovers the payload via a
+    //   `DalPointer` whose routable kinds are enumerated in
+    //   `KernelDalPayloadKind`.
+    //
+    // If a sentinel below breaks:
+    //   1. Read the new size from the assertion output.
+    //   2. If it still exceeds 4096 bytes: confirm that the corresponding
+    //      `KernelDalPayloadKind` variant and the match arm in
+    //      `tezos/rollup-kernel/src/lib.rs::fetch_kernel_message_from_dal`
+    //      still exist.  Otherwise the message becomes impossible to
+    //      deliver to the kernel.
+    //   3. If it now fits in 4096 bytes: the DAL route remains correct
+    //      but also becomes optional for this message type.
+    //   4. Update the `EXPECTED_*` constant to the new value.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// The L1 smart-rollup external message size limit, as defined by the
+    /// Tezos protocol (`Constants_repr.sc_rollup_message_size_limit`).
+    /// Duplicated here because this crate does not depend on the protocol.
+    const L1_INBOX_MESSAGE_LIMIT: usize = 4096;
+
+    #[test]
+    fn configure_verifier_serialized_size_sentinel() {
+        const EXPECTED_SIZE: usize = 4923;
+
+        let ask = crate::hash(b"tzel-dev-rollup-config-admin");
+        let config = KernelVerifierConfig {
+            auth_domain: [0xAA; 32],
+            verified_program_hashes: ProgramHashes {
+                shield: [0xBB; 32],
+                transfer: [0xCC; 32],
+                unshield: [0xDD; 32],
+            },
+        };
+        let signed = sign_kernel_verifier_config(&ask, config)
+            .expect("sign verifier config");
+        let encoded = encode_kernel_inbox_message(
+            &KernelInboxMessage::ConfigureVerifier(signed),
+        )
+        .expect("encode configure-verifier message");
+
+        assert_eq!(
+            encoded.len(),
+            EXPECTED_SIZE,
+            "ConfigureVerifier serialized size changed — see module comment",
+        );
+        assert!(
+            encoded.len() > L1_INBOX_MESSAGE_LIMIT,
+            "ConfigureVerifier now fits in L1 inbox ({} <= {}); the DAL \
+             route can remain but is no longer required",
+            encoded.len(),
+            L1_INBOX_MESSAGE_LIMIT,
+        );
+    }
+
+    #[test]
+    fn configure_bridge_serialized_size_sentinel() {
+        const EXPECTED_SIZE: usize = 4835;
+
+        // A typical KT1 Tezos contract address (36 characters).
+        let ticketer = "KT1Fq8fPi2NjhWUXtcXBggbL6zFjZctGkmso".to_string();
+
+        let ask = crate::hash(b"tzel-dev-rollup-config-admin");
+        let signed = sign_kernel_bridge_config(&ask, KernelBridgeConfig { ticketer })
+            .expect("sign bridge config");
+        let encoded = encode_kernel_inbox_message(
+            &KernelInboxMessage::ConfigureBridge(signed),
+        )
+        .expect("encode configure-bridge message");
+
+        assert_eq!(
+            encoded.len(),
+            EXPECTED_SIZE,
+            "ConfigureBridge serialized size changed — see module comment",
+        );
+        assert!(
+            encoded.len() > L1_INBOX_MESSAGE_LIMIT,
+            "ConfigureBridge now fits in L1 inbox ({} <= {}); the DAL \
+             route can remain but is no longer required",
+            encoded.len(),
+            L1_INBOX_MESSAGE_LIMIT,
+        );
     }
 }
