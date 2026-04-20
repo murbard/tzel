@@ -247,13 +247,18 @@ Notes:
 
 ## 6. Fund Alice On L1 And Wait For The Public Rollup Balance
 
-Deposit into the bridge for Alice’s public rollup account:
+Deposit into the bridge for Alice’s public rollup account.  The shield
+in the next step debits `v + fee + producer_fee` from the public
+balance (200000 + 100000 + 1 = 300001 mutez), so the deposit must cover
+that total — depositing just `v` (200000) or `v + burn` (300000) leaves
+the shield short by the DAL-producer fee and it fails with
+"insufficient balance".
 
 ```bash
 /usr/local/bin/tzel-wallet \
   --wallet alice.wallet \
   deposit \
-  --amount 300000 \
+  --amount 300001 \
   --public-account alice
 ```
 
@@ -266,7 +271,7 @@ The wallet prints an L1 operation hash. Wait for it to land, then poll:
 Do not continue until Alice shows a non-zero line like:
 
 ```text
-Public rollup balance (alice): 300000
+Public rollup balance (alice): 300001
 ```
 
 ## 7. Shield Alice’s Funds
