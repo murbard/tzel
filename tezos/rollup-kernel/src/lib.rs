@@ -935,47 +935,28 @@ fn fetch_kernel_message_from_dal<H: Host>(
     }
     // Match on `pointer.kind` with no catch-all so that adding a new variant
     // to `KernelDalPayloadKind` is a compile error until this dispatcher is
-    // updated.  The inner message match is the runtime guard: if the payload
+    // updated.  The boolean result below is the runtime guard: if the payload
     // decoded to an unrelated variant, we fail loudly rather than applying
     // the wrong kernel message.
     let kind_name = dal_payload_kind_name(&pointer.kind);
-    match pointer.kind {
-        KernelDalPayloadKind::Shield => match message {
-            KernelInboxMessage::Shield(_) => Ok(message),
-            other => Err(format!(
-                "DAL payload kind mismatch: pointer declared {}, decoded {:?}",
-                kind_name, other
-            )),
-        },
-        KernelDalPayloadKind::Transfer => match message {
-            KernelInboxMessage::Transfer(_) => Ok(message),
-            other => Err(format!(
-                "DAL payload kind mismatch: pointer declared {}, decoded {:?}",
-                kind_name, other
-            )),
-        },
-        KernelDalPayloadKind::Unshield => match message {
-            KernelInboxMessage::Unshield(_) => Ok(message),
-            other => Err(format!(
-                "DAL payload kind mismatch: pointer declared {}, decoded {:?}",
-                kind_name, other
-            )),
-        },
-        KernelDalPayloadKind::ConfigureVerifier => match message {
-            KernelInboxMessage::ConfigureVerifier(_) => Ok(message),
-            other => Err(format!(
-                "DAL payload kind mismatch: pointer declared {}, decoded {:?}",
-                kind_name, other
-            )),
-        },
-        KernelDalPayloadKind::ConfigureBridge => match message {
-            KernelInboxMessage::ConfigureBridge(_) => Ok(message),
-            other => Err(format!(
-                "DAL payload kind mismatch: pointer declared {}, decoded {:?}",
-                kind_name, other
-            )),
-        },
+    let kind_matches_content = match pointer.kind {
+        KernelDalPayloadKind::Shield => matches!(message, KernelInboxMessage::Shield(_)),
+        KernelDalPayloadKind::Transfer => matches!(message, KernelInboxMessage::Transfer(_)),
+        KernelDalPayloadKind::Unshield => matches!(message, KernelInboxMessage::Unshield(_)),
+        KernelDalPayloadKind::ConfigureVerifier => {
+            matches!(message, KernelInboxMessage::ConfigureVerifier(_))
+        }
+        KernelDalPayloadKind::ConfigureBridge => {
+            matches!(message, KernelInboxMessage::ConfigureBridge(_))
+        }
+    };
+    if !kind_matches_content {
+        return Err(format!(
+            "DAL payload kind mismatch: pointer declared {}, decoded {:?}",
+            kind_name, message
+        ));
     }
+    Ok(message)
 }
 
 fn apply_kernel_message<H: Host>(
