@@ -24,6 +24,68 @@ Supported message kinds:
 
 These messages are applied through the shared Rust transition logic in `core/`.
 
+## Admin configuration messages and DAL routing
+
+Two admin-signed messages configure the rollup post-origination:
+
+- `ConfigureVerifier` — sets the expected Cairo program hashes (shield /
+  transfer / unshield) and the STARK auth domain.
+- `ConfigureBridge` — sets the KT1 ticketer contract whose tickets the
+  kernel will accept as legitimate deposit receipts.
+
+Both are signed with a WOTS one-time signature authenticated by a leaf
+baked into the kernel WASM at build time (`admin-material`,
+`TZEL_ROLLUP_{VERIFIER,BRIDGE}_CONFIG_ADMIN_LEAF_HEX`).  The WOTS
+signature accounts for most of the message size (`WOTS_CHAINS × F` =
+133 × 32 = 4256 bytes).
+
+### Delivery invariant
+
+The Tezos protocol constant `sc_rollup_message_size_limit` caps L1 inbox
+external messages at **4096 bytes**.  Both admin config messages exceed
+this limit once signed:
+
+| Message              | Serialized size | L1 inbox viable? |
+|----------------------|----------------:|:-----------------|
+| `ConfigureVerifier`  | 4923 bytes      | ❌ must use DAL  |
+| `ConfigureBridge`    | 4835 bytes      | ❌ must use DAL  |
+
+They are therefore routed through the DAL delivery path, same as
+`Shield`, `Transfer`, `Unshield`.  The flow:
+
+1. Operator computes the unframed `KernelInboxMessage` bytes via the
+   `configure-{verifier,bridge}-payload` subcommands of
+   `octez_kernel_message`.
+2. Operator chunks the bytes, publishes them as DAL slots, waits for
+   attestation.
+3. Operator injects into the L1 inbox a small `DalPointer` message
+   (framed via `ExternalMessageFrame::Targetted`) whose `kind` field
+   (`configure_verifier` / `configure_bridge`) tells the kernel how to
+   interpret the DAL payload.
+4. Kernel's `fetch_kernel_message_from_dal` reassembles the chunks,
+   verifies the hash, decodes as `KernelInboxMessage`, and dispatches
+   based on `pointer.kind ↔ message` consistency.
+
+### Adding a new oversized message type
+
+If a future message exceeds 4096 bytes and must reach the kernel:
+
+1. Add a variant to `KernelDalPayloadKind` in `core/src/kernel_wire.rs`
+   (next free wire tag).
+2. Add the reciprocal arm in `fetch_kernel_message_from_dal` in this
+   crate's `lib.rs` and in `dal_payload_kind_name`.
+3. Mirror the variant in `RollupSubmissionKind` and the operator's
+   `submission_kind_matches_message` / `dal_pointer_from_submission`.
+4. Update the `octez_kernel_message` CLI: add a `<cmd>-payload`
+   subcommand that outputs the raw unframed bytes, and extend
+   `parse_dal_kind` with the new token.
+5. Add a size-sentinel test under `core/src/kernel_wire.rs::tests`
+   (see `configure_verifier_serialized_size_sentinel`).
+
+If a change *reduces* an existing message below 4096 bytes, the direct
+L1 path becomes usable again but the DAL path can remain for uniformity
+— review on a case-by-case basis.
+
 The kernel does not keep the full ledger as one serialized blob. It stores:
 - note records under append-only per-index paths
 - the commitment-tree append frontier and current root
