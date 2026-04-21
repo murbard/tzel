@@ -21,7 +21,8 @@ use tezos_smart_rollup_encoding::{
     smart_rollup::SmartRollupAddress,
 };
 use tzel_core::kernel_wire::{
-    encode_kernel_inbox_message, sign_kernel_bridge_config, KernelBridgeConfig, KernelInboxMessage,
+    encode_kernel_inbox_message, sign_kernel_bridge_config, KernelBridgeConfig,
+    KernelDalChunkPointer, KernelDalPayloadKind, KernelDalPayloadPointer, KernelInboxMessage,
     KernelResult, KernelWithdrawReq,
 };
 #[cfg(feature = "proof-verifier")]
@@ -46,6 +47,8 @@ struct TestHost {
     store: HashMap<Vec<u8>, Vec<u8>>,
     outputs: Vec<Vec<u8>>,
     debug: String,
+    dal_parameters: Option<DalParameters>,
+    dal_pages: HashMap<(i32, u8, u16), Vec<u8>>,
 }
 
 impl TestHost {
@@ -89,17 +92,26 @@ impl Host for TestHost {
     }
 
     fn reveal_dal_parameters(&self) -> Result<DalParameters, String> {
-        Err("DAL is not configured in bridge_flow test host".into())
+        self.dal_parameters
+            .clone()
+            .ok_or_else(|| "DAL is not configured in bridge_flow test host".into())
     }
 
     fn reveal_dal_page(
         &self,
-        _published_level: i32,
-        _slot_index: u8,
-        _page_index: u16,
-        _max_bytes: usize,
+        published_level: i32,
+        slot_index: u8,
+        page_index: u16,
+        max_bytes: usize,
     ) -> Result<Vec<u8>, String> {
-        Ok(Vec::new())
+        Ok(self
+            .dal_pages
+            .get(&(published_level, slot_index, page_index))
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .take(max_bytes)
+            .collect())
     }
 }
 
@@ -111,6 +123,47 @@ fn signed_bridge_message(config: KernelBridgeConfig) -> KernelInboxMessage {
     KernelInboxMessage::ConfigureBridge(
         sign_kernel_bridge_config(&sample_config_admin_ask(), config).unwrap(),
     )
+}
+
+fn install_test_dal_payload(
+    host: &mut TestHost,
+    published_level: i32,
+    slot_index: u8,
+    page_size: usize,
+    slot_size: usize,
+    payload: &[u8],
+) -> KernelDalChunkPointer {
+    assert!(page_size > 0);
+    assert!(slot_size > 0);
+    host.dal_parameters = Some(DalParameters {
+        number_of_slots: u64::from(slot_index) + 1,
+        attestation_lag: 8,
+        slot_size: slot_size as u64,
+        page_size: page_size as u64,
+    });
+    let chunk_len = payload.len().min(slot_size);
+    let chunk = &payload[..chunk_len];
+    let page_count = chunk_len.div_ceil(page_size);
+    for page_index in 0..page_count {
+        let start = page_index * page_size;
+        let end = (start + page_size).min(chunk_len);
+        let mut page = vec![0u8; page_size];
+        page[..end - start].copy_from_slice(&chunk[start..end]);
+        host.dal_pages.insert(
+            (
+                published_level,
+                slot_index,
+                u16::try_from(page_index).expect("page index fits"),
+            ),
+            page,
+        );
+    }
+    KernelDalChunkPointer {
+        published_level: u64::try_from(published_level)
+            .expect("published level must be non-negative"),
+        slot_index,
+        payload_len: chunk_len as u64,
+    }
 }
 
 #[cfg(feature = "proof-verifier")]
@@ -230,6 +283,40 @@ fn bridge_roundtrip_survives_restarts_and_preserves_append_only_withdrawals() {
         sample_l1_receiver(),
         5,
     );
+}
+
+#[test]
+fn bridge_configuration_can_be_delivered_via_dal_pointer() {
+    let mut host = TestHost::default();
+    let payload = encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
+        ticketer: sample_ticketer().into(),
+    }))
+    .unwrap();
+    let pointer = KernelDalPayloadPointer {
+        kind: KernelDalPayloadKind::ConfigureBridge,
+        chunks: vec![install_test_dal_payload(
+            &mut host, 101, 0, 64, 8192, &payload,
+        )],
+        payload_len: payload.len() as u64,
+        payload_hash: hash(&payload),
+    };
+    host.push_input(
+        0,
+        0,
+        encode_external_kernel_message(KernelInboxMessage::DalPointer(pointer)),
+    );
+
+    run_with_host(&mut host);
+
+    assert_eq!(
+        host.read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
+            .expect("ticketer stored"),
+        sample_ticketer().as_bytes()
+    );
+    assert!(matches!(
+        read_last_result(&host).unwrap(),
+        KernelResult::Configured
+    ));
 }
 
 #[test]
@@ -404,6 +491,36 @@ fn verified_bridge_roundtrip_uses_checked_in_real_proofs() {
         &fixture.withdrawal_recipient,
         fixture.unshield.v_pub,
     );
+}
+
+#[cfg(feature = "proof-verifier")]
+#[test]
+fn verified_bridge_can_be_configured_via_dal_pointers() {
+    let fixture = verified_bridge_fixture();
+    let mut host = TestHost::default();
+    configure_verified_bridge_via_dal(&mut host, fixture);
+
+    assert!(matches!(
+        read_last_result(&host).unwrap(),
+        KernelResult::Configured
+    ));
+    assert_eq!(read_ledger(&host).unwrap().auth_domain, fixture.auth_domain);
+    assert_eq!(
+        host.read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
+            .expect("ticketer stored"),
+        fixture.bridge_ticketer.as_bytes()
+    );
+
+    apply_fixture_deposit(&mut host, fixture, 2);
+    apply_fixture_shield(&mut host, fixture, 3);
+
+    match read_last_result(&host).unwrap() {
+        KernelResult::Shield(resp) => {
+            assert_eq!(resp.index, 0);
+            assert_eq!(resp.producer_index, 1);
+        }
+        other => panic!("unexpected rollup result: {:?}", other),
+    }
 }
 
 #[cfg(feature = "proof-verifier")]
@@ -787,6 +904,58 @@ fn kernel_unshield_req_from_fixture(req: &UnshieldReq) -> KernelUnshieldReq {
 #[cfg(feature = "proof-verifier")]
 fn configure_verified_bridge(host: &mut TestHost, fixture: &VerifiedBridgeFixture) {
     configure_verified_bridge_with_hashes(host, fixture, fixture.program_hashes.clone());
+}
+
+#[cfg(feature = "proof-verifier")]
+fn configure_verified_bridge_via_dal(host: &mut TestHost, fixture: &VerifiedBridgeFixture) {
+    let verifier_payload =
+        encode_kernel_inbox_message(&signed_verifier_message(KernelVerifierConfig {
+            auth_domain: fixture.auth_domain,
+            verified_program_hashes: fixture.program_hashes.clone(),
+        }))
+        .unwrap();
+    let verifier_pointer = KernelDalPayloadPointer {
+        kind: KernelDalPayloadKind::ConfigureVerifier,
+        chunks: vec![install_test_dal_payload(
+            host,
+            101,
+            0,
+            64,
+            8192,
+            &verifier_payload,
+        )],
+        payload_len: verifier_payload.len() as u64,
+        payload_hash: hash(&verifier_payload),
+    };
+    host.push_input(
+        0,
+        0,
+        encode_external_kernel_message(KernelInboxMessage::DalPointer(verifier_pointer)),
+    );
+
+    let bridge_payload = encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
+        ticketer: fixture.bridge_ticketer.clone(),
+    }))
+    .unwrap();
+    let bridge_pointer = KernelDalPayloadPointer {
+        kind: KernelDalPayloadKind::ConfigureBridge,
+        chunks: vec![install_test_dal_payload(
+            host,
+            102,
+            1,
+            64,
+            8192,
+            &bridge_payload,
+        )],
+        payload_len: bridge_payload.len() as u64,
+        payload_hash: hash(&bridge_payload),
+    };
+    host.push_input(
+        1,
+        0,
+        encode_external_kernel_message(KernelInboxMessage::DalPointer(bridge_pointer)),
+    );
+    run_with_host(host);
 }
 
 #[cfg(feature = "proof-verifier")]

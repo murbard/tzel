@@ -54,6 +54,7 @@ The wallet commands below assume:
 - `/usr/local/bin/tzel-wallet`
 - `/usr/local/bin/reprove`
 - `/usr/local/bin/octez_kernel_message`
+- `/usr/local/bin/submit_rollup_config`
 - `/usr/local/bin/verified_bridge_fixture_message`
 - Cairo executables in `/opt/tzel/cairo/target/dev`
 - rollup config admin env files in `/usr/local/etc/tzel/rollup-config-admin-{runtime,build}.env`
@@ -109,11 +110,10 @@ These commands are one-time per deployed rollup.
 Set the shell variables first:
 
 ```bash
-export CLIENT_DIR=/var/lib/tzel/octez-client
-export NODE_ENDPOINT=http://127.0.0.1:8732
+export OPERATOR_URL=http://127.0.0.1:8787
+export OPERATOR_BEARER_TOKEN="$(cat /etc/tzel/operator-bearer-token)"
 export ROLLUP_ADDRESS=sr1REPLACE_ME
 export BRIDGE_TICKETER=KT1REPLACE_ME
-export SOURCE_ALIAS=tzelshadownet
 ```
 
 Extract the verifier metadata from the checked-in verified fixture:
@@ -128,32 +128,36 @@ export TRANSFER_HASH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)[
 export UNSHIELD_HASH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["unshield_program_hash"])' <<<"$META_JSON")"
 ```
 
-Send `configure-verifier`:
+Submit `configure-verifier` through the operator:
 
 ```bash
-MSG_HEX="$(/usr/local/bin/octez_kernel_message configure-verifier \
-  "$ROLLUP_ADDRESS" \
+/usr/local/bin/submit_rollup_config \
+  --operator-url "$OPERATOR_URL" \
+  --bearer-token "$OPERATOR_BEARER_TOKEN" \
+  --rollup-address "$ROLLUP_ADDRESS" \
+  configure-verifier \
   "$AUTH_DOMAIN" \
   "$SHIELD_HASH" \
   "$TRANSFER_HASH" \
-  "$UNSHIELD_HASH")"
-
-octez-client -d "$CLIENT_DIR" -E "$NODE_ENDPOINT" \
-  send smart rollup message "hex:[ \"$MSG_HEX\" ]" from "$SOURCE_ALIAS"
+  "$UNSHIELD_HASH"
 ```
 
-Send `configure-bridge`:
+Submit `configure-bridge` through the operator:
 
 ```bash
-MSG_HEX="$(/usr/local/bin/octez_kernel_message configure-bridge \
-  "$ROLLUP_ADDRESS" \
-  "$BRIDGE_TICKETER")"
-
-octez-client -d "$CLIENT_DIR" -E "$NODE_ENDPOINT" \
-  send smart rollup message "hex:[ \"$MSG_HEX\" ]" from "$SOURCE_ALIAS"
+/usr/local/bin/submit_rollup_config \
+  --operator-url "$OPERATOR_URL" \
+  --bearer-token "$OPERATOR_BEARER_TOKEN" \
+  --rollup-address "$ROLLUP_ADDRESS" \
+  configure-bridge \
+  "$BRIDGE_TICKETER"
 ```
 
-Wait for both operations to be included, then verify local services again:
+The operator automatically falls back to DAL when a config message is too large
+for the direct inbox path, which is the normal case for the signed config
+payloads now. Each command returns JSON with a `submission.id`; poll
+`$OPERATOR_URL/v1/rollup/submissions/<id>` until both submissions reach
+`submitted_to_l1`, then verify local services again:
 
 ```bash
 ./scripts/shadownet_operator_preflight.sh /etc/tzel/shadownet.env

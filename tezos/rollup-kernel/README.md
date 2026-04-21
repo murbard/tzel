@@ -105,8 +105,9 @@ TZEL_RUN_OCTEZ_ROLLUP_SANDBOX_DAL=1 \
 
 The DAL smoke requires `octez-dal-node` in addition to the normal sandbox
 dependencies. It spins up a local node, baker, DAL node, rollup node, and
-`tzel-operator`, then submits the checked-in verified shield fixture through the
-operator and waits for the rollup durable state to reflect the shield.
+publishes both the signed config messages and the checked-in verified shield
+fixture through DAL pointers, then waits for the rollup durable state to reflect
+the configuration and shield.
 
 You can then strip it and run it with the Octez smart-rollup debugger as
 described in the Tezos smart-rollup tutorial.

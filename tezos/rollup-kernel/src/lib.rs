@@ -41,9 +41,8 @@ use tzel_core::{
         KernelSignedBridgeConfig, KernelSignedVerifierConfig, KernelVerifierConfig,
         KERNEL_BRIDGE_CONFIG_KEY_INDEX, KERNEL_VERIFIER_CONFIG_KEY_INDEX,
     },
-    required_tx_fee_for_private_tx_count,
-    verify_wots_signature_against_leaf, EncryptedNote, Ledger, LedgerState, WithdrawalRecord,
-    DEPTH, F, ZERO,
+    required_tx_fee_for_private_tx_count, verify_wots_signature_against_leaf, EncryptedNote,
+    Ledger, LedgerState, WithdrawalRecord, DEPTH, F, ZERO,
 };
 #[cfg(any(test, debug_assertions))]
 use tzel_core::{auth_leaf_hash, derive_auth_pub_seed};
@@ -359,8 +358,8 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
 
     fn ensure_note_capacity(&self, additional: usize) -> Result<(), String> {
         let count = self.read_u64(PATH_TREE_SIZE)?.unwrap_or(0);
-        let additional =
-            u64::try_from(additional).map_err(|_| "note capacity does not fit in u64".to_string())?;
+        let additional = u64::try_from(additional)
+            .map_err(|_| "note capacity does not fit in u64".to_string())?;
         let limit = 1u64 << DEPTH;
         let next = count
             .checked_add(additional)
@@ -826,6 +825,8 @@ pub fn read_last_result<H: Host>(host: &H) -> Option<KernelResult> {
 
 fn dal_payload_kind_name(kind: &KernelDalPayloadKind) -> &'static str {
     match kind {
+        KernelDalPayloadKind::ConfigureVerifier => "configure-verifier",
+        KernelDalPayloadKind::ConfigureBridge => "configure-bridge",
         KernelDalPayloadKind::Shield => "shield",
         KernelDalPayloadKind::Transfer => "transfer",
         KernelDalPayloadKind::Unshield => "unshield",
@@ -950,7 +951,9 @@ fn fetch_kernel_message_from_dal<H: Host>(
 
     let message = decode_kernel_inbox_message(&payload)?;
     match (&pointer.kind, &message) {
-        (KernelDalPayloadKind::Shield, KernelInboxMessage::Shield(_))
+        (KernelDalPayloadKind::ConfigureVerifier, KernelInboxMessage::ConfigureVerifier(_))
+        | (KernelDalPayloadKind::ConfigureBridge, KernelInboxMessage::ConfigureBridge(_))
+        | (KernelDalPayloadKind::Shield, KernelInboxMessage::Shield(_))
         | (KernelDalPayloadKind::Transfer, KernelInboxMessage::Transfer(_))
         | (KernelDalPayloadKind::Unshield, KernelInboxMessage::Unshield(_)) => Ok(message),
         (_, KernelInboxMessage::DalPointer(_)) => {
@@ -1558,8 +1561,8 @@ mod tests {
             KernelBridgeConfig, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
             KernelTransferReq, KernelUnshieldReq, KernelVerifierConfig, KernelWithdrawReq,
         },
-        owner_tag, PaymentAddress, ProgramHashes, Proof, ShieldReq, ShieldResp, TransferResp,
-        UnshieldResp, WithdrawResp, MIN_TX_FEE, ZERO, u64_to_felt,
+        owner_tag, u64_to_felt, PaymentAddress, ProgramHashes, Proof, ShieldReq, ShieldResp,
+        TransferResp, UnshieldResp, WithdrawResp, MIN_TX_FEE, ZERO,
     };
 
     #[derive(Default)]
@@ -2075,6 +2078,79 @@ mod tests {
             }
             other => panic!("unexpected rollup result: {:?}", other),
         }
+    }
+
+    #[test]
+    fn applies_configure_verifier_message_from_dal_pointer() {
+        let mut host = MockHost::default();
+        let config = KernelVerifierConfig {
+            auth_domain: sample_felt(0x41),
+            verified_program_hashes: sample_program_hashes(),
+        };
+        let payload =
+            encode_kernel_inbox_message(&signed_verifier_message(config.clone())).unwrap();
+        let pointer = KernelDalPayloadPointer {
+            kind: KernelDalPayloadKind::ConfigureVerifier,
+            chunks: vec![install_mock_dal_payload(
+                &mut host, 101, 1, 64, 8192, &payload,
+            )],
+            payload_len: payload.len() as u64,
+            payload_hash: hash(&payload),
+        };
+        host.inputs.push_back(InputMessage {
+            level: 13,
+            id: 0,
+            payload: encode_kernel_inbox_message(&KernelInboxMessage::DalPointer(pointer)).unwrap(),
+        });
+
+        run_with_host(&mut host);
+
+        let verifier = read_verifier_config(&host)
+            .expect("verifier config read")
+            .expect("verifier config persisted");
+        assert_eq!(verifier.auth_domain, config.auth_domain);
+        assert_eq!(
+            verifier.verified_program_hashes,
+            config.verified_program_hashes
+        );
+        assert!(matches!(
+            read_last_result(&host).unwrap(),
+            KernelResult::Configured
+        ));
+    }
+
+    #[test]
+    fn applies_configure_bridge_message_from_dal_pointer() {
+        let mut host = MockHost::default();
+        let config = KernelBridgeConfig {
+            ticketer: sample_ticketer().into(),
+        };
+        let payload = encode_kernel_inbox_message(&signed_bridge_message(config.clone())).unwrap();
+        let pointer = KernelDalPayloadPointer {
+            kind: KernelDalPayloadKind::ConfigureBridge,
+            chunks: vec![install_mock_dal_payload(
+                &mut host, 101, 2, 64, 8192, &payload,
+            )],
+            payload_len: payload.len() as u64,
+            payload_hash: hash(&payload),
+        };
+        host.inputs.push_back(InputMessage {
+            level: 14,
+            id: 0,
+            payload: encode_kernel_inbox_message(&KernelInboxMessage::DalPointer(pointer)).unwrap(),
+        });
+
+        run_with_host(&mut host);
+
+        assert_eq!(
+            host.read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
+                .expect("ticketer stored"),
+            sample_ticketer().as_bytes()
+        );
+        assert!(matches!(
+            read_last_result(&host).unwrap(),
+            KernelResult::Configured
+        ));
     }
 
     #[test]

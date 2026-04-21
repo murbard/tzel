@@ -114,6 +114,8 @@ pub struct KernelWithdrawReq {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelDalPayloadKind {
+    ConfigureVerifier,
+    ConfigureBridge,
     Shield,
     Transfer,
     Unshield,
@@ -284,6 +286,10 @@ enum WireKernelDalPayloadKind {
     Transfer,
     #[encoding(tag = 2)]
     Unshield,
+    #[encoding(tag = 3)]
+    ConfigureVerifier,
+    #[encoding(tag = 4)]
+    ConfigureBridge,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -698,6 +704,8 @@ fn signed_bridge_config_from_wire(
 
 fn kernel_dal_payload_kind_to_wire(kind: &KernelDalPayloadKind) -> WireKernelDalPayloadKind {
     match kind {
+        KernelDalPayloadKind::ConfigureVerifier => WireKernelDalPayloadKind::ConfigureVerifier,
+        KernelDalPayloadKind::ConfigureBridge => WireKernelDalPayloadKind::ConfigureBridge,
         KernelDalPayloadKind::Shield => WireKernelDalPayloadKind::Shield,
         KernelDalPayloadKind::Transfer => WireKernelDalPayloadKind::Transfer,
         KernelDalPayloadKind::Unshield => WireKernelDalPayloadKind::Unshield,
@@ -708,6 +716,8 @@ fn kernel_dal_payload_kind_from_wire(
     kind: WireKernelDalPayloadKind,
 ) -> Result<KernelDalPayloadKind, String> {
     Ok(match kind {
+        WireKernelDalPayloadKind::ConfigureVerifier => KernelDalPayloadKind::ConfigureVerifier,
+        WireKernelDalPayloadKind::ConfigureBridge => KernelDalPayloadKind::ConfigureBridge,
         WireKernelDalPayloadKind::Shield => KernelDalPayloadKind::Shield,
         WireKernelDalPayloadKind::Transfer => KernelDalPayloadKind::Transfer,
         WireKernelDalPayloadKind::Unshield => KernelDalPayloadKind::Unshield,
@@ -1752,7 +1762,7 @@ mod tests {
     #[test]
     fn kernel_inbox_roundtrip_preserves_dal_pointer() {
         let message = KernelInboxMessage::DalPointer(KernelDalPayloadPointer {
-            kind: KernelDalPayloadKind::Transfer,
+            kind: KernelDalPayloadKind::ConfigureVerifier,
             chunks: vec![
                 KernelDalChunkPointer {
                     published_level: 101,
@@ -1773,7 +1783,7 @@ mod tests {
         let KernelInboxMessage::DalPointer(pointer) = decoded else {
             panic!("unexpected decoded message");
         };
-        assert_eq!(pointer.kind, KernelDalPayloadKind::Transfer);
+        assert_eq!(pointer.kind, KernelDalPayloadKind::ConfigureVerifier);
         assert_eq!(pointer.chunks.len(), 2);
         assert_eq!(pointer.chunks[0].published_level, 101);
         assert_eq!(pointer.chunks[0].slot_index, 3);
