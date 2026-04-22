@@ -39,27 +39,12 @@ jobs:
         with:
           scarb-version: "2.16.1"
 
-      - name: Install OCaml system prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libgmp-dev pkg-config
-
-      - name: Set up OCaml for Rust/OCaml interop tests
-        uses: ocaml/setup-ocaml@v3
-        with:
-          ocaml-compiler: "5.2.0"
-
-      - name: Install OCaml dependencies for Rust/OCaml interop tests
-        run: |
-          opam install -y dune alcotest cstruct ctypes ctypes-foreign hex mirage-crypto yojson
-
       - name: Run Rust unit tests
         run: |
           cargo test -p tzel-core --lib
           cargo +nightly-2025-07-14 test -p tzel-verifier --lib
           cargo test --lib -p tzel-services
           cargo test --test integration -p tzel-services
-          cargo test --test cross_impl_interop -p tzel-services
           cargo test --manifest-path services/tzel/Cargo.toml --bin tzel-operator
           cargo +nightly-2025-07-14 test -p tzel-rollup-kernel --lib
           cargo +nightly-2025-07-14 test -p tzel-rollup-kernel --test bridge_flow
@@ -97,6 +82,8 @@ jobs:
 
   ocaml:
     runs-on: ubuntu-latest
+    env:
+      LIBRARY_PATH: ${{ github.workspace }}/ocaml/vendor/mlkem-native/test/build
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -115,5 +102,14 @@ jobs:
         run: |
           opam install -y dune alcotest cstruct ctypes ctypes-foreign hex mirage-crypto yojson
 
+      - name: Build ML-KEM native library
+        run: make -C ocaml/vendor/mlkem-native lib
+
+      - name: Set up Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
       - name: Run OCaml unit tests
-        run: ./scripts/ocaml_unit_tests.sh
+        run: opam exec -- ./scripts/ocaml_unit_tests.sh
+
+      - name: Run cross-implementation interop test
+        run: opam exec -- cargo test --test cross_impl_interop -p tzel-services
