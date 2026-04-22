@@ -1,6 +1,6 @@
 use crate::{
     EncryptedNote, NoteMemo, PaymentAddress, ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES,
-    NOTE_AEAD_NONCE_BYTES,
+    NOTE_AEAD_NONCE_BYTES, OUTGOING_RECOVERY_CT_BYTES,
 };
 use ml_kem::KeyExport;
 #[cfg(not(target_arch = "wasm32"))]
@@ -9,7 +9,7 @@ use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const CANONICAL_WIRE_VERSION: u16 = 2;
+pub const CANONICAL_WIRE_VERSION: u16 = 3;
 pub const FELT252_BYTES: usize = 32;
 pub const ML_KEM768_ENCAPSULATION_KEY_BYTES: usize = 1184;
 
@@ -54,6 +54,8 @@ pub(crate) struct WireEncryptedNote {
     pub(crate) nonce: Vec<u8>,
     #[encoding(sized = "ENCRYPTED_NOTE_BYTES", bytes)]
     pub(crate) encrypted_data: Vec<u8>,
+    #[encoding(sized = "OUTGOING_RECOVERY_CT_BYTES", bytes)]
+    pub(crate) outgoing_ct: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -176,6 +178,7 @@ pub fn encode_encrypted_note(enc: &EncryptedNote) -> Result<Vec<u8>, String> {
         ct_v: enc.ct_v.clone(),
         nonce: enc.nonce.clone(),
         encrypted_data: enc.encrypted_data.clone(),
+        outgoing_ct: enc.outgoing_ct.clone(),
     })
 }
 
@@ -187,6 +190,7 @@ pub fn decode_encrypted_note(bytes: &[u8]) -> Result<EncryptedNote, String> {
         ct_v: wire.ct_v,
         nonce: wire.nonce,
         encrypted_data: wire.encrypted_data,
+        outgoing_ct: wire.outgoing_ct,
     };
     enc.validate()?;
     Ok(enc)
@@ -206,6 +210,7 @@ pub fn encode_note_memo(note: &NoteMemo) -> Result<Vec<u8>, String> {
             ct_v: note.enc.ct_v.clone(),
             nonce: note.enc.nonce.clone(),
             encrypted_data: note.enc.encrypted_data.clone(),
+            outgoing_ct: note.enc.outgoing_ct.clone(),
         },
     })
 }
@@ -221,6 +226,7 @@ pub fn decode_note_memo(bytes: &[u8]) -> Result<NoteMemo, String> {
         ct_v: wire.enc.ct_v,
         nonce: wire.enc.nonce,
         encrypted_data: wire.enc.encrypted_data,
+        outgoing_ct: wire.enc.outgoing_ct,
     };
     enc.validate()?;
     Ok(NoteMemo {
@@ -240,6 +246,7 @@ pub fn encode_published_note(cm: &F, enc: &EncryptedNote) -> Result<Vec<u8>, Str
             ct_v: enc.ct_v.clone(),
             nonce: enc.nonce.clone(),
             encrypted_data: enc.encrypted_data.clone(),
+            outgoing_ct: enc.outgoing_ct.clone(),
         },
     })
 }
@@ -252,6 +259,7 @@ pub fn decode_published_note(bytes: &[u8]) -> Result<(F, EncryptedNote), String>
         ct_v: wire.enc.ct_v,
         nonce: wire.enc.nonce,
         encrypted_data: wire.enc.encrypted_data,
+        outgoing_ct: wire.enc.outgoing_ct,
     };
     enc.validate()?;
     Ok((wire_to_felt(wire.cm)?, enc))
@@ -427,6 +435,7 @@ mod tests {
         assert_eq!(decoded.tag, enc.tag);
         assert_eq!(decoded.ct_v, enc.ct_v);
         assert_eq!(decoded.encrypted_data, enc.encrypted_data);
+        assert_eq!(decoded.outgoing_ct, enc.outgoing_ct);
     }
 
     #[test]
@@ -440,6 +449,7 @@ mod tests {
         assert_eq!(decoded.enc.tag, note_memo.enc.tag);
         assert_eq!(decoded.enc.ct_v, note_memo.enc.ct_v);
         assert_eq!(decoded.enc.encrypted_data, note_memo.enc.encrypted_data);
+        assert_eq!(decoded.enc.outgoing_ct, note_memo.enc.outgoing_ct);
     }
 
     #[test]
@@ -453,6 +463,7 @@ mod tests {
         assert_eq!(decoded_enc.tag, enc.tag);
         assert_eq!(decoded_enc.ct_v, enc.ct_v);
         assert_eq!(decoded_enc.encrypted_data, enc.encrypted_data);
+        assert_eq!(decoded_enc.outgoing_ct, enc.outgoing_ct);
     }
 
     #[test]

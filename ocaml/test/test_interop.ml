@@ -71,6 +71,13 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
   | Ok () -> ()
   | Error e -> Alcotest.failf "shield failed: %s" e
   end;
+  Tzel.Ledger.append_commitment ledger
+    (felt_of_hex (json_string (json_field "producer_cm" shield)));
+  Tzel.Ledger.set_balance ledger shield_sender
+    (Int64.sub (Tzel.Ledger.get_balance ledger shield_sender)
+       (Int64.add
+          (Int64.of_int (json_int (json_field "fee" shield)))
+          (Int64.of_int (json_int (json_field "producer_fee" shield)))));
 
   let transfer = json_field "transfer" json in
   let transfer_pub : Tzel.Transaction.transfer_public = {
@@ -89,6 +96,8 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
   | Ok () -> ()
   | Error e -> Alcotest.failf "transfer failed: %s" e
   end;
+  Tzel.Ledger.append_commitment ledger
+    (felt_of_hex (json_string (json_field "cm_3" transfer)));
 
   let unshield = json_field "unshield" json in
   let recipient = json_string (json_field "recipient" unshield) in
@@ -107,6 +116,8 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
   | Ok () -> ()
   | Error e -> Alcotest.failf "unshield failed: %s" e
   end;
+  Tzel.Ledger.append_commitment ledger
+    (felt_of_hex (json_string (json_field "cm_fee" unshield)));
 
   let expected = json_field "expected" json in
   Alcotest.(check int64) "alice balance"

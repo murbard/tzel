@@ -111,7 +111,8 @@ let encrypt_note ~(ek_v : Mlkem.encapsulation_key) ~(ek_d : Mlkem.encapsulation_
   let tag = compute_tag ss_d in
   let (ss_v, ct_v) = Mlkem.encaps ek_v in
   let (nonce, encrypted_data) = encrypt_memo ~ss_v ~v ~rseed ~memo in
-  let enc : Encoding.encrypted_note = { ct_d; tag; ct_v; nonce; encrypted_data } in
+  let outgoing_ct = Bytes.make Encoding.outgoing_recovery_ct_size '\x00' in
+  let enc : Encoding.encrypted_note = { ct_d; tag; ct_v; nonce; encrypted_data; outgoing_ct } in
   enc
 
 (* Decrypt a note (recipient with dk_v) *)

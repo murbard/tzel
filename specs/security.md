@@ -19,7 +19,7 @@ This document is informative, not normative. The canonical protocol rules and en
 - **Transaction shape and timing are public:** observers still learn transaction type, ordering, and whether there is a change note.
 - **Delegated provers get per-address spent-state visibility:** the prover sees per-address values such as `nk_spend_j` and `auth_root_j`. Given public commitments, positions, and the public nullifier set, a prover with `nk_spend_j` can compute candidate nullifiers for one address and learn which public notes for that address have been spent. This is stronger than mere same-address linking.
 - **Detection tags are only a filtering aid:** the false-positive rate `2^(-k)` is not, by itself, a meaningful privacy guarantee.
-- **No outgoing viewing in the current protocol:** full-view capability means incoming viewing plus nullifier/spent-state tracking for notes whose address metadata is known. There is no outgoing-view ciphertext in the current scheme.
+- **Outgoing viewing is sender-scoped:** `outgoing_seed` decrypts sender-recovery ciphertexts for outputs created by the same wallet. It does not detect arbitrary incoming notes, compute nullifiers, or grant spend authority.
 - **No expiry in spend authorization:** a delegated prover can withhold a completed authorization until one of its nullifiers is consumed elsewhere. This is a protocol-level anti-withholding gap, not a circuit bug.
 
 ## Honest-Sender and Ciphertext Caveats

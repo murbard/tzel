@@ -24,6 +24,12 @@ The intended separation is:
   - cannot spend
   - cannot mark notes spent because it does not have spend authority
 
+- `outgoing`
+  - export `outgoing_seed`
+  - can recover metadata for outputs created by this wallet
+  - cannot detect arbitrary incoming notes
+  - cannot spend or compute nullifiers
+
 ## Export
 
 From the spending wallet:
@@ -31,6 +37,7 @@ From the spending wallet:
 ```bash
 tzel-wallet --wallet alice.json export-detect --out alice.detect.json
 tzel-wallet --wallet alice.json export-view --out alice.view.json
+tzel-wallet --wallet alice.json export-outgoing --out alice.outgoing.json
 ```
 
 ## Create A Watch Wallet
@@ -84,6 +91,7 @@ Endpoints:
 
 - `detect` mode returns candidate matches
 - `view` mode returns validated incoming notes and aggregate incoming total
+- `outgoing` mode returns recovered sender-created outputs and aggregate outgoing total
 
 ## Installed Deployment
 

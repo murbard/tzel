@@ -16,7 +16,8 @@
      tag:            u16,
      ct_v:           bytes[1088],
      nonce:          bytes[12],
-     encrypted_data: bytes[1080]
+     encrypted_data: bytes[1080],
+     outgoing_ct:    bytes[185]
    }
 
    PublishedNote := record {
@@ -37,6 +38,7 @@ type encrypted_note = {
   ct_v : bytes;           (* 1088 bytes *)
   nonce : bytes;          (* 12 bytes *)
   encrypted_data : bytes; (* 1080 bytes *)
+  outgoing_ct : bytes;    (* 185 bytes *)
 }
 
 type published_note = {
@@ -81,8 +83,9 @@ let get_u64_le buf ofs =
   done;
   !r
 
-(* EncryptedNote binary: 1088 + 2 + 1088 + 12 + 1080 = 3270 bytes *)
-let encrypted_note_size = 3270
+(* EncryptedNote binary: 1088 + 2 + 1088 + 12 + 1080 + 185 = 3455 bytes *)
+let outgoing_recovery_ct_size = 185
+let encrypted_note_size = 3455
 
 let encode_encrypted_note enc =
   let buf = Bytes.create encrypted_note_size in
@@ -91,6 +94,7 @@ let encode_encrypted_note enc =
   Bytes.blit enc.ct_v 0 buf 1090 1088;
   Bytes.blit enc.nonce 0 buf 2178 12;
   Bytes.blit enc.encrypted_data 0 buf 2190 1080;
+  Bytes.blit enc.outgoing_ct 0 buf 3270 outgoing_recovery_ct_size;
   buf
 
 let decode_encrypted_note buf =
@@ -100,10 +104,11 @@ let decode_encrypted_note buf =
   let ct_v = Bytes.sub buf 1090 1088 in
   let nonce = Bytes.sub buf 2178 12 in
   let encrypted_data = Bytes.sub buf 2190 1080 in
-  { ct_d; tag; ct_v; nonce; encrypted_data }
+  let outgoing_ct = Bytes.sub buf 3270 outgoing_recovery_ct_size in
+  { ct_d; tag; ct_v; nonce; encrypted_data; outgoing_ct }
 
-(* PublishedNote binary: 32 + 3270 = 3302 bytes *)
-let published_note_size = 3302
+(* PublishedNote binary: 32 + 3455 = 3487 bytes *)
+let published_note_size = 3487
 
 let encode_published_note pn =
   let buf = Bytes.create published_note_size in
@@ -118,8 +123,8 @@ let decode_published_note buf =
   let pn_enc = decode_encrypted_note (Bytes.sub buf 32 encrypted_note_size) in
   { pn_cm; pn_enc }
 
-(* NoteMemo binary: 8 + 32 + 3270 = 3310 bytes *)
-let note_memo_size = 3310
+(* NoteMemo binary: 8 + 32 + 3455 = 3495 bytes *)
+let note_memo_size = 3495
 
 let encode_note_memo nm =
   let buf = Bytes.create note_memo_size in
@@ -159,7 +164,7 @@ let decode_payment_address buf =
   let ek_d = Bytes.sub buf 1312 1184 in
   { d_j; auth_root; auth_pub_seed; nk_tag; ek_v; ek_d }
 
-(* Memo hash: H_memo(ct_d || tag_le || ct_v || encrypted_data) *)
+(* Memo hash: H_memo(ct_d || tag_le || ct_v || nonce || encrypted_data || outgoing_ct) *)
 let compute_memo_ct_hash enc =
   let buf = encode_encrypted_note enc in
   Hash.hash_memo buf
@@ -181,6 +186,7 @@ let encrypted_note_to_json enc =
     "ct_v", `String (hex_of_bytes enc.ct_v);
     "nonce", `String (hex_of_bytes enc.nonce);
     "encrypted_data", `String (hex_of_bytes enc.encrypted_data);
+    "outgoing_ct", `String (hex_of_bytes enc.outgoing_ct);
   ]
 
 let published_note_to_json pn =

@@ -11,6 +11,7 @@ type account_keys = {
   ask_base : Felt.t;
   dsk : Felt.t;
   incoming_seed : Felt.t;
+  outgoing_seed : Felt.t;
   view_root : Felt.t;
   detect_root : Felt.t;
 }
@@ -41,12 +42,13 @@ type payment_address = {
 let derive master_sk =
   let spend_seed = Hash.hash2 Hash.tag_spend master_sk in
   let incoming_seed = Hash.hash2 Hash.tag_incoming master_sk in
+  let outgoing_seed = Hash.hash2 Hash.tag_outgoing master_sk in
   let nk = Hash.hash2 Hash.tag_nk spend_seed in
   let ask_base = Hash.hash2 Hash.tag_ask spend_seed in
   let dsk = Hash.hash2 Hash.tag_dsk incoming_seed in
   let view_root = Hash.hash2 Hash.tag_view incoming_seed in
   let detect_root = Hash.hash2 Hash.tag_detect view_root in
-  { nk; ask_base; dsk; incoming_seed; view_root; detect_root }
+  { nk; ask_base; dsk; incoming_seed; outgoing_seed; view_root; detect_root }
 
 let derive_diversifier keys j =
   Hash.hash2 keys.dsk (Felt.of_int j)

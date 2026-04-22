@@ -99,6 +99,7 @@ Tests the full account key derivation from `master_sk`.
 | `ask_base` | hex felt | `H(TAG_ASK, H(TAG_SPEND, master_sk))` |
 | `dsk` | hex felt | `H(TAG_DSK, H(TAG_INCOMING, master_sk))` |
 | `incoming_seed` | hex felt | `H(TAG_INCOMING, master_sk)` |
+| `outgoing_seed` | hex felt | `H(TAG_OUTGOING, master_sk)` |
 | `view_root` | hex felt | `H(TAG_VIEW, incoming_seed)` |
 | `detect_root` | hex felt | `H(TAG_DETECT, view_root)` |
 
@@ -245,7 +246,7 @@ Tests detection tag computation.
 
 ## Section: `memo_ct_hash`
 
-Tests `H_memo(ct_d || tag_le || ct_v || nonce || encrypted_data)`.
+Tests `H_memo(ct_d || tag_le || ct_v || nonce || encrypted_data || outgoing_ct)`.
 
 **Single object:**
 
@@ -256,7 +257,8 @@ Tests `H_memo(ct_d || tag_le || ct_v || nonce || encrypted_data)`.
 | `ct_v` | hex | 1088 bytes: `byte[i] = (i + 100) % 256` |
 | `nonce` | hex | 12 bytes: `0x44` repeated |
 | `encrypted_data` | hex | 1080 bytes: `byte[i] = (i + 200) % 256` |
-| `memo_ct_hash` | hex felt | `H_memo(ct_d || LE16(42) || ct_v || nonce || encrypted_data)` |
+| `outgoing_ct` | hex | 185 bytes: `0xDD` repeated |
+| `memo_ct_hash` | hex felt | `H_memo(ct_d || LE16(42) || ct_v || nonce || encrypted_data || outgoing_ct)` |
 
 ---
 
@@ -284,8 +286,9 @@ End-to-end test: derives keys from `master_sk`, performs deterministic KEM encap
 | `memo` | hex | `text_memo("cross-impl test")` (1024 bytes) |
 | `nonce` | hex | Derived note nonce |
 | `encrypted_data` | hex | ChaCha20-Poly1305 output (1080 bytes) |
+| `outgoing_ct` | hex | 185 bytes of `0xEE` used for cross-implementation memo hash coverage |
 | `tag` | int | Detection tag from `ss_d` |
-| `memo_ct_hash` | hex felt | `H_memo(ct_d \|\| LE16(tag) \|\| ct_v \|\| nonce \|\| encrypted_data)` |
+| `memo_ct_hash` | hex felt | `H_memo(ct_d \|\| LE16(tag) \|\| ct_v \|\| nonce \|\| encrypted_data \|\| outgoing_ct)` |
 
 **Verification procedure:** an implementation MUST:
 1. Derive `view_seed` and `detect_seed` from `master_sk` and `j=0`
@@ -294,7 +297,7 @@ End-to-end test: derives keys from `master_sk`, performs deterministic KEM encap
 4. Run `encaps_derand(ek_d, coins_d)`, compare `ss_d` and `ct_d`
 5. Encrypt the memo with `ss_v`, compare `nonce` and `encrypted_data`
 6. Compute detection tag from `ss_d`, compare `tag`
-7. Compute `H_memo(ct_d || LE16(tag) || ct_v || nonce || encrypted_data)`, compare `memo_ct_hash`
+7. Compute `H_memo(ct_d || LE16(tag) || ct_v || nonce || encrypted_data || outgoing_ct)`, compare `memo_ct_hash`
 
 If any step fails, the intermediate values pinpoint the first divergence.
 
@@ -436,9 +439,9 @@ Tests canonical binary serialization byte layout.
 | Field | Type | Description |
 |-------|------|-------------|
 | `payment_address` | hex | 2496-byte PaymentAddress encoding for address j=0 from `master_sk` |
-| `encrypted_note` | hex | 3270-byte EncryptedNote with deterministic fill (see below) |
-| `published_note` | hex | 3302-byte PublishedNote |
-| `note_memo` | hex | 3310-byte NoteMemo with `index=42` |
+| `encrypted_note` | hex | 3455-byte EncryptedNote with deterministic fill (see below) |
+| `published_note` | hex | 3487-byte PublishedNote |
+| `note_memo` | hex | 3495-byte NoteMemo with `index=42` |
 
 **Deterministic EncryptedNote fill:**
 ```
@@ -447,6 +450,7 @@ tag = 42
 ct_v[i] = (i + 50) % 256    for i in 0..1088
 nonce[i] = 0xAA             for i in 0..12
 encrypted_data[i] = (i + 100) % 256  for i in 0..1080
+outgoing_ct[i] = 0xBB       for i in 0..185
 ```
 
 **PublishedNote:** `cm = H(UTF8("wire-test-cm"))` (i.e., `felt252(BLAKE2s-256(UTF8("wire-test-cm")))`), followed by the EncryptedNote above.

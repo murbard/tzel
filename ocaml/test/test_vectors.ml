@@ -85,6 +85,7 @@ let test_key_hierarchy_vectors json =
   check_hex "ask_base" (json_string (json_field "ask_base" kh)) keys.ask_base;
   check_hex "dsk" (json_string (json_field "dsk" kh)) keys.dsk;
   check_hex "incoming_seed" (json_string (json_field "incoming_seed" kh)) keys.incoming_seed;
+  check_hex "outgoing_seed" (json_string (json_field "outgoing_seed" kh)) keys.outgoing_seed;
   check_hex "view_root" (json_string (json_field "view_root" kh)) keys.view_root;
   check_hex "detect_root" (json_string (json_field "detect_root" kh)) keys.detect_root
 
@@ -187,6 +188,7 @@ let test_memo_ct_hash_vectors json =
     ct_v = bytes_of_hex (json_string (json_field "ct_v" v));
     nonce = bytes_of_hex (json_string (json_field "nonce" v));
     encrypted_data = bytes_of_hex (json_string (json_field "encrypted_data" v));
+    outgoing_ct = bytes_of_hex (json_string (json_field "outgoing_ct" v));
   } in
   let mch = Tzel.Encoding.compute_memo_ct_hash enc in
   check_hex "memo_ct_hash" (json_string (json_field "memo_ct_hash" v)) mch
@@ -214,7 +216,8 @@ let test_cross_impl_encrypt_vectors json =
   check_hex "encrypted_data" (json_string (json_field "encrypted_data" v)) encrypted_data;
   let tag = Tzel.Detection.compute_tag ss_d in
   Alcotest.(check int) "tag" (json_int (json_field "tag" v)) tag;
-  let enc : Tzel.Encoding.encrypted_note = { ct_d; tag; ct_v; nonce; encrypted_data } in
+  let outgoing_ct = bytes_of_hex (json_string (json_field "outgoing_ct" v)) in
+  let enc : Tzel.Encoding.encrypted_note = { ct_d; tag; ct_v; nonce; encrypted_data; outgoing_ct } in
   let mch = Tzel.Encoding.compute_memo_ct_hash enc in
   check_hex "memo_ct_hash" (json_string (json_field "memo_ct_hash" v)) mch
 
@@ -331,6 +334,7 @@ let test_wire_encoding_vectors json =
     ct_v = Bytes.init 1088 (fun i -> Char.chr ((i + 50) mod 256));
     nonce = Bytes.make 12 '\xAA';
     encrypted_data = Bytes.init 1080 (fun i -> Char.chr ((i + 100) mod 256));
+    outgoing_ct = Bytes.make Tzel.Encoding.outgoing_recovery_ct_size '\xBB';
   } in
   check_hex "encrypted_note" expected_enc (Tzel.Encoding.encode_encrypted_note enc);
   let cm = Tzel.Hash.hash_tag "wire-test-cm" in

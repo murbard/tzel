@@ -39,20 +39,22 @@ master_sk
 │   │           └── pk_i = WOTS+.KeyGen(sk_root_i) — 133 chain endpoints (w=4)
 │   │       └── (auth_root_j, pub_seed_j) = XMSS-style address auth public key
 │
-└── incoming_seed = H(TAG_INCOMING, master_sk)
-    ├── dsk         = H(TAG_DSK, incoming_seed)     — diversifier derivation key
-    │   └── d_j     = H(dsk, j)                   — diversified address index
-    ├── view_root   = H(TAG_VIEW, incoming_seed)    — root for per-address ML-KEM viewing keys
-    │   └── seed_v_j = KDF_view(view_root, j)     — exact KDF defined below
-    │       └── (ek_v_j, dk_v_j) = ML-KEM-768.KeyGenDet(seed_v_j)
-    └── detect_root = H(TAG_DETECT, view_root)      — root for per-address detection keys
-        └── seed_d_j = KDF_detect(detect_root, j) — exact KDF defined below
-            └── (ek_d_j, dk_d_j) = ML-KEM-768.KeyGenDet(seed_d_j)
+├── incoming_seed = H(TAG_INCOMING, master_sk)
+│   ├── dsk         = H(TAG_DSK, incoming_seed)     — diversifier derivation key
+│   │   └── d_j     = H(dsk, j)                   — diversified address index
+│   ├── view_root   = H(TAG_VIEW, incoming_seed)    — root for per-address ML-KEM viewing keys
+│   │   └── seed_v_j = KDF_view(view_root, j)     — exact KDF defined below
+│   │       └── (ek_v_j, dk_v_j) = ML-KEM-768.KeyGenDet(seed_v_j)
+│   └── detect_root = H(TAG_DETECT, view_root)      — root for per-address detection keys
+│       └── seed_d_j = KDF_detect(detect_root, j) — exact KDF defined below
+│           └── (ek_d_j, dk_d_j) = ML-KEM-768.KeyGenDet(seed_d_j)
+│
+└── outgoing_seed = H(TAG_OUTGOING, master_sk)       — sender-side recovery key for created outputs
 ```
 
-**Spending branch** holds nullifier material (`nk`) and authorization (`ask`). **Incoming branch** holds address diversification and incoming memo keys. The two branches are independent — address material reveals nothing about spending keys.
+**Spending branch** holds nullifier material (`nk`) and authorization (`ask`). **Incoming branch** holds address diversification and incoming memo keys. **Outgoing branch** lets the sender recover the notes it created without learning anything about other incoming notes. These branches are independent — address material reveals nothing about spending keys, and outgoing viewing material is not part of payment addresses.
 
-The current protocol does NOT include an outgoing viewing key or a sender-recovery ciphertext. Full-view capability means "incoming viewing plus nullifier / spent-state tracking", not "recover sent notes".
+Outgoing viewing is sender-side only: each output note carries an `outgoing_ct` encrypted to the creator's `outgoing_seed`. This ciphertext recovers enough note metadata for sender accounting and audit of sent outputs, but it does not give incoming viewing capability or spending authority.
 
 Exact deterministic ML-KEM derivation for interoperability:
 
@@ -155,10 +157,11 @@ This ensures the commitment cryptographically binds to the nullifier key materia
 |------------|-----------|--------|
 | **Detection** | `dk_d_j` for one address, or `detect_root` for all addresses | Flag candidate transactions (with tunable false positives) |
 | **Incoming view** | `incoming_seed` | Derive all `d_j`, `dk_v_j`, and `dk_d_j`; decrypt all incoming memos |
-| **Full view** | `(nk, incoming_seed)` | Above + compute nullifiers + track spent/unspent for notes whose address metadata is known |
-| **Spend** | `(nk, ask_base, incoming_seed)` | Above + authorize transactions |
+| **Outgoing view** | `outgoing_seed` | Decrypt sender-recovery ciphertexts for outputs created by this wallet |
+| **Full view** | `(nk, incoming_seed)` | Incoming view + compute nullifiers + track spent/unspent for notes whose address metadata is known |
+| **Spend** | `(nk, ask_base, incoming_seed)` | Full view + authorize transactions |
 
-Detection ⊂ incoming view ⊂ full view ⊂ spend. Each level strictly adds capability.
+Detection ⊂ incoming view ⊂ full view ⊂ spend. Each level strictly adds capability. Outgoing view is orthogonal to that chain: it tracks sent outputs created with the account's `outgoing_seed`, but it cannot detect arbitrary incoming notes, compute nullifiers, or spend.
 
 `incoming_seed` and `nk` alone do NOT reconstruct `(auth_root_j, pub_seed_j)`, so incoming-view and full-view holders cannot fully validate note spendability from keys alone. Independent note validation requires locally stored address metadata (or exported address records) containing at least `(d_j, auth_root_j, pub_seed_j, nk_tag_j)` for the recipient addresses being monitored.
 
@@ -245,8 +248,8 @@ separate resource price from the burned rollup fee above.
 8. `producer_fee > 0`
 
 `memo_ct_hash` and `producer_memo_ct_hash` are computed client-side as
-`H(ct_d || tag || ct_v || nonce || encrypted_data)` — covering ALL on-chain
-note data — and passed into the circuit as public inputs.
+`H(ct_d || tag || ct_v || nonce || encrypted_data || outgoing_ct)` —
+covering ALL on-chain note data — and passed into the circuit as public inputs.
 
 **Contract / ledger checks:** proof valid, deposit binding per [Shield deposit binding](#shield-deposit-binding), `H(posted_client_note_calldata) == memo_ct_hash`, `H(posted_producer_note_calldata) == producer_memo_ct_hash`, `fee >= required_tx_fee`.
 
@@ -409,6 +412,19 @@ encrypted_data   = ChaCha20-Poly1305(key=H(ss_v), nonce, plaintext)
 
 The detection server (with `dk_d_j`) decapsulates `ct_d`, recomputes `tag_u16`, and compares it to the posted little-endian `tag` field. True matches always succeed. Non-matches succeed with probability 2^(-k) (false positives from ML-KEM's implicit rejection).
 
+## Outgoing Viewing
+
+For each output created by a wallet, the sender also posts a fixed-size sender-recovery ciphertext:
+
+```text
+outgoing_plaintext = role || v || rseed || d_j || auth_root || pub_seed || nk_tag
+outgoing_key       = H_ovk(outgoing_seed, cm)
+outgoing_nonce     = H_ovn(outgoing_key, cm)[0..12)
+outgoing_ct        = ChaCha20-Poly1305(outgoing_key, outgoing_nonce, outgoing_plaintext)
+```
+
+`role` distinguishes recipient, change, shield, unshield-change, and producer-fee outputs. The ciphertext is bound to `cm`, so copying it to another note does not decrypt under the same outgoing key. It intentionally stores the cryptographic note metadata needed for sender recovery, not the full 1024-byte user memo. Payment addresses are unchanged; recipients still use the incoming ML-KEM viewing path above.
+
 ## Wallet Note Acceptance
 
 Detection and successful memo decryption are only candidate filters. A wallet MUST accept an incoming note as belonging to one of its addresses only if it can match the note against locally known address metadata and recompute the commitment exactly:
@@ -434,7 +450,7 @@ The memo is end-to-end encrypted — only the recipient (with `dk_v`) can read i
 
 ## Memo Integrity (Anti-Tampering)
 
-Each circuit includes a `memo_ct_hash` per output note in its public outputs. This is a hash of ALL on-chain note data (`H(ct_d || tag || ct_v || nonce || encrypted_data)`), computed **client-side** before proving. The circuit does not compute it — it simply passes it through as a public output. Including the detection ciphertext and tag prevents a relayer from swapping detection data to redirect note discovery.
+Each circuit includes a `memo_ct_hash` per output note in its public outputs. This is a hash of ALL on-chain note data (`H(ct_d || tag || ct_v || nonce || encrypted_data || outgoing_ct)`), computed **client-side** before proving. The circuit does not compute it — it simply passes it through as a public output. Including the detection ciphertext, tag, and outgoing-recovery ciphertext prevents a relayer from swapping discovery or sender-recovery data.
 
 The on-chain contract verifies `H(posted_calldata) == memo_ct_hash` for each output note. If a malicious relayer or sequencer swaps the encrypted memo data in transit, the hash won't match and the contract rejects the transaction.
 
@@ -449,8 +465,9 @@ tag             —     2 bytes   little-endian `u16`; low k bits are the detect
 ct_v            — 1,088 bytes   ML-KEM-768 memo ciphertext
 nonce           —    12 bytes   derived AEAD nonce `H_mnon(H(ss_v) || plaintext)[0..12)`
 encrypted_data  — 1,080 bytes   ChaCha20-Poly1305(v:8 || rseed:32 || memo:1024) + 16 auth tag
+outgoing_ct     —   185 bytes   ChaCha20-Poly1305(role:1 || v:8 || rseed:32 || d_j:32 || auth_root:32 || pub_seed:32 || nk_tag:32) + 16 auth tag
                 ---------
-                 3,302 bytes per output note (~3.2 KB)
+                 3,487 bytes per output note (~3.4 KB)
 ```
 
 ## Transaction Format
@@ -460,7 +477,7 @@ encrypted_data  — 1,080 bytes   ChaCha20-Poly1305(v:8 || rseed:32 || memo:1024
 ```
 proof             — ~295 KB    circuit proof (ZK, two-level recursive STARK)
 public_outputs    —  256 B     [v_pub, fee, producer_fee, cm_new, cm_producer, deposit_id, memo_ct_hash, producer_memo_ct_hash] (8 x 32 bytes)
-note_data         —  6.4 KB    2 output notes
+note_data         —  6.8 KB    2 output notes
                   ----------
                   ~302 KB total (no spend signature — ownership is proved by deposit-secret preimage knowledge)
 ```
@@ -470,9 +487,9 @@ note_data         —  6.4 KB    2 output notes
 ```
 proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
 public_outputs    — (N+8)*32 B  [auth_domain, root, nf_0..nf_{N-1}, fee, cm_1, cm_2, cm_3, mh_1, mh_2, mh_3]
-note_data         —  9.6 KB    3 output notes
+note_data         — 10.2 KB    3 output notes
                   ----------
-                  ~305 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
+                  ~306 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
 ```
 
 For a typical N=2 transfer: ~306 KB total.
@@ -482,9 +499,9 @@ For a typical N=2 transfer: ~306 KB total.
 ```
 proof             — ~295 KB    circuit proof (WOTS+ sig verified inside STARK)
 public_outputs    — (N+8)*32 B  [auth_domain, root, nf_0..nf_{N-1}, v_pub, fee, recipient_id, cm_change, mh_change, cm_fee, mh_fee]
-note_data         — 3.2-6.4 KB  producer fee note plus optional change note
+note_data         — 3.4-6.8 KB  producer fee note plus optional change note
                   ----------
-                  ~299-302 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
+                  ~299-303 KB + 32N B  (no signatures — WOTS+ verified inside STARK)
 ```
 
 For a typical N=2 unshield: ~300-303 KB total.
@@ -509,6 +526,8 @@ All hashing uses BLAKE2s-256 truncated to 251 bits, with domain separation via B
 | Standalone WOTS regression helper | `wotsSP__` | `hash1_wots` |
 | Sighash | `sighSP__` | `sighash_fold` (in circuit + client) |
 | Memo hash (client-side) | `memoSP__` | -- (not in circuit) |
+| Outgoing recovery key | `ovkKSP__` | -- (client-side sender recovery) |
+| Outgoing recovery nonce | `ovkNSP__` | -- (client-side sender recovery) |
 
 The commitment tree uses `mrklSP__` for internal nodes. The XMSS address tree does **not** use that personalization; it uses unpersonalized BLAKE2s with ADRS-based domain separation via `H_node`.
 
@@ -538,11 +557,11 @@ Examples:
 | `TAG_NK` | `"nk"` | `6b6e000000000000000000000000000000000000000000000000000000000000` |
 | `TAG_ASK` | `"ask"` | `6b73610000000000000000000000000000000000000000000000000000000000` |
 | `TAG_INCOMING` | `"incoming"` | `676e696d6f636e69000000000000000000000000000000000000000000000000` |
+| `TAG_OUTGOING` | `"outgoing"` | `676e696f6774756f000000000000000000000000000000000000000000000000` |
 | `TAG_DSK` | `"dsk"` | `6b73640000000000000000000000000000000000000000000000000000000000` |
 | `TAG_VIEW` | `"view"` | `7765697600000000000000000000000000000000000000000000000000000000` |
 | `TAG_DETECT` | `"detect"` | `7463657465640000000000000000000000000000000000000000000000000000` |
 | `TAG_RCM` | `"rcm"` | `6d63720000000000000000000000000000000000000000000000000000000000` |
-| `TAG_MLKEM_V` | `"mlkem-v"` | `762d6d656b6c6d00000000000000000000000000000000000000000000000000` |
 | `TAG_MLKEM_V2` | `"mlkem-v2"` | `32762d6d656b6c6d000000000000000000000000000000000000000000000000` |
 | `TAG_MLKEM_D` | `"mlkem-d"` | `642d6d656b6c6d00000000000000000000000000000000000000000000000000` |
 | `TAG_MLKEM_D2` | `"mlkem-d2"` | `32642d6d656b6c6d000000000000000000000000000000000000000000000000` |
@@ -592,7 +611,8 @@ EncryptedNote := record {
   tag:            u16le,         // detection tag, little-endian on the wire
   ct_v:           bytes[1088],   // ML-KEM-768 ciphertext
   nonce:          bytes[12],     // derived AEAD nonce
-  encrypted_data: bytes[1080]    // ChaCha20-Poly1305 ciphertext+tag
+  encrypted_data: bytes[1080],   // ChaCha20-Poly1305 ciphertext+tag
+  outgoing_ct:    bytes[185]     // sender-recovery ciphertext+tag
 }
 
 PublishedNote := record {
@@ -682,7 +702,7 @@ Both the commitment tree and auth key tree use left-right BLAKE2s Merkle trees:
 The `memo_ct_hash` public output is defined as:
 
 ```
-memo_ct_hash = H_memo(ct_d || tag_le || ct_v || nonce || encrypted_data)
+memo_ct_hash = H_memo(ct_d || tag_le || ct_v || nonce || encrypted_data || outgoing_ct)
 ```
 
 where:
@@ -692,6 +712,7 @@ where:
 - `ct_v` is the ML-KEM-768 viewing ciphertext (1088 bytes)
 - `nonce` is the 12-byte derived AEAD nonce
 - `encrypted_data` is the ChaCha20-Poly1305 ciphertext (1080 bytes)
+- `outgoing_ct` is the ChaCha20-Poly1305 sender-recovery ciphertext (185 bytes)
 - `H_memo` uses the `memoSP__` personalization, truncated to 251 bits
 
-The on-chain contract verifies that hashing the posted note data (exactly these five fields in this order) produces the `memo_ct_hash` from the proof's public outputs. The commitment (`cm`) is NOT included in this hash — it is verified separately via the commitment binding check.
+The on-chain contract verifies that hashing the posted note data (exactly these six fields in this order) produces the `memo_ct_hash` from the proof's public outputs. The commitment (`cm`) is NOT included in this hash — it is verified separately via the commitment binding check.

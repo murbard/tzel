@@ -819,6 +819,7 @@ mod tests {
                 ct_v: vec![0; 1088],
                 nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
                 encrypted_data: vec![0; 1080],
+                outgoing_ct: empty_outgoing_recovery_ct(),
             }),
             producer_cm,
             producer_enc: Some(producer_enc),
@@ -1115,6 +1116,7 @@ mod tests {
                 ct_v: vec![0; 1088],
                 nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
                 encrypted_data: vec![0; 1080],
+                outgoing_ct: empty_outgoing_recovery_ct(),
             }),
             producer_cm,
             producer_enc: Some(producer_enc),
@@ -1448,6 +1450,7 @@ mod tests {
             ct_v: vec![0; 1088],
             nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![0; 1080],
+            outgoing_ct: empty_outgoing_recovery_ct(),
         };
         let mh = memo_ct_hash(&enc);
         let (producer_cm, producer_enc, producer_mh) = test_output_note(0x36);
@@ -1782,6 +1785,15 @@ mod tests {
             original_hash,
             "changing encrypted_data must change memo_ct_hash"
         );
+
+        // Tamper with outgoing recovery ciphertext
+        let mut tampered = enc.clone();
+        tampered.outgoing_ct[0] ^= 0xFF;
+        assert_ne!(
+            memo_ct_hash(&tampered),
+            original_hash,
+            "changing outgoing_ct must change memo_ct_hash"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -1838,6 +1850,7 @@ mod tests {
                 ct_v: vec![0; 1088],
                 nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
                 encrypted_data: vec![0; 1080],
+                outgoing_ct: empty_outgoing_recovery_ct(),
             },
             enc_2: EncryptedNote {
                 ct_d: vec![0; 1088],
@@ -1845,6 +1858,7 @@ mod tests {
                 ct_v: vec![0; 1088],
                 nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
                 encrypted_data: vec![0; 1080],
+                outgoing_ct: empty_outgoing_recovery_ct(),
             },
             enc_3: EncryptedNote {
                 ct_d: vec![0; 1088],
@@ -1852,6 +1866,7 @@ mod tests {
                 ct_v: vec![0; 1088],
                 nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
                 encrypted_data: vec![0; 1080],
+                outgoing_ct: empty_outgoing_recovery_ct(),
             },
             proof: Proof::TrustMeBro,
         };
@@ -1930,6 +1945,7 @@ mod tests {
             ct_v: vec![0; 1088],
             nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![0; 1080],
+            outgoing_ct: empty_outgoing_recovery_ct(),
         };
         assert!(
             !detect(&bad_enc, &dk_d),
@@ -1953,6 +1969,7 @@ mod tests {
             ct_v: vec![0; 10], // wrong length
             nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![0; 1080],
+            outgoing_ct: empty_outgoing_recovery_ct(),
         };
         assert!(
             decrypt_memo(&bad_enc, &dk_v).is_none(),
@@ -2006,6 +2023,7 @@ mod tests {
             ct_v: vec![0; ML_KEM768_CIPHERTEXT_BYTES],
             nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![0; ENCRYPTED_NOTE_BYTES],
+            outgoing_ct: empty_outgoing_recovery_ct(),
         };
         let mut client_cm = ZERO;
         client_cm[0] = 1;
@@ -3102,6 +3120,7 @@ mod tests {
             ct_v: vec![0xBB; 1088],
             nonce: vec![0xDD; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![0xCC; 100],
+            outgoing_ct: empty_outgoing_recovery_ct(),
         };
 
         // Must not panic — should return false

@@ -6,12 +6,13 @@ use crate::{
     hash, wots_sign, EncryptedNote, PaymentAddress, ProgramHashes, Proof, ShieldReq, ShieldResp,
     TransferReq, TransferResp, UnshieldReq, UnshieldResp, WithdrawReq, WithdrawResp,
     ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES,
+    OUTGOING_RECOVERY_CT_BYTES,
 };
 use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const KERNEL_WIRE_VERSION: u16 = 9;
+pub const KERNEL_WIRE_VERSION: u16 = 10;
 pub const KERNEL_VERIFIER_CONFIG_KEY_INDEX: u32 = 0;
 pub const KERNEL_BRIDGE_CONFIG_KEY_INDEX: u32 = 1;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
@@ -22,8 +23,11 @@ const MAX_VERIFY_META_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
 const MAX_DAL_CHUNK_POINTERS: usize = 256;
 const MAX_DAL_CHUNK_LIST_BYTES: usize = 64 * 1024;
-const MAX_ENCODED_NOTE_WIRE_BYTES: usize =
-    (ML_KEM768_CIPHERTEXT_BYTES * 2) + NOTE_AEAD_NONCE_BYTES + ENCRYPTED_NOTE_BYTES + 32;
+const MAX_ENCODED_NOTE_WIRE_BYTES: usize = (ML_KEM768_CIPHERTEXT_BYTES * 2)
+    + NOTE_AEAD_NONCE_BYTES
+    + ENCRYPTED_NOTE_BYTES
+    + OUTGOING_RECOVERY_CT_BYTES
+    + 32;
 const MAX_ENCODED_PROOF_WIRE_BYTES: usize =
     MAX_PROOF_BYTES + MAX_VERIFY_META_BYTES + (MAX_OUTPUT_PREIMAGE_ITEMS * 64) + 4096;
 const MAX_ENCODED_NULLIFIER_LIST_BYTES: usize = 256 * 1024;
@@ -841,6 +845,7 @@ fn encrypted_note_to_wire(enc: &EncryptedNote) -> Result<WireEncryptedNote, Stri
         ct_v: enc.ct_v.clone(),
         nonce: enc.nonce.clone(),
         encrypted_data: enc.encrypted_data.clone(),
+        outgoing_ct: enc.outgoing_ct.clone(),
     })
 }
 
@@ -851,6 +856,7 @@ fn encrypted_note_from_wire(wire: WireEncryptedNote) -> Result<EncryptedNote, St
         ct_v: wire.ct_v,
         nonce: wire.nonce,
         encrypted_data: wire.encrypted_data,
+        outgoing_ct: wire.outgoing_ct,
     };
     enc.validate()?;
     Ok(enc)
@@ -1292,13 +1298,17 @@ mod tests {
             prop::collection::vec(any::<u8>(), ML_KEM768_CIPHERTEXT_BYTES),
             prop::collection::vec(any::<u8>(), NOTE_AEAD_NONCE_BYTES),
             prop::collection::vec(any::<u8>(), ENCRYPTED_NOTE_BYTES),
+            prop::collection::vec(any::<u8>(), OUTGOING_RECOVERY_CT_BYTES),
         )
-            .prop_map(|(ct_d, tag, ct_v, nonce, encrypted_data)| EncryptedNote {
-                ct_d,
-                tag,
-                ct_v,
-                nonce,
-                encrypted_data,
+            .prop_map(|(ct_d, tag, ct_v, nonce, encrypted_data, outgoing_ct)| {
+                EncryptedNote {
+                    ct_d,
+                    tag,
+                    ct_v,
+                    nonce,
+                    encrypted_data,
+                    outgoing_ct,
+                }
             })
     }
 
@@ -1821,6 +1831,7 @@ mod tests {
             ct_v: vec![fill ^ 0x5a; crate::ML_KEM768_CIPHERTEXT_BYTES],
             nonce: vec![fill.wrapping_add(2); crate::NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![fill.wrapping_add(1); crate::ENCRYPTED_NOTE_BYTES],
+            outgoing_ct: vec![fill.wrapping_add(3); crate::OUTGOING_RECOVERY_CT_BYTES],
         }
     }
 
@@ -2406,6 +2417,7 @@ mod tests {
             ct_v: vec![0; ML_KEM768_CIPHERTEXT_BYTES],
             nonce: vec![0; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![0; ENCRYPTED_NOTE_BYTES],
+            outgoing_ct: vec![0; OUTGOING_RECOVERY_CT_BYTES],
         })
         .unwrap_err();
         assert!(err.contains("bad ct_d length"));

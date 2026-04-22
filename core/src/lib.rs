@@ -23,6 +23,8 @@ pub const DETECT_K: usize = 10;
 pub const ML_KEM768_CIPHERTEXT_BYTES: usize = 1088;
 pub const NOTE_AEAD_NONCE_BYTES: usize = 12;
 pub const ENCRYPTED_NOTE_BYTES: usize = 8 + 32 + MEMO_SIZE + 16;
+pub const OUTGOING_RECOVERY_PLAINTEXT_BYTES: usize = 1 + 8 + (5 * 32);
+pub const OUTGOING_RECOVERY_CT_BYTES: usize = OUTGOING_RECOVERY_PLAINTEXT_BYTES + 16;
 pub const MAX_VALID_ROOTS: usize = 4096;
 pub const MIN_TX_FEE: u64 = 100_000;
 pub const BASE_PRIVATE_TXS_PER_LEVEL: u64 = 2;
@@ -341,18 +343,35 @@ pub fn unshield_sighash(
 }
 
 /// Hash of all encrypted note data — binds the full on-chain note to the proof.
-/// Covers detection ciphertext, tag, viewing ciphertext, and encrypted payload.
+/// Covers detection ciphertext, tag, viewing ciphertext, encrypted payload, and outgoing recovery.
 /// A relayer cannot swap any component without invalidating the hash.
 pub fn memo_ct_hash(enc: &EncryptedNote) -> F {
     let mut buf = Vec::with_capacity(
-        enc.ct_d.len() + 2 + enc.ct_v.len() + enc.nonce.len() + enc.encrypted_data.len(),
+        enc.ct_d.len()
+            + 2
+            + enc.ct_v.len()
+            + enc.nonce.len()
+            + enc.encrypted_data.len()
+            + enc.outgoing_ct.len(),
     );
     buf.extend_from_slice(&enc.ct_d);
     buf.extend_from_slice(&enc.tag.to_le_bytes());
     buf.extend_from_slice(&enc.ct_v);
     buf.extend_from_slice(&enc.nonce);
     buf.extend_from_slice(&enc.encrypted_data);
+    buf.extend_from_slice(&enc.outgoing_ct);
     blake2s(b"memoSP__", &buf)
+}
+
+fn derive_outgoing_recovery_key(outgoing_seed: &F, cm: &F) -> F {
+    blake2s_parts_personalized(b"ovkKSP__", &[outgoing_seed, cm])
+}
+
+fn derive_outgoing_recovery_nonce(key: &F, cm: &F) -> [u8; NOTE_AEAD_NONCE_BYTES] {
+    let digest = blake2s_parts_personalized(b"ovkNSP__", &[key, cm]);
+    let mut nonce = [0u8; NOTE_AEAD_NONCE_BYTES];
+    nonce.copy_from_slice(&digest[..NOTE_AEAD_NONCE_BYTES]);
+    nonce
 }
 
 pub fn derive_note_aead_nonce(aead_key: &F, plaintext: &[u8]) -> [u8; NOTE_AEAD_NONCE_BYTES] {
@@ -412,6 +431,7 @@ pub struct Account {
     pub nk: F,
     pub ask_base: F,
     pub incoming_seed: F,
+    pub outgoing_seed: F,
 }
 
 pub fn derive_account(master_sk: &F) -> Account {
@@ -420,6 +440,7 @@ pub fn derive_account(master_sk: &F) -> Account {
         nk: hash_two(&felt_tag(b"nk"), &spend_seed),
         ask_base: hash_two(&felt_tag(b"ask"), &spend_seed),
         incoming_seed: hash_two(&felt_tag(b"incoming"), master_sk),
+        outgoing_seed: hash_two(&felt_tag(b"outgoing"), master_sk),
     }
 }
 
@@ -879,6 +900,135 @@ pub fn derive_kem_detect_keys_from_root(detect_root: &F, j: u32) -> (Ek, Dk) {
     kem_keygen_from_seed(&out)
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum OutgoingNoteRole {
+    ShieldOutput = 1,
+    ProducerFee = 2,
+    TransferRecipient = 3,
+    TransferChange = 4,
+    UnshieldChange = 5,
+}
+
+impl OutgoingNoteRole {
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::ShieldOutput),
+            2 => Some(Self::ProducerFee),
+            3 => Some(Self::TransferRecipient),
+            4 => Some(Self::TransferChange),
+            5 => Some(Self::UnshieldChange),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ShieldOutput => "shield_output",
+            Self::ProducerFee => "producer_fee",
+            Self::TransferRecipient => "transfer_recipient",
+            Self::TransferChange => "transfer_change",
+            Self::UnshieldChange => "unshield_change",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutgoingRecoveryPlaintext {
+    pub role: OutgoingNoteRole,
+    pub value: u64,
+    pub rseed: F,
+    pub d_j: F,
+    pub auth_root: F,
+    pub auth_pub_seed: F,
+    pub nk_tag: F,
+}
+
+impl OutgoingRecoveryPlaintext {
+    pub fn commitment(&self) -> F {
+        let rcm = derive_rcm(&self.rseed);
+        let owner = owner_tag(&self.auth_root, &self.auth_pub_seed, &self.nk_tag);
+        commit(&self.d_j, self.value, &rcm, &owner)
+    }
+
+    pub fn encode(&self) -> [u8; OUTGOING_RECOVERY_PLAINTEXT_BYTES] {
+        let mut out = [0u8; OUTGOING_RECOVERY_PLAINTEXT_BYTES];
+        out[0] = self.role.as_u8();
+        out[1..9].copy_from_slice(&self.value.to_le_bytes());
+        out[9..41].copy_from_slice(&self.rseed);
+        out[41..73].copy_from_slice(&self.d_j);
+        out[73..105].copy_from_slice(&self.auth_root);
+        out[105..137].copy_from_slice(&self.auth_pub_seed);
+        out[137..169].copy_from_slice(&self.nk_tag);
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != OUTGOING_RECOVERY_PLAINTEXT_BYTES {
+            return None;
+        }
+        let role = OutgoingNoteRole::from_u8(bytes[0])?;
+        let value = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
+        let mut rseed = ZERO;
+        rseed.copy_from_slice(&bytes[9..41]);
+        let mut d_j = ZERO;
+        d_j.copy_from_slice(&bytes[41..73]);
+        let mut auth_root = ZERO;
+        auth_root.copy_from_slice(&bytes[73..105]);
+        let mut auth_pub_seed = ZERO;
+        auth_pub_seed.copy_from_slice(&bytes[105..137]);
+        let mut nk_tag = ZERO;
+        nk_tag.copy_from_slice(&bytes[137..169]);
+        Some(Self {
+            role,
+            value,
+            rseed,
+            d_j,
+            auth_root,
+            auth_pub_seed,
+            nk_tag,
+        })
+    }
+}
+
+pub fn empty_outgoing_recovery_ct() -> Vec<u8> {
+    vec![0u8; OUTGOING_RECOVERY_CT_BYTES]
+}
+
+pub fn encrypt_outgoing_recovery(
+    outgoing_seed: &F,
+    cm: &F,
+    plaintext: &OutgoingRecoveryPlaintext,
+) -> Vec<u8> {
+    let key = derive_outgoing_recovery_key(outgoing_seed, cm);
+    let nonce = derive_outgoing_recovery_nonce(&key, cm);
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+    cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext.encode().as_slice())
+        .unwrap()
+}
+
+pub fn decrypt_outgoing_recovery(
+    outgoing_seed: &F,
+    cm: &F,
+    outgoing_ct: &[u8],
+) -> Option<OutgoingRecoveryPlaintext> {
+    if outgoing_ct.len() != OUTGOING_RECOVERY_CT_BYTES {
+        return None;
+    }
+    let key = derive_outgoing_recovery_key(outgoing_seed, cm);
+    let nonce = derive_outgoing_recovery_nonce(&key, cm);
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&nonce), outgoing_ct)
+        .ok()?;
+    OutgoingRecoveryPlaintext::decode(&plaintext)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EncryptedNote {
     #[serde(with = "hex_bytes")]
@@ -890,6 +1040,8 @@ pub struct EncryptedNote {
     pub nonce: Vec<u8>,
     #[serde(with = "hex_bytes")]
     pub encrypted_data: Vec<u8>,
+    #[serde(with = "hex_bytes")]
+    pub outgoing_ct: Vec<u8>,
 }
 
 impl EncryptedNote {
@@ -920,6 +1072,13 @@ impl EncryptedNote {
                 "bad encrypted_data length: got {} bytes, expected {}",
                 self.encrypted_data.len(),
                 ENCRYPTED_NOTE_BYTES
+            ));
+        }
+        if self.outgoing_ct.len() != OUTGOING_RECOVERY_CT_BYTES {
+            return Err(format!(
+                "bad outgoing_ct length: got {} bytes, expected {}",
+                self.outgoing_ct.len(),
+                OUTGOING_RECOVERY_CT_BYTES
             ));
         }
         if (self.tag as usize) >= (1 << DETECT_K) {
@@ -984,6 +1143,7 @@ pub fn encrypt_note(
             ct_v: ct_v.to_vec(),
             nonce: nonce.to_vec(),
             encrypted_data,
+            outgoing_ct: empty_outgoing_recovery_ct(),
         }
     }
 }
@@ -1032,6 +1192,7 @@ pub fn encrypt_note_deterministic(
         ct_v: ct_v.to_vec(),
         nonce: nonce.to_vec(),
         encrypted_data,
+        outgoing_ct: empty_outgoing_recovery_ct(),
     }
 }
 
@@ -2279,6 +2440,44 @@ mod tests {
         let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &addr.nk_tag);
         let cm = commit(&addr.d_j, v, &rcm, &otag);
         (enc, cm)
+    }
+
+    #[test]
+    fn test_outgoing_recovery_roundtrip_and_key_isolation() {
+        let (account, addr, _, _, _) = sample_address_bundle(0x01, 0);
+        let rseed = u(777);
+        let (_enc, cm) = deterministic_note(&addr, 123, rseed, Some(b"outgoing"));
+        let plaintext = OutgoingRecoveryPlaintext {
+            role: OutgoingNoteRole::TransferRecipient,
+            value: 123,
+            rseed,
+            d_j: addr.d_j,
+            auth_root: addr.auth_root,
+            auth_pub_seed: addr.auth_pub_seed,
+            nk_tag: addr.nk_tag,
+        };
+
+        let ct = encrypt_outgoing_recovery(&account.outgoing_seed, &cm, &plaintext);
+        assert_eq!(ct.len(), OUTGOING_RECOVERY_CT_BYTES);
+        assert_eq!(
+            decrypt_outgoing_recovery(&account.outgoing_seed, &cm, &ct),
+            Some(plaintext)
+        );
+
+        let other = derive_account(&u(999));
+        assert_eq!(
+            decrypt_outgoing_recovery(&other.outgoing_seed, &cm, &ct),
+            None,
+            "another wallet's outgoing key must not recover the note"
+        );
+
+        let mut tampered_cm = cm;
+        tampered_cm[0] ^= 0x01;
+        assert_eq!(
+            decrypt_outgoing_recovery(&account.outgoing_seed, &tampered_cm, &ct),
+            None,
+            "outgoing recovery is bound to the note commitment"
+        );
     }
 
     struct LimitedAppendLedgerState {

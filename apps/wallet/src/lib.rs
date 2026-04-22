@@ -546,6 +546,11 @@ enum WatchKeyMaterial {
         incoming_seed: F,
         addresses: Vec<WatchAddressRecord>,
     },
+    Outgoing {
+        version: u16,
+        #[serde(with = "hex_f")]
+        outgoing_seed: F,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -568,6 +573,25 @@ struct ViewedNoteRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct OutgoingNoteRecord {
+    index: usize,
+    role: String,
+    value: u64,
+    #[serde(with = "hex_f")]
+    cm: F,
+    #[serde(with = "hex_f")]
+    rseed: F,
+    #[serde(with = "hex_f")]
+    d_j: F,
+    #[serde(with = "hex_f")]
+    auth_root: F,
+    #[serde(with = "hex_f")]
+    auth_pub_seed: F,
+    #[serde(with = "hex_f")]
+    nk_tag: F,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 enum WatchWalletFile {
     Detect {
@@ -586,6 +610,13 @@ enum WatchWalletFile {
         scanned: usize,
         notes: Vec<ViewedNoteRecord>,
     },
+    Outgoing {
+        version: u16,
+        #[serde(with = "hex_f")]
+        outgoing_seed: F,
+        scanned: usize,
+        notes: Vec<OutgoingNoteRecord>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -594,11 +625,14 @@ pub struct WatchWalletStatus {
     scanned: usize,
     tracked: usize,
     incoming_total: u128,
+    outgoing_total: u128,
     spend_status: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     matches: Vec<DetectedNoteRecord>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     notes: Vec<ViewedNoteRecord>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    outgoing_notes: Vec<OutgoingNoteRecord>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -877,6 +911,13 @@ impl WatchKeyMaterial {
             addresses,
         }
     }
+
+    fn from_outgoing_wallet(wallet: &WalletFile) -> Self {
+        Self::Outgoing {
+            version: WATCH_WALLET_VERSION,
+            outgoing_seed: wallet.account().outgoing_seed,
+        }
+    }
 }
 
 impl WatchWalletFile {
@@ -904,6 +945,15 @@ impl WatchWalletFile {
                 scanned: 0,
                 notes: Vec::new(),
             },
+            WatchKeyMaterial::Outgoing {
+                version,
+                outgoing_seed,
+            } => Self::Outgoing {
+                version,
+                outgoing_seed,
+                scanned: 0,
+                notes: Vec::new(),
+            },
         }
     }
 
@@ -916,18 +966,33 @@ impl WatchWalletFile {
                 scanned: *scanned,
                 tracked: matches.len(),
                 incoming_total: 0,
+                outgoing_total: 0,
                 spend_status: "candidate_matches_only",
                 matches: matches.clone(),
                 notes: Vec::new(),
+                outgoing_notes: Vec::new(),
             },
             WatchWalletFile::View { scanned, notes, .. } => WatchWalletStatus {
                 mode: "view",
                 scanned: *scanned,
                 tracked: notes.len(),
                 incoming_total: notes.iter().map(|note| note.value as u128).sum(),
+                outgoing_total: 0,
                 spend_status: "unavailable_without_spend_key",
                 matches: Vec::new(),
                 notes: notes.clone(),
+                outgoing_notes: Vec::new(),
+            },
+            WatchWalletFile::Outgoing { scanned, notes, .. } => WatchWalletStatus {
+                mode: "outgoing",
+                scanned: *scanned,
+                tracked: notes.len(),
+                incoming_total: 0,
+                outgoing_total: notes.iter().map(|note| note.value as u128).sum(),
+                spend_status: "unavailable_without_spend_key",
+                matches: Vec::new(),
+                notes: Vec::new(),
+                outgoing_notes: notes.clone(),
             },
         }
     }
@@ -980,6 +1045,24 @@ fn view_record_for_note(
     None
 }
 
+fn outgoing_record_for_note(outgoing_seed: &F, nm: &NoteMemo) -> Option<OutgoingNoteRecord> {
+    let recovery = decrypt_outgoing_recovery(outgoing_seed, &nm.cm, &nm.enc.outgoing_ct)?;
+    if recovery.commitment() != nm.cm {
+        return None;
+    }
+    Some(OutgoingNoteRecord {
+        index: nm.index,
+        role: recovery.role.as_str().into(),
+        value: recovery.value,
+        cm: nm.cm,
+        rseed: recovery.rseed,
+        d_j: recovery.d_j,
+        auth_root: recovery.auth_root,
+        auth_pub_seed: recovery.auth_pub_seed,
+        nk_tag: recovery.nk_tag,
+    })
+}
+
 fn trim_decrypted_memo(mut memo: Vec<u8>) -> Vec<u8> {
     while memo.last().copied() == Some(0) {
         memo.pop();
@@ -1024,6 +1107,25 @@ fn apply_watch_feed(watch: &mut WatchWalletFile, feed: &NotesFeedResp) -> WatchS
                 notes.iter().map(|n| (n.index, n.cm)).collect();
             for nm in &feed.notes {
                 let Some(record) = view_record_for_note(incoming_seed, addresses, nm) else {
+                    continue;
+                };
+                if known.insert((record.index, record.cm)) {
+                    notes.push(record);
+                    summary.found += 1;
+                }
+            }
+            *scanned = feed.next_cursor;
+        }
+        WatchWalletFile::Outgoing {
+            outgoing_seed,
+            scanned,
+            notes,
+            ..
+        } => {
+            let mut known: std::collections::HashSet<(usize, F)> =
+                notes.iter().map(|n| (n.index, n.cm)).collect();
+            for nm in &feed.notes {
+                let Some(record) = outgoing_record_for_note(outgoing_seed, nm) else {
                     continue;
                 };
                 if known.insert((record.index, record.cm)) {
@@ -2307,10 +2409,28 @@ struct PreparedOutputNote {
     rseed: F,
 }
 
-fn build_output_note(
+fn outgoing_recovery_plaintext(
+    address: &PaymentAddress,
+    role: OutgoingNoteRole,
+    value: u64,
+    rseed: F,
+) -> OutgoingRecoveryPlaintext {
+    OutgoingRecoveryPlaintext {
+        role,
+        value,
+        rseed,
+        d_j: address.d_j,
+        auth_root: address.auth_root,
+        auth_pub_seed: address.auth_pub_seed,
+        nk_tag: address.nk_tag,
+    }
+}
+
+fn build_output_note_inner(
     address: &PaymentAddress,
     value: u64,
     memo: Option<&[u8]>,
+    outgoing: Option<(&F, OutgoingNoteRole)>,
 ) -> Result<PreparedOutputNote, String> {
     let rseed = random_felt();
     let rcm = derive_rcm(&rseed);
@@ -2324,9 +2444,23 @@ fn build_output_note(
     .map_err(|_| "invalid ek_d")?;
     let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
     let cm = commit(&address.d_j, value, &rcm, &otag);
-    let enc = encrypt_note(value, &rseed, memo, &ek_v, &ek_d);
+    let mut enc = encrypt_note(value, &rseed, memo, &ek_v, &ek_d);
+    if let Some((outgoing_seed, role)) = outgoing {
+        let recovery = outgoing_recovery_plaintext(address, role, value, rseed);
+        enc.outgoing_ct = encrypt_outgoing_recovery(outgoing_seed, &cm, &recovery);
+    }
     let mh = memo_ct_hash(&enc);
     Ok(PreparedOutputNote { cm, enc, mh, rseed })
+}
+
+fn build_output_note_with_outgoing(
+    address: &PaymentAddress,
+    value: u64,
+    memo: Option<&[u8]>,
+    outgoing_seed: &F,
+    role: OutgoingNoteRole,
+) -> Result<PreparedOutputNote, String> {
+    build_output_note_inner(address, value, memo, Some((outgoing_seed, role)))
 }
 
 fn extract_operation_hash(output: &str) -> Option<String> {
@@ -2459,6 +2593,11 @@ enum Cmd {
         #[arg(long)]
         out: Option<String>,
     },
+    /// Export outgoing viewing material for sent-output recovery.
+    ExportOutgoing {
+        #[arg(long)]
+        out: Option<String>,
+    },
     /// Scan ledger for new notes
     Scan {
         #[arg(short, long, default_value = "http://localhost:8080")]
@@ -2565,7 +2704,11 @@ fn run(cli: Cli) -> Result<(), String> {
         | Cmd::Shield { .. }
         | Cmd::Transfer { .. }
         | Cmd::Unshield { .. } => Some(acquire_wallet_lock(&cli.wallet)?),
-        Cmd::ExportDetect { .. } | Cmd::ExportView { .. } | Cmd::Balance | Cmd::Fund { .. } => None,
+        Cmd::ExportDetect { .. }
+        | Cmd::ExportView { .. }
+        | Cmd::ExportOutgoing { .. }
+        | Cmd::Balance
+        | Cmd::Fund { .. } => None,
     };
     let pc = ProveConfig {
         skip_proof: cli.trust_me_bro,
@@ -2577,6 +2720,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Cmd::Address => cmd_address(&cli.wallet),
         Cmd::ExportDetect { out } => cmd_export_detect(&cli.wallet, out.as_deref()),
         Cmd::ExportView { out } => cmd_export_view(&cli.wallet, out.as_deref()),
+        Cmd::ExportOutgoing { out } => cmd_export_outgoing(&cli.wallet, out.as_deref()),
         Cmd::Scan { ledger } => cmd_scan(&cli.wallet, &ledger),
         Cmd::Balance => cmd_balance(&cli.wallet),
         Cmd::Shield {
@@ -2757,6 +2901,11 @@ enum UserCmd {
     },
     /// Export viewing material for delegated scanning and note validation.
     ExportView {
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Export outgoing viewing material for sent-output recovery.
+    ExportOutgoing {
         #[arg(long)]
         out: Option<String>,
     },
@@ -2944,7 +3093,8 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         | UserCmd::Status { .. }
         | UserCmd::Withdraw { .. }
         | UserCmd::ExportDetect { .. }
-        | UserCmd::ExportView { .. } => None,
+        | UserCmd::ExportView { .. }
+        | UserCmd::ExportOutgoing { .. } => None,
         UserCmd::Watch { cmd } => match cmd {
             UserWatchCmd::Init { .. } | UserWatchCmd::Sync { .. } => {
                 Some(acquire_wallet_lock(&cli.wallet)?)
@@ -3035,6 +3185,7 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         }
         UserCmd::ExportDetect { out } => cmd_export_detect(&cli.wallet, out.as_deref()),
         UserCmd::ExportView { out } => cmd_export_view(&cli.wallet, out.as_deref()),
+        UserCmd::ExportOutgoing { out } => cmd_export_outgoing(&cli.wallet, out.as_deref()),
         UserCmd::Watch { cmd } => run_watch_wallet(&cli.wallet, cmd),
     }
 }
@@ -3276,6 +3427,14 @@ fn cmd_export_view(path: &str, out: Option<&str>) -> Result<(), String> {
     write_json_stdout_or_file(&exported, out)
 }
 
+fn cmd_export_outgoing(path: &str, out: Option<&str>) -> Result<(), String> {
+    let w = load_wallet(path)?;
+    // Export outgoing_seed only: holder can recover sender-encrypted output metadata,
+    // but cannot detect incoming notes or spend.
+    let exported = WatchKeyMaterial::from_outgoing_wallet(&w);
+    write_json_stdout_or_file(&exported, out)
+}
+
 fn load_watch_material(path: &str) -> Result<WatchKeyMaterial, String> {
     load_private_json(path, "watch material")
 }
@@ -3301,7 +3460,9 @@ fn sync_watch_wallet_once(
 ) -> Result<WatchSyncSummary, String> {
     let mut watch = load_watch_wallet(path)?;
     let cursor = match &watch {
-        WatchWalletFile::Detect { scanned, .. } | WatchWalletFile::View { scanned, .. } => *scanned,
+        WatchWalletFile::Detect { scanned, .. }
+        | WatchWalletFile::View { scanned, .. }
+        | WatchWalletFile::Outgoing { scanned, .. } => *scanned,
     };
     let rollup = RollupRpc::new(profile);
     let feed = rollup.load_notes_since(cursor).map_err(|e| {
@@ -3330,6 +3491,14 @@ fn cmd_watch_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), Stri
             status.scanned,
             status.tracked,
             status.incoming_total,
+            status.spend_status
+        ),
+        "outgoing" => println!(
+            "Watch sync: {} new outgoing notes, cursor={}, tracked={}, outgoing_total={}, spend_status={}",
+            summary.found,
+            status.scanned,
+            status.tracked,
+            status.outgoing_total,
             status.spend_status
         ),
         _ => println!(
@@ -3406,7 +3575,9 @@ pub fn load_detection_service_status(path: &str) -> Result<WatchWalletStatus, St
 
 pub fn validate_detection_service_wallet(path: &str) -> Result<(), String> {
     match load_watch_wallet(path)? {
-        WatchWalletFile::Detect { .. } | WatchWalletFile::View { .. } => {}
+        WatchWalletFile::Detect { .. }
+        | WatchWalletFile::View { .. }
+        | WatchWalletFile::Outgoing { .. } => {}
     }
     Ok(())
 }
@@ -3900,6 +4071,134 @@ mod tests {
         assert!(view_record_for_note(&incoming_seed, &addresses, &nm).is_none());
     }
 
+    #[test]
+    fn test_outgoing_export_and_watch_recover_sent_output() {
+        let w = test_wallet(1);
+        let material = WatchKeyMaterial::from_outgoing_wallet(&w);
+        let WatchKeyMaterial::Outgoing { outgoing_seed, .. } = material else {
+            panic!("expected outgoing material");
+        };
+        assert_eq!(outgoing_seed, w.account().outgoing_seed);
+        assert_ne!(outgoing_seed, w.account().incoming_seed);
+
+        let (ek_v, _, ek_d, _) = w.kem_keys(0);
+        let address = w.addresses[0].payment_address(&ek_v, &ek_d);
+        let note = build_output_note_with_outgoing(
+            &address,
+            91,
+            Some(b"not in outgoing view"),
+            &outgoing_seed,
+            OutgoingNoteRole::TransferRecipient,
+        )
+        .expect("output note should build");
+        let nm = NoteMemo {
+            index: 7,
+            cm: note.cm,
+            enc: note.enc,
+        };
+
+        let recovered = outgoing_record_for_note(&outgoing_seed, &nm)
+            .expect("outgoing material should recover sender note");
+        assert_eq!(recovered.index, 7);
+        assert_eq!(recovered.role, "transfer_recipient");
+        assert_eq!(recovered.value, 91);
+        assert_eq!(recovered.cm, nm.cm);
+        assert_eq!(recovered.rseed, note.rseed);
+        assert_eq!(recovered.d_j, address.d_j);
+        assert_eq!(recovered.auth_root, address.auth_root);
+        assert_eq!(recovered.auth_pub_seed, address.auth_pub_seed);
+        assert_eq!(recovered.nk_tag, address.nk_tag);
+
+        let other = test_wallet(1);
+        assert!(
+            outgoing_record_for_note(&other.account().incoming_seed, &nm).is_none(),
+            "wrong key material must not recover outgoing note"
+        );
+    }
+
+    #[test]
+    fn test_outgoing_material_rejects_recovery_plaintext_with_wrong_commitment() {
+        let w = test_wallet(1);
+        let outgoing_seed = w.account().outgoing_seed;
+        let (ek_v, _, ek_d, _) = w.kem_keys(0);
+        let address = w.addresses[0].payment_address(&ek_v, &ek_d);
+        let value = 91;
+        let note = build_output_note_with_outgoing(
+            &address,
+            value,
+            Some(b"not in outgoing view"),
+            &outgoing_seed,
+            OutgoingNoteRole::TransferRecipient,
+        )
+        .expect("output note should build");
+        let mut nm = NoteMemo {
+            index: 7,
+            cm: note.cm,
+            enc: note.enc,
+        };
+
+        let forged_recovery = outgoing_recovery_plaintext(
+            &address,
+            OutgoingNoteRole::TransferRecipient,
+            value + 1,
+            note.rseed,
+        );
+        nm.enc.outgoing_ct = encrypt_outgoing_recovery(&outgoing_seed, &nm.cm, &forged_recovery);
+        assert!(
+            decrypt_outgoing_recovery(&outgoing_seed, &nm.cm, &nm.enc.outgoing_ct).is_some(),
+            "malformed sender recovery payload is still authenticated under the outgoing key"
+        );
+
+        assert!(
+            outgoing_record_for_note(&outgoing_seed, &nm).is_none(),
+            "outgoing watch must not trust metadata that does not recompute to the note commitment"
+        );
+
+        let feed = NotesFeedResp {
+            notes: vec![nm],
+            next_cursor: 8,
+        };
+        let mut watch = WatchWalletFile::from_material(WatchKeyMaterial::from_outgoing_wallet(&w));
+        let summary = apply_watch_feed(&mut watch, &feed);
+        assert_eq!(summary.found, 0);
+        assert_eq!(watch.status().outgoing_total, 0);
+    }
+
+    #[test]
+    fn test_apply_watch_feed_outgoing_tracks_sender_outputs() {
+        let w = test_wallet(1);
+        let outgoing_seed = w.account().outgoing_seed;
+        let (ek_v, _, ek_d, _) = w.kem_keys(0);
+        let address = w.addresses[0].payment_address(&ek_v, &ek_d);
+        let note = build_output_note_with_outgoing(
+            &address,
+            12,
+            None,
+            &outgoing_seed,
+            OutgoingNoteRole::ProducerFee,
+        )
+        .expect("output note should build");
+        let feed = NotesFeedResp {
+            notes: vec![NoteMemo {
+                index: 3,
+                cm: note.cm,
+                enc: note.enc,
+            }],
+            next_cursor: 4,
+        };
+        let mut watch = WatchWalletFile::from_material(WatchKeyMaterial::from_outgoing_wallet(&w));
+
+        let summary = apply_watch_feed(&mut watch, &feed);
+
+        assert_eq!(summary.found, 1);
+        assert_eq!(summary.next_cursor, 4);
+        let status = watch.status();
+        assert_eq!(status.mode, "outgoing");
+        assert_eq!(status.tracked, 1);
+        assert_eq!(status.outgoing_total, 12);
+        assert_eq!(status.outgoing_notes[0].role, "producer_fee");
+    }
+
     proptest! {
         #[test]
         fn prop_view_material_recovers_wallet_notes(
@@ -4078,7 +4377,9 @@ mod tests {
                 assert_eq!(scanned, 0);
                 assert!(notes.is_empty());
             }
-            WatchWalletFile::Detect { .. } => panic!("expected view watch wallet"),
+            WatchWalletFile::Detect { .. } | WatchWalletFile::Outgoing { .. } => {
+                panic!("expected view watch wallet")
+            }
         }
     }
 
@@ -4112,7 +4413,9 @@ mod tests {
                 assert_eq!(scanned, 0);
                 assert!(matches.is_empty());
             }
-            WatchWalletFile::View { .. } => panic!("expected detect watch wallet"),
+            WatchWalletFile::View { .. } | WatchWalletFile::Outgoing { .. } => {
+                panic!("expected detect watch wallet")
+            }
         }
     }
 
@@ -4141,7 +4444,9 @@ mod tests {
         cmd_watch_init(watch_path_str, detect_path_str, true).expect("force overwrite watch");
         match load_watch_wallet(watch_path_str).expect("load overwritten watch") {
             WatchWalletFile::Detect { addr_count, .. } => assert_eq!(addr_count, 2),
-            WatchWalletFile::View { .. } => panic!("expected detect watch wallet after overwrite"),
+            WatchWalletFile::View { .. } | WatchWalletFile::Outgoing { .. } => {
+                panic!("expected detect watch wallet after overwrite")
+            }
         }
     }
 
@@ -5706,6 +6011,7 @@ fn cmd_shield(
     let fee = resolve_requested_tx_fee(fee, cfg.required_tx_fee)?;
     ensure_positive_dal_fee(dal_fee)?;
     let mut w = load_wallet(path)?;
+    let outgoing_seed = w.account().outgoing_seed;
     let producer_address = load_address(dal_fee_address_path)?;
 
     let (address, generated_self_address) = if let Some(addr_path) = to {
@@ -5715,8 +6021,20 @@ fn cmd_shield(
         (addr, true)
     };
 
-    let client_note = build_output_note(&address, amount, memo.as_deref().map(str::as_bytes))?;
-    let producer_note = build_output_note(&producer_address, dal_fee, Some(b"dal"))?;
+    let client_note = build_output_note_with_outgoing(
+        &address,
+        amount,
+        memo.as_deref().map(str::as_bytes),
+        &outgoing_seed,
+        OutgoingNoteRole::ShieldOutput,
+    )?;
+    let producer_note = build_output_note_with_outgoing(
+        &producer_address,
+        dal_fee,
+        Some(b"dal"),
+        &outgoing_seed,
+        OutgoingNoteRole::ProducerFee,
+    )?;
     let proof = if !pc.skip_proof {
         let deposit_secret = deposit_secret_from_label(sender);
         let deposit_id = deposit_id_from_secret(&deposit_secret);
@@ -5794,6 +6112,7 @@ fn cmd_transfer(
     let fee = resolve_requested_tx_fee(fee, cfg.required_tx_fee)?;
     ensure_positive_dal_fee(dal_fee)?;
     let mut w = load_wallet(path)?;
+    let outgoing_seed = w.account().outgoing_seed;
     let recipient = load_address(to_path)?;
     let producer_address = load_address(dal_fee_address_path)?;
 
@@ -5841,14 +6160,32 @@ fn cmd_transfer(
         })
         .collect();
 
-    let note_1 = build_output_note(&recipient, amount, memo.as_deref().map(str::as_bytes))?;
+    let note_1 = build_output_note_with_outgoing(
+        &recipient,
+        amount,
+        memo.as_deref().map(str::as_bytes),
+        &outgoing_seed,
+        OutgoingNoteRole::TransferRecipient,
+    )?;
 
     // Build output 2: change to self (per-address KEM keys)
     let (change_state, _change_addr) = w.next_address()?;
     let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
     let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
-    let note_2 = build_output_note(&change_address, change, None)?;
-    let note_3 = build_output_note(&producer_address, dal_fee, Some(b"dal"))?;
+    let note_2 = build_output_note_with_outgoing(
+        &change_address,
+        change,
+        None,
+        &outgoing_seed,
+        OutgoingNoteRole::TransferChange,
+    )?;
+    let note_3 = build_output_note_with_outgoing(
+        &producer_address,
+        dal_fee,
+        Some(b"dal"),
+        &outgoing_seed,
+        OutgoingNoteRole::ProducerFee,
+    )?;
 
     let proof = if !pc.skip_proof {
         let auth_domain = cfg.auth_domain;
@@ -6038,6 +6375,7 @@ fn cmd_unshield(
     let fee = resolve_requested_tx_fee(fee, cfg.required_tx_fee)?;
     ensure_positive_dal_fee(dal_fee)?;
     let mut w = load_wallet(path)?;
+    let outgoing_seed = w.account().outgoing_seed;
     let producer_address = load_address(dal_fee_address_path)?;
 
     let tree_info: TreeInfoResp = get_json(&format!("{}/tree", ledger))?;
@@ -6092,7 +6430,13 @@ fn cmd_unshield(
         let (change_state, _change_addr) = w.next_address()?;
         let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
         let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
-        let note = build_output_note(&change_address, change, None)?;
+        let note = build_output_note_with_outgoing(
+            &change_address,
+            change,
+            None,
+            &outgoing_seed,
+            OutgoingNoteRole::UnshieldChange,
+        )?;
         let cd = ChangeData {
             d_j: change_state.d_j,
             rseed: note.rseed,
@@ -6105,7 +6449,13 @@ fn cmd_unshield(
     } else {
         (ZERO, None, None)
     };
-    let producer_note = build_output_note(&producer_address, dal_fee, Some(b"dal"))?;
+    let producer_note = build_output_note_with_outgoing(
+        &producer_address,
+        dal_fee,
+        Some(b"dal"),
+        &outgoing_seed,
+        OutgoingNoteRole::ProducerFee,
+    )?;
 
     let proof = if !pc.skip_proof {
         let auth_domain = cfg.auth_domain;
@@ -6294,6 +6644,7 @@ fn cmd_shield_rollup(
         .ok_or_else(|| "shield total spend overflow".to_string())?;
 
     let mut w = load_wallet(path)?;
+    let outgoing_seed = w.account().outgoing_seed;
     let requested_deposit_id = deposit_id_arg.map(parse_deposit_id_hex).transpose()?;
     let (selected_deposit, public_balance) =
         select_pending_deposit(&w, &balances, requested_deposit_id, total_debit)?;
@@ -6306,8 +6657,20 @@ fn cmd_shield_rollup(
         (addr, true)
     };
 
-    let client_note = build_output_note(&address, amount, memo.as_deref().map(str::as_bytes))?;
-    let producer_note = build_output_note(producer_address, profile.dal_fee, Some(b"dal"))?;
+    let client_note = build_output_note_with_outgoing(
+        &address,
+        amount,
+        memo.as_deref().map(str::as_bytes),
+        &outgoing_seed,
+        OutgoingNoteRole::ShieldOutput,
+    )?;
+    let producer_note = build_output_note_with_outgoing(
+        producer_address,
+        profile.dal_fee,
+        Some(b"dal"),
+        &outgoing_seed,
+        OutgoingNoteRole::ProducerFee,
+    )?;
     let args: Vec<String> = vec![
         felt_u64_to_hex(19),
         felt_u64_to_hex(amount),
@@ -6380,6 +6743,7 @@ fn cmd_transfer_rollup(
     let root = snapshot.current_root();
 
     let mut w = load_wallet(path)?;
+    let outgoing_seed = w.account().outgoing_seed;
     let recipient = load_address(to_path)?;
     let producer_address = &profile.dal_fee_address;
     let total_spend = amount
@@ -6395,13 +6759,31 @@ fn cmd_transfer_rollup(
         .map(|&i| note_nullifier(&w.notes[i]))
         .collect();
 
-    let note_1 = build_output_note(&recipient, amount, memo.as_deref().map(str::as_bytes))?;
+    let note_1 = build_output_note_with_outgoing(
+        &recipient,
+        amount,
+        memo.as_deref().map(str::as_bytes),
+        &outgoing_seed,
+        OutgoingNoteRole::TransferRecipient,
+    )?;
 
     let (change_state, _change_addr) = w.next_address()?;
     let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
     let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
-    let note_2 = build_output_note(&change_address, change, None)?;
-    let note_3 = build_output_note(producer_address, profile.dal_fee, Some(b"dal"))?;
+    let note_2 = build_output_note_with_outgoing(
+        &change_address,
+        change,
+        None,
+        &outgoing_seed,
+        OutgoingNoteRole::TransferChange,
+    )?;
+    let note_3 = build_output_note_with_outgoing(
+        producer_address,
+        profile.dal_fee,
+        Some(b"dal"),
+        &outgoing_seed,
+        OutgoingNoteRole::ProducerFee,
+    )?;
 
     let proof = {
         let auth_domain = snapshot.auth_domain;
@@ -6568,6 +6950,7 @@ fn cmd_unshield_rollup(
     let root = snapshot.current_root();
 
     let mut w = load_wallet(path)?;
+    let outgoing_seed = w.account().outgoing_seed;
     let producer_address = &profile.dal_fee_address;
     let total_spend = amount
         .checked_add(fee)
@@ -6586,7 +6969,13 @@ fn cmd_unshield_rollup(
         let (change_state, _change_addr) = w.next_address()?;
         let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
         let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
-        let note = build_output_note(&change_address, change, None)?;
+        let note = build_output_note_with_outgoing(
+            &change_address,
+            change,
+            None,
+            &outgoing_seed,
+            OutgoingNoteRole::UnshieldChange,
+        )?;
         let cd = ChangeData {
             d_j: change_state.d_j,
             rseed: note.rseed,
@@ -6599,7 +6988,13 @@ fn cmd_unshield_rollup(
     } else {
         (ZERO, None, None)
     };
-    let producer_note = build_output_note(producer_address, profile.dal_fee, Some(b"dal"))?;
+    let producer_note = build_output_note_with_outgoing(
+        producer_address,
+        profile.dal_fee,
+        Some(b"dal"),
+        &outgoing_seed,
+        OutgoingNoteRole::ProducerFee,
+    )?;
 
     let proof = {
         let auth_domain = snapshot.auth_domain;
@@ -6827,14 +7222,33 @@ fn prepare_transfer_skip_proof(
             nullifier(&n.nk_spend, &n.cm, n.index as u64)
         })
         .collect();
+    let outgoing_seed = w.account().outgoing_seed;
 
-    let note_1 = build_output_note(recipient, amount, memo.map(str::as_bytes))?;
+    let note_1 = build_output_note_with_outgoing(
+        recipient,
+        amount,
+        memo.map(str::as_bytes),
+        &outgoing_seed,
+        OutgoingNoteRole::TransferRecipient,
+    )?;
 
     let (change_state, _change_addr) = w.next_address()?;
     let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
     let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
-    let note_2 = build_output_note(&change_address, change, None)?;
-    let note_3 = build_output_note(producer_address, dal_fee, Some(b"dal"))?;
+    let note_2 = build_output_note_with_outgoing(
+        &change_address,
+        change,
+        None,
+        &outgoing_seed,
+        OutgoingNoteRole::TransferChange,
+    )?;
+    let note_3 = build_output_note_with_outgoing(
+        producer_address,
+        dal_fee,
+        Some(b"dal"),
+        &outgoing_seed,
+        OutgoingNoteRole::ProducerFee,
+    )?;
 
     Ok(PreparedTransferSubmit {
         selected,
@@ -6877,12 +7291,19 @@ fn prepare_unshield_skip_proof(
             nullifier(&n.nk_spend, &n.cm, n.index as u64)
         })
         .collect();
+    let outgoing_seed = w.account().outgoing_seed;
 
     let (cm_change, enc_change, _change_data) = if change > 0 {
         let (change_state, _change_addr) = w.next_address()?;
         let (ek_v_c, _, ek_d_c, _) = w.kem_keys(change_state.index);
         let change_address = change_state.payment_address(&ek_v_c, &ek_d_c);
-        let note = build_output_note(&change_address, change, None)?;
+        let note = build_output_note_with_outgoing(
+            &change_address,
+            change,
+            None,
+            &outgoing_seed,
+            OutgoingNoteRole::UnshieldChange,
+        )?;
         let cd = ChangeData {
             d_j: change_state.d_j,
             rseed: note.rseed,
@@ -6895,7 +7316,13 @@ fn prepare_unshield_skip_proof(
     } else {
         (ZERO, None, None)
     };
-    let producer_note = build_output_note(producer_address, dal_fee, Some(b"dal"))?;
+    let producer_note = build_output_note_with_outgoing(
+        producer_address,
+        dal_fee,
+        Some(b"dal"),
+        &outgoing_seed,
+        OutgoingNoteRole::ProducerFee,
+    )?;
 
     Ok(PreparedUnshieldSubmit {
         selected,

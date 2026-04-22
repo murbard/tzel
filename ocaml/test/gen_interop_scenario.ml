@@ -23,7 +23,8 @@ let deterministic_encrypted_note (addr : Tzel.Keys.address) ~v ~rseed ~memo ~det
   let tag = Tzel.Detection.compute_tag ss_d in
   let (ss_v, ct_v) = Tzel.Mlkem.encaps_derand addr.ek_v (fixed_bytes view_seed) in
   let (nonce, encrypted_data) = Tzel.Detection.encrypt_memo ~ss_v ~v ~rseed ~memo in
-  let enc : Tzel.Encoding.encrypted_note = { ct_d; tag; ct_v; nonce; encrypted_data } in
+  let outgoing_ct = Bytes.make Tzel.Encoding.outgoing_recovery_ct_size '\x00' in
+  let enc : Tzel.Encoding.encrypted_note = { ct_d; tag; ct_v; nonce; encrypted_data; outgoing_ct } in
   let memo_ct_hash = Tzel.Encoding.compute_memo_ct_hash enc in
   (enc, memo_ct_hash)
 

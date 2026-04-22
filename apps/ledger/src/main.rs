@@ -318,6 +318,7 @@ mod tests {
             ct_v: vec![0x5A; ML_KEM768_CIPHERTEXT_BYTES],
             nonce: vec![0x33; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: vec![0x11; ENCRYPTED_NOTE_BYTES],
+            outgoing_ct: empty_outgoing_recovery_ct(),
         }
     }
 

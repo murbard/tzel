@@ -7,7 +7,8 @@ use crate::{
     derive_nk_spend, derive_nk_tag, derive_note_aead_nonce, derive_rcm, hash, hash_merkle,
     hash_two, kem_keygen_from_seed, memo_ct_hash, nullifier, owner_tag, sighash_fold, wots_pk,
     wots_pk_to_leaf, wots_sign, Account, EncryptedNote, NoteMemo, PaymentAddress, DETECT_K,
-    ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES, ZERO,
+    ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES,
+    OUTGOING_RECOVERY_CT_BYTES, ZERO,
 };
 use blake2s_simd::Params;
 use chacha20poly1305::{aead::Aead, ChaCha20Poly1305, KeyInit, Nonce};
@@ -62,7 +63,7 @@ fn encrypt_with_shared_secret(
     rseed: &F,
     memo: &[u8],
 ) -> (Vec<u8>, Vec<u8>) {
-    let key = raw_blake2s(ss_v_raw, None);
+    let key = hash(ss_v_raw);
     let cipher = ChaCha20Poly1305::new_from_slice(&key).unwrap();
     let mut plaintext = Vec::with_capacity(8 + 32 + crate::MEMO_SIZE);
     plaintext.extend_from_slice(&v.to_le_bytes());
@@ -193,6 +194,7 @@ fn deterministic_wire_note() -> EncryptedNote {
         ct_v,
         nonce: vec![0xAA; NOTE_AEAD_NONCE_BYTES],
         encrypted_data,
+        outgoing_ct: vec![0xBB; OUTGOING_RECOVERY_CT_BYTES],
     }
 }
 
@@ -247,6 +249,7 @@ pub fn generate_protocol_v1_value() -> Value {
         "ask_base": hex_felt(&account.ask_base),
         "dsk": hex_felt(&dsk),
         "incoming_seed": hex_felt(&account.incoming_seed),
+        "outgoing_seed": hex_felt(&account.outgoing_seed),
         "view_root": hex_felt(&view_root),
         "detect_root": hex_felt(&detect_root),
     });
@@ -410,6 +413,7 @@ pub fn generate_protocol_v1_value() -> Value {
             ct_v: ct_v.clone(),
             nonce: vec![0xCC; NOTE_AEAD_NONCE_BYTES],
             encrypted_data: encrypted_data.clone(),
+            outgoing_ct: vec![0xDD; OUTGOING_RECOVERY_CT_BYTES],
         };
         json!({
             "ct_d": hex_bytes(ct_d),
@@ -417,6 +421,7 @@ pub fn generate_protocol_v1_value() -> Value {
             "ct_v": hex_bytes(ct_v),
             "nonce": hex_bytes(&enc.nonce),
             "encrypted_data": hex_bytes(encrypted_data),
+            "outgoing_ct": hex_bytes(&enc.outgoing_ct),
             "memo_ct_hash": hex_felt(&memo_ct_hash(&enc)),
         })
     };
@@ -437,6 +442,7 @@ pub fn generate_protocol_v1_value() -> Value {
             ct_v: ct_v.to_vec(),
             nonce: nonce.clone(),
             encrypted_data: encrypted_data.clone(),
+            outgoing_ct: vec![0xEE; OUTGOING_RECOVERY_CT_BYTES],
         };
         json!({
             "master_sk": hex_felt(&master_sk),
@@ -735,6 +741,29 @@ mod tests {
         assert_eq!(none[0], 0xF6);
         assert_eq!(&text[..2], b"hi");
         assert!(text[2..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn test_vector_memo_encryption_uses_protocol_hash_key() {
+        let ss_v = raw_blake2s(b"key-0", None);
+        let v = 1000;
+        let rseed = felt_of_u64(42);
+        let memo = memo_none();
+        let (nonce, _) = encrypt_with_shared_secret(&ss_v, v, &rseed, &memo);
+
+        let mut plaintext = Vec::with_capacity(8 + 32 + MEMO_SIZE);
+        plaintext.extend_from_slice(&v.to_le_bytes());
+        plaintext.extend_from_slice(&rseed);
+        plaintext.extend_from_slice(&memo);
+
+        let protocol_key = hash(&ss_v);
+        let raw_key = raw_blake2s(&ss_v, None);
+        assert_eq!(nonce, derive_note_aead_nonce(&protocol_key, &plaintext));
+        assert_ne!(
+            nonce,
+            derive_note_aead_nonce(&raw_key, &plaintext),
+            "vectors must follow the protocol note key, not a raw helper hash"
+        );
     }
 
     #[test]

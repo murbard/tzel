@@ -1276,6 +1276,7 @@ let test_encoding_encrypted_note () =
     ct_v = Bytes.make 1088 '\x02';
     nonce = Bytes.make 12 '\x04';
     encrypted_data = Bytes.make 1080 '\x03';
+    outgoing_ct = Bytes.make Tzel.Encoding.outgoing_recovery_ct_size '\x05';
   } in
   let wire = Tzel.Encoding.encode_encrypted_note enc in
   Alcotest.(check int) "wire size" Tzel.Encoding.encrypted_note_size (Bytes.length wire);
@@ -1284,7 +1285,8 @@ let test_encoding_encrypted_note () =
   Alcotest.(check bool) "ct_d" true (Bytes.equal enc.ct_d dec.ct_d);
   Alcotest.(check bool) "ct_v" true (Bytes.equal enc.ct_v dec.ct_v);
   Alcotest.(check bool) "nonce" true (Bytes.equal enc.nonce dec.nonce);
-  Alcotest.(check bool) "encrypted_data" true (Bytes.equal enc.encrypted_data dec.encrypted_data)
+  Alcotest.(check bool) "encrypted_data" true (Bytes.equal enc.encrypted_data dec.encrypted_data);
+  Alcotest.(check bool) "outgoing_ct" true (Bytes.equal enc.outgoing_ct dec.outgoing_ct)
 
 let test_encoding_published_note () =
   let cm = Tzel.Hash.hash_tag "test-cm" in
@@ -1292,6 +1294,7 @@ let test_encoding_published_note () =
     ct_d = Bytes.make 1088 '\xAA'; tag = 1023;
     ct_v = Bytes.make 1088 '\xBB'; nonce = Bytes.make 12 '\xDD';
     encrypted_data = Bytes.make 1080 '\xCC';
+    outgoing_ct = Bytes.make Tzel.Encoding.outgoing_recovery_ct_size '\xEE';
   } in
   let pn = { Tzel.Encoding.pn_cm = cm; pn_enc = enc } in
   let wire = Tzel.Encoding.encode_published_note pn in
@@ -1306,6 +1309,7 @@ let test_encoding_note_memo () =
     ct_d = Bytes.make 1088 '\x00'; tag = 7;
     ct_v = Bytes.make 1088 '\x00'; nonce = Bytes.make 12 '\x00';
     encrypted_data = Bytes.make 1080 '\x00';
+    outgoing_ct = Bytes.make Tzel.Encoding.outgoing_recovery_ct_size '\x00';
   } in
   let nm = { Tzel.Encoding.nm_index = 42L; nm_cm = cm; nm_enc = enc } in
   let wire = Tzel.Encoding.encode_note_memo nm in
@@ -1364,6 +1368,7 @@ let test_memo_ct_hash_deterministic () =
     ct_d = Bytes.make 1088 '\x11'; tag = 42;
     ct_v = Bytes.make 1088 '\x22'; nonce = Bytes.make 12 '\x44';
     encrypted_data = Bytes.make 1080 '\x33';
+    outgoing_ct = Bytes.make Tzel.Encoding.outgoing_recovery_ct_size '\x55';
   } in
   let h1 = Tzel.Encoding.compute_memo_ct_hash enc in
   let h2 = Tzel.Encoding.compute_memo_ct_hash enc in
@@ -1374,11 +1379,12 @@ let test_encoding_json_encrypted_note () =
     ct_d = Bytes.make 1088 '\x01'; tag = 42;
     ct_v = Bytes.make 1088 '\x02'; nonce = Bytes.make 12 '\x04';
     encrypted_data = Bytes.make 1080 '\x03';
+    outgoing_ct = Bytes.make Tzel.Encoding.outgoing_recovery_ct_size '\x05';
   } in
   let json = Tzel.Encoding.encrypted_note_to_json enc in
   match json with
   | `Assoc fields ->
-    Alcotest.(check int) "5 fields" 5 (List.length fields);
+    Alcotest.(check int) "6 fields" 6 (List.length fields);
     let tag_val = List.assoc "tag" fields in
     Alcotest.(check int) "tag" 42 (match tag_val with `Int n -> n | _ -> -1)
   | _ -> Alcotest.fail "expected Assoc"
@@ -1389,6 +1395,7 @@ let test_encoding_json_published_note () =
     ct_d = Bytes.make 1088 '\x00'; tag = 0;
     ct_v = Bytes.make 1088 '\x00'; nonce = Bytes.make 12 '\x00';
     encrypted_data = Bytes.make 1080 '\x00';
+    outgoing_ct = Bytes.make Tzel.Encoding.outgoing_recovery_ct_size '\x00';
   } in
   let pn = { Tzel.Encoding.pn_cm = cm; pn_enc = enc } in
   let json = Tzel.Encoding.published_note_to_json pn in

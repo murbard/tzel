@@ -67,6 +67,7 @@ let gen_key_hierarchy () =
     "ask_base", jhex keys.ask_base;
     "dsk", jhex keys.dsk;
     "incoming_seed", jhex keys.incoming_seed;
+    "outgoing_seed", jhex keys.outgoing_seed;
     "view_root", jhex keys.view_root;
     "detect_root", jhex keys.detect_root;
   ]
@@ -200,7 +201,7 @@ let gen_detection_tags () =
   ) shared_secrets)
 
 (* ── Memo hash (memo_ct_hash) ──
-   H_memo(ct_d || tag_le || ct_v || nonce || encrypted_data) is deterministic. *)
+   H_memo(ct_d || tag_le || ct_v || nonce || encrypted_data || outgoing_ct) is deterministic. *)
 
 let gen_memo_ct_hash () =
   let enc : Tzel.Encoding.encrypted_note = {
@@ -209,6 +210,7 @@ let gen_memo_ct_hash () =
     ct_v = Bytes.init 1088 (fun i -> Char.chr ((i + 100) mod 256));
     nonce = Bytes.make 12 '\x44';
     encrypted_data = Bytes.init 1080 (fun i -> Char.chr ((i + 200) mod 256));
+    outgoing_ct = Bytes.make Tzel.Encoding.outgoing_recovery_ct_size '\xDD';
   } in
   let mch = Tzel.Encoding.compute_memo_ct_hash enc in
   `Assoc [
@@ -217,6 +219,7 @@ let gen_memo_ct_hash () =
     "ct_v", jhex enc.ct_v;
     "nonce", jhex enc.nonce;
     "encrypted_data", jhex enc.encrypted_data;
+    "outgoing_ct", jhex enc.outgoing_ct;
     "memo_ct_hash", jhex mch;
   ]
 
@@ -241,7 +244,8 @@ let gen_cross_impl_encrypt () =
   let memo = Tzel.Detection.text_memo "cross-impl test" in
   let (nonce, encrypted_data) = Tzel.Detection.encrypt_memo ~ss_v ~v ~rseed ~memo in
   let tag = Tzel.Detection.compute_tag ss_d in
-  let enc : Tzel.Encoding.encrypted_note = { ct_d; tag; ct_v; nonce; encrypted_data } in
+  let outgoing_ct = Bytes.make Tzel.Encoding.outgoing_recovery_ct_size '\xEE' in
+  let enc : Tzel.Encoding.encrypted_note = { ct_d; tag; ct_v; nonce; encrypted_data; outgoing_ct } in
   let mch = Tzel.Encoding.compute_memo_ct_hash enc in
   `Assoc [
     "master_sk", jhex master_sk;
@@ -260,6 +264,7 @@ let gen_cross_impl_encrypt () =
     "memo", jhex memo;
     "nonce", jhex nonce;
     "encrypted_data", jhex encrypted_data;
+    "outgoing_ct", jhex outgoing_ct;
     "tag", jint tag;
     "memo_ct_hash", jhex mch;
   ]
@@ -386,6 +391,7 @@ let gen_wire_encoding () =
     ct_v = Bytes.init 1088 (fun i -> Char.chr ((i + 50) mod 256));
     nonce = Bytes.make 12 '\xAA';
     encrypted_data = Bytes.init 1080 (fun i -> Char.chr ((i + 100) mod 256));
+    outgoing_ct = Bytes.make Tzel.Encoding.outgoing_recovery_ct_size '\xBB';
   } in
   let enc_bytes = Tzel.Encoding.encode_encrypted_note enc in
   let cm = Tzel.Hash.hash_tag "wire-test-cm" in
