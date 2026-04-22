@@ -1,0 +1,736 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{array}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!45!black,
+  urlcolor=blue!45!black,
+  citecolor=blue!45!black
+}
+
+\newcommand{\TzEL}{TzEL}
+\newcommand{\Hash}{\mathsf{H}}
+\newcommand{\cm}{\mathsf{cm}}
+\newcommand{\nf}{\mathsf{nf}}
+\newcommand{\rcm}{\mathsf{rcm}}
+
+\title{\TzEL: Tezos Encrypted Ledger\\
+\large Post-Quantum Shielded Transactions on Tezos Smart Rollups}
+\author{TzEL contributors}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\TzEL{}, the Tezos Encrypted Ledger, is a shielded transaction protocol for
+Tezos smart rollups. It is designed for a setting in which shielded transaction
+data is public and durable, so encrypted note payloads may be archived long
+before anyone knows whether the cryptography protecting them will survive
+future attacks. \TzEL{} adapts the note/commitment/nullifier architecture of
+shielded payments to that threat by making the shielded path post-quantum end
+to end: incoming notes are delivered with ML-KEM, spends are authorized with
+one-time hash-based signatures inside an XMSS-style tree, and validity is
+proved with recursive STARKs. The protocol also separates spend authority from
+proof generation, allowing wallets to authorize exact transaction effects
+locally while outsourcing proof generation to an untrusted prover. Shielded
+transactions can move value from bridge deposits into notes, transfer value
+between notes, and release value back to public recipients. The result is a
+rollup-based shielded ledger whose archived note ciphertexts, spend
+authorizations, and proof system do not depend on classical discrete-log
+assumptions.
+\end{abstract}
+
+\section{Introduction}
+
+Shielded payment systems publish encrypted transaction data on a public ledger.
+Those ciphertexts can be copied and stored indefinitely. If the cryptography
+protecting them is later broken, old notes, values, and memos can be decrypted
+retroactively. For a private payment system, that is the natural form of
+harvest-now-decrypt-later.
+
+That observation creates two distinct questions. The first is \emph{when} to
+migrate: if note ciphertexts can be harvested now and decrypted later, then the
+privacy layer matters before a quantum-capable adversary arrives. The second is
+\emph{how far} to migrate: it is possible to harden only the memo layer and
+still leave other parts of the shielded path on assumptions that are not meant
+to survive quantum attacks. \TzEL{} takes the broader route. It aims to make
+the shielded transaction path itself post-quantum.
+
+A second requirement is practical rather than cryptographic. STARK proving is
+heavy enough that wallets may want to outsource proof generation. That should
+not require outsourcing spend authority. \TzEL{} therefore separates the right
+to authorize a spend from the work of producing the proof that validates it.
+
+\section{Threat Model and Design Goals}
+
+\subsection{Threat model}
+
+\TzEL{} is designed for the following setting:
+
+\begin{itemize}
+  \item Shielded transaction data, including encrypted note payloads, is public
+        and can be archived indefinitely.
+  \item Proof generation may be delegated to an untrusted prover.
+  \item Users may want watch-only services that can help find incoming notes or
+        account for sent outputs without gaining spend authority.
+  \item The rollup enforces public state-transition rules, while the proof
+        system enforces private consistency of notes, nullifiers, and spends.
+\end{itemize}
+
+Like other practical shielded ledgers, \TzEL{} does not make all observable
+structure disappear. Transaction type, timing, ordering, number of spent
+inputs, and some output-shape information remain visible at the public layer.
+The protocol separates receiver-side recovery from sender-side recovery.
+Recipients use incoming viewing material to detect and decrypt notes addressed
+to them. Senders can separately export outgoing viewing material that recovers
+the metadata needed to recognize notes they created, without granting spend
+authority and without adding another public key to payment addresses.
+
+\subsection{Design goals}
+
+The main design goals are:
+
+\begin{itemize}
+  \item Preserve the core shielded-ledger structure of notes, commitments,
+        nullifiers, and historical Merkle roots.
+  \item Replace non-post-quantum assumptions in the shielded path with
+        primitives chosen for long-lived public ciphertexts and durable note
+        archives.
+  \item Keep spend authority in the wallet even when proof generation is
+        delegated.
+  \item Support reduced-capability exports such as detection-only and
+        incoming-view monitoring and sender-side outgoing accounting.
+  \item Fit the execution and data model of Tezos smart rollups and the Tezos
+        Data Availability Layer (DAL).
+\end{itemize}
+
+\section{Protocol Overview}
+
+A \emph{note} is the protocol's private value object. On chain it appears as a
+commitment together with encrypted note data. Off chain, the recipient uses the
+viewing path and local address metadata to recover the note plaintext. To spend
+a note, the wallet reveals a \emph{nullifier}: a one-use serial derived from
+the note and the note owner's secret spending material. The rollup rejects any
+nullifier that has already appeared.
+
+The rollup state therefore contains:
+
+\begin{itemize}
+  \item an append-only Merkle tree of note commitments;
+  \item a global set of spent nullifiers;
+  \item a historical set of Merkle roots usable as spend anchors;
+  \item a set of public bridge deposit receipts keyed by secret-bound deposit
+        identifiers, used only to move value into the shielded pool;
+  \item verifier configuration, public-account bindings, and fee-policy state.
+\end{itemize}
+
+A \emph{shielded transaction} is any transaction that creates or destroys notes.
+\TzEL{} has three of them:
+
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.17\linewidth} >{\raggedright\arraybackslash}p{0.28\linewidth} >{\raggedright\arraybackslash}p{0.42\linewidth}}
+\toprule
+Transaction & Consumes & Creates \\
+\midrule
+Shield & a bridge deposit receipt keyed by a secret-bound deposit identifier & a user note and a DAL-producer fee note \\
+Transfer & 1--7 shielded input notes & a recipient note, a change note, and a DAL-producer fee note \\
+Unshield & 1--7 shielded input notes & a public credit, an optional change note, and a DAL-producer fee note \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Every shielded transaction pays two distinct resource prices. The first is a
+burned rollup fee \(fee\), which prices rollup execution and is recreated
+nowhere. In the current reference rollup it has a floor of 100000 mutez: the
+first two private transactions in an inbox level pay the floor, each later
+private transaction doubles the required fee, the doubling is capped after six
+steps, and the fee resets when the inbox level advances. The second is a
+strictly positive private producer fee \(producer\_fee\), created as an
+ordinary shielded note intended for the DAL slot producer. The rollup proves
+that such a note exists and has positive value; the producer enforces that it is
+payable to them as an inclusion policy before publishing. The burned fee and the
+producer fee price different resources and are therefore modeled separately.
+
+\section{Cryptographic Design}
+
+\subsection{Post-quantum profile}
+
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.28\linewidth} >{\raggedright\arraybackslash}p{0.31\linewidth} >{\raggedright\arraybackslash}p{0.27\linewidth}}
+\toprule
+Role & Instantiation & Purpose \\
+\midrule
+Commitments and nullifiers & BLAKE2s-derived field hashes & bind notes and prevent double spends \\
+Incoming-note delivery & ML-KEM-768 + ChaCha20-Poly1305 & encrypt note payloads and memos \\
+Detection & ML-KEM-768 clue + short tag & watch-only candidate filtering \\
+Outgoing recovery & BLAKE2s-derived key + ChaCha20-Poly1305 & sender-side accounting for created outputs \\
+Spend authorization & hash-based one-time signatures in an XMSS-style tree & authorize each spent note once \\
+Zero knowledge & Cairo AIR + recursive STARKs & prove validity without exposing witness data \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Where the protocol can be expressed with hash-based machinery, it does so:
+commitments, nullifiers, Merkle nodes, owner binding, transaction sighashes,
+and one-time-signature chains are all built from hashes. That leaves one place
+where hashing alone is not enough. A sender must take a public payment address
+and, without interaction, produce note ciphertext that only the recipient can
+open. That is a public-key delivery problem, so \TzEL{} uses ML-KEM for the
+incoming-note path.
+
+This is why the system is not purely hash-based. If there were a practical,
+standardized hash-based KEM with the right ergonomics for per-address note
+delivery and watch-only detection, the protocol could have used it. In the
+current ecosystem, the pragmatic post-quantum choice for that role is ML-KEM.
+Everywhere else, the design stays with hashes.
+
+That still leaves a design choice. One could adopt ML-KEM for note encryption
+and stop there, while keeping spend authorization or proof verification on
+classical assumptions. \TzEL{} takes the stronger route: the shielded path as a
+whole is meant to survive without elliptic-curve or pairing-based cryptography.
+
+\subsection{Proof architecture}
+
+The private transaction logic is first expressed as Cairo AIR. That first proof
+establishes the arithmetic and Merkle constraints for shield, transfer, or
+unshield. A second proving layer then re-proves that Cairo execution using
+Stwo, yielding the recursive proof object that is posted to the rollup.
+
+This two-layer structure serves two purposes. First, it keeps the proving stack
+entirely in STARK territory. Second, it yields a proof that is small and
+verifier-friendly enough for rollup use while still carrying zero-knowledge
+blinding. On the current reference stack, recursive proofs are around 300 KB;
+single-level proving exists as a development aid, not as the intended privacy
+profile.
+
+\section{Keys, Addresses, and Capabilities}
+
+The key hierarchy is organized around capability separation. \TzEL{}
+distinguishes the following reduced-authority capabilities:
+
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.18\linewidth} >{\raggedright\arraybackslash}p{0.60\linewidth}}
+\toprule
+Capability & What it can do \\
+\midrule
+Detection & flag candidate incoming notes, with false positives, without reading note contents \\
+Incoming view & decrypt and validate incoming notes and memos, but not spend them \\
+Outgoing view & recover sender-created output metadata and values, but not spend them \\
+Full view & incoming view plus spent-state tracking for notes whose address metadata is known \\
+Spend & full view plus transaction authorization \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Detection, incoming view, full view, and spend form a nested receiver-side
+chain. Outgoing view is orthogonal: it tracks outputs created by the sender but
+does not detect arbitrary incoming notes, compute nullifiers, or authorize
+spends.
+
+That separation is reflected in the wallet derivation tree. From a master
+secret, the wallet derives independent spending, incoming, and outgoing
+branches:
+
+\[
+\begin{aligned}
+spend\_seed &= \Hash(\mathrm{TAG\_SPEND}, master\_sk), \\
+incoming\_seed &= \Hash(\mathrm{TAG\_INCOMING}, master\_sk), \\
+outgoing\_seed &= \Hash(\mathrm{TAG\_OUTGOING}, master\_sk).
+\end{aligned}
+\]
+
+The spending branch contains the secrets needed to derive nullifiers and to
+authorize spends. The incoming branch contains the material needed to receive,
+detect, and view notes. This makes reduced-capability export natural: a user
+can hand detection or viewing material to another process without handing over
+spend authority.
+
+Incoming and full-view wallets still need the local address records containing
+\((d_j, auth\_root_j, pub\_seed_j, nk\_tag_j)\) to validate recovered notes.
+The incoming and nullifier branches alone do not reconstruct that public address
+metadata.
+
+The outgoing branch is sender-scoped. It is not part of payment addresses and
+does not require an additional ML-KEM public key on chain. Instead, when a wallet
+creates an output, it encrypts a compact recovery record under a symmetric key
+derived from \(outgoing\_seed\) and the output commitment \(\cm\). This lets the
+sender later recognize and account for notes it created while preserving the
+recipient-facing address format.
+
+For address index \(j\), the wallet derives:
+
+\begin{itemize}
+  \item \(d_j\), the address diversifier;
+  \item \(nk\_spend_j\), the per-address nullifier secret;
+  \item \(nk\_tag_j = \Hash_{\mathrm{nktg}}(nk\_spend_j)\), a public binding tag
+        that lets a sender bind a note to the correct nullifier lineage without
+        learning the nullifier secret;
+  \item \((auth\_root_j, pub\_seed_j)\), the public root and seed of that
+        address's one-time authorization tree;
+  \item \((ek^v_j, dk^v_j)\), the ML-KEM viewing keypair;
+  \item \((ek^d_j, dk^d_j)\), the ML-KEM detection keypair.
+\end{itemize}
+
+The payment address is therefore
+
+\[
+address_j = (d_j, auth\_root_j, pub\_seed_j, nk\_tag_j, ek^v_j, ek^d_j).
+\]
+
+It contains enough public information for a sender to create a spendable note
+for that address, but not enough information to derive nullifiers or spend
+authorizations.
+
+These addresses are larger than classical shielded addresses because they carry
+multiple post-quantum public components. In practice, such addresses are better
+handled as structured payment requests, QR encodings, or directory lookups than
+as strings to copy by hand.
+
+\section{Notes, Commitments, and Nullifiers}
+
+For note value \(v\), per-note seed \(rseed\), and the recipient's address
+metadata, the protocol derives commitment randomness and the note commitment as
+
+\[
+\rcm = \Hash(\Hash(\mathrm{TAG\_RCM}), rseed),
+\]
+
+\[
+owner\_tag_j = \Hash_{\mathrm{owner}}(auth\_root_j, pub\_seed_j, nk\_tag_j),
+\]
+
+\[
+\cm = \Hash_{\mathrm{commit}}(d_j, v, \rcm, owner\_tag_j).
+\]
+
+The owner tag is what fuses the two sides of future spending authority into the
+note commitment. It binds the note both to the authorization tree and to the
+nullifier derivation path. Without that binding, a commitment could be paired
+with unrelated nullifier material. The dependency chain is
+
+\[
+nk\_spend_j \rightarrow nk\_tag_j \rightarrow owner\_tag_j \rightarrow \cm.
+\]
+
+Nullifiers are position-dependent:
+
+\[
+\nf = \Hash_{\mathrm{nf}}(nk\_spend_j, \Hash_{\mathrm{nf}}(\cm, pos)).
+\]
+
+Including the Merkle leaf position prevents two otherwise identical commitments
+inserted at different leaves from collapsing to the same nullifier. That is the
+same basic issue sometimes described as a faerie-gold problem: identical-looking
+notes at different positions must still spend distinctly.
+
+\section{Spend Authorization and Delegated Proving}
+
+\subsection{Why one-time authorization is needed}
+
+If proof generation is delegated, the wallet needs a way to authorize the exact
+public effects of a transaction without handing the prover a reusable spending
+key. \TzEL{} solves that with an XMSS-style authorization tree of one-time
+hash-signature keys. Each spent input consumes one unused leaf. The wallet
+signs the transaction locally; the prover only proves, inside the STARK, that
+the signature is valid under the address's authorization root.
+
+This mechanism is still useful when proving is done locally. It keeps spend
+authorization inside the proof and avoids publishing public keys or signatures
+on chain.
+
+\subsection{Authorization tree and in-circuit verification}
+
+Each address owns a depth-16 authorization tree, giving \(2^{16}\) one-time
+authorization leaves. The per-leaf signature is WOTS-like, with the current
+parameterization using base \(w = 4\), 133 chains, and chain length \(w - 1\).
+
+For each spent input, the wallet signs a transaction-specific sighash with the
+corresponding one-time secret. Inside the STARK, the circuit
+
+\begin{enumerate}
+  \item recomputes the sighash from the public outputs;
+  \item decomposes it into base-4 WOTS digits;
+  \item hashes the signature chains forward to recover the corresponding public
+        key endpoints;
+  \item compresses those endpoints through the XMSS-style L-tree;
+  \item proves membership of the recovered leaf under \(auth\_root_j\).
+\end{enumerate}
+
+No authorization leaf, one-time public key, or one-time signature appears in the
+public transaction outputs. The proof itself is the public authorization object.
+
+That matters for privacy as well as correctness. Publishing authorization leaves
+or signatures would create another public handle linking spends to address
+material. Instead, the public layer sees only the commitments, nullifiers,
+note-data hashes, and other public effects that the rollup actually needs.
+
+\subsection{What the prover can and cannot do}
+
+The wallet, not the prover, chooses the transaction effects. It selects the
+inputs, computes the output commitments, derives the note-data hashes, forms
+the public statement, and signs the sighash locally. These hashes bind the
+posted recipient-delivery ciphertexts and outgoing-recovery ciphertexts as
+bytes; the circuit does not prove that those ciphertexts decrypt to the
+commitment preimages. The prover receives only the witness needed to prove that
+statement.
+
+Because spend authorization is checked inside the circuit over the public
+outputs, an untrusted prover cannot change recipients, fees, nullifiers,
+commitments, withdrawal targets, or note-data hashes without invalidating the
+proof. This is the core separation between delegated proving and delegated
+spending.
+
+\subsection{Replay binding}
+
+For transfer and unshield, the signature covers a folded transaction sighash
+that includes
+
+\begin{itemize}
+  \item a circuit-type tag;
+  \item the deployment authorization domain \(auth\_domain\);
+  \item the input root;
+  \item all nullifiers;
+  \item public values such as fees, withdrawal amount, and recipient id;
+  \item output commitments and note-data hashes, including the hashes of
+        recipient-delivery and outgoing-recovery ciphertexts.
+\end{itemize}
+
+The type tag prevents cross-circuit replay. The authorization domain prevents
+replay across mirrored deployments, forks, or verifier migrations that might
+otherwise share root history. The current base protocol does not yet include an
+expiry or per-transaction nonce in that authorization, so a delegated prover
+can withhold a completed authorization until one of its nullifiers is consumed
+elsewhere.
+
+\section{Shielded Transaction Types}
+
+\subsection{Shield}
+
+Shield takes value that has already crossed from L1 into the rollup and moves it
+into the shielded pool. The public rollup object being consumed is not a normal
+transparent account balance. It is a bridge deposit receipt keyed by a
+secret-bound deposit identifier:
+
+\[
+deposit\_id = \Hash(\mathrm{TAG\_DEPOSIT}, deposit\_secret).
+\]
+
+The bridge credits a public rollup balance key derived from that
+\(deposit\_id\). To shield the funds, the witness proves knowledge of
+\(deposit\_secret\) and therefore of the exact deposit receipt being consumed.
+
+The public outputs of shield are
+
+\[
+[v_{pub}, fee, producer\_fee, \cm_{user}, \cm_{producer}, deposit\_id,
+ mh_{user}, mh_{producer}].
+\]
+
+The circuit proves the user commitment, the producer-fee commitment, that
+\(deposit\_id\) equals \(\Hash(\mathrm{TAG\_DEPOSIT}, deposit\_secret)\), and
+the condition \(producer\_fee > 0\). The rollup then checks proof validity,
+deposit binding, note-data hashes, and the required burned fee.
+
+The consumed public balance is
+
+\[
+v_{pub} + fee + producer\_fee.
+\]
+
+That accounting is deliberate. \(v_{pub}\) becomes the user's shielded note,
+\(producer\_fee\) becomes the DAL-producer fee note, and \(fee\) is burned. The
+deposit receipt itself is not directly withdrawable; otherwise publication of
+\(deposit\_id\) would be enough to race the shield and defeat the ownership
+binding.
+
+\subsection{Transfer}
+
+Transfer consumes \(N\) shielded notes, where \(1 \leq N \leq 7\), and creates
+three new shielded notes: recipient, change, and DAL-producer fee. Its public
+outputs are
+
+\[
+[auth\_domain, root, \nf_0, \ldots, \nf_{N-1}, fee,
+ \cm_1, \cm_2, \cm_3, mh_1, mh_2, mh_3].
+\]
+
+For each input, the circuit proves commitment reconstruction, Merkle membership,
+nullifier computation, and one-time authorization under the corresponding
+authorization root. For the outputs, it proves all three commitments and
+enforces
+
+\[
+\sum_{i=0}^{N-1} v_i = v_1 + v_2 + v_3 + fee,
+\]
+
+with \(v_3 > 0\) for the producer-fee note. The circuit also enforces pairwise
+distinct nullifiers within the transaction, while the rollup checks each
+published nullifier against the global nullifier set.
+
+\subsection{Unshield}
+
+Unshield consumes \(N\) shielded notes, releases public value to a recipient,
+and creates a producer-fee note plus an optional shielded change note. Its
+public outputs are
+
+\[
+[auth\_domain, root, \nf_0, \ldots, \nf_{N-1}, v_{pub}, fee,
+ recipient\_id, \cm_{change}, mh_{change}, \cm_{fee}, mh_{fee}].
+\]
+
+The circuit proves the same input validity and authorization conditions as
+transfer, then enforces
+
+\[
+\sum_{i=0}^{N-1} v_i = v_{pub} + v_{change} + v_{fee} + fee.
+\]
+
+If there is no change note, the change commitment, change note-data hash, and all
+corresponding witness values are constrained to zero. That removes a source of
+prover malleability: the prover cannot hide nonzero private change behind a
+zero public commitment.
+
+\section{Encrypted Note Delivery and Detection}
+
+Each output note carries
+
+\begin{itemize}
+  \item the commitment \(\cm\);
+  \item a detection ciphertext \(ct_d\);
+  \item a short detection tag;
+  \item a viewing ciphertext \(ct_v\);
+  \item a derived AEAD nonce;
+  \item encrypted note plaintext \((v \parallel rseed \parallel memo)\);
+  \item an outgoing recovery ciphertext \(ct_o\).
+\end{itemize}
+
+For recipient address \((ek^d_j, ek^v_j)\), the sender creates two ML-KEM
+encapsulations. The viewing path is the strong one: encapsulate to \(ek^v_j\),
+derive a symmetric key from the shared secret, and encrypt
+\((v \parallel rseed \parallel memo)\) with ChaCha20-Poly1305. The detection
+path is weaker on purpose. It gives a watch-only service just enough material
+to flag candidate incoming notes, while leaving note contents encrypted and
+spend authority untouched.
+
+This is the operational role of detection. Without it, a wallet or service would
+have to attempt full incoming-note recovery against every output on the chain.
+With detection, a lightweight indexer can scan the chain, report likely
+matches by address index, and leave the wallet to do full note recovery only on
+that narrowed candidate set.
+
+Detection leaks very little compared with viewing. A detector can test whether a
+note is a candidate for one of the monitored addresses. It cannot decrypt note
+contents, derive nullifiers, authorize spends, or directly infer spent status.
+False positives are built in by design.
+
+The outgoing recovery path is separate from recipient delivery. For each output,
+the sender encrypts
+
+\[
+(role \parallel v \parallel rseed \parallel d_j \parallel auth\_root_j
+ \parallel pub\_seed_j \parallel nk\_tag_j)
+\]
+
+under a key derived from \(outgoing\_seed\) and \(\cm\). The plaintext omits
+spending secrets. A wallet using outgoing viewing material accepts a recovered
+record only after recomputing
+
+\[
+\cm_{expected} =
+\Hash_{\mathrm{commit}}(d_j, v, \Hash(\Hash(\mathrm{TAG\_RCM}), rseed),
+\Hash_{\mathrm{owner}}(auth\_root_j, pub\_seed_j, nk\_tag_j))
+\]
+
+and checking \(\cm_{expected} = \cm\). Thus outgoing viewing is an accounting
+and recovery feature for the sender, not a new authorization path.
+
+Detection is only a filtering aid, not a correctness condition. A wallet accepts
+an incoming note only after it
+
+\begin{enumerate}
+  \item decrypts the note plaintext;
+  \item selects the matching local address record containing
+        \((d_j, auth\_root_j, pub\_seed_j, nk\_tag_j)\);
+  \item recomputes \(\rcm = \Hash(\Hash(\mathrm{TAG\_RCM}), rseed)\);
+  \item recomputes
+        \(owner\_tag_j = \Hash_{\mathrm{owner}}(auth\_root_j, pub\_seed_j, nk\_tag_j)\);
+  \item recomputes
+        \(\cm_{expected} = \Hash_{\mathrm{commit}}(d_j, v, \rcm, owner\_tag_j)\);
+  \item accepts the note only if \(\cm_{expected}\) equals the posted
+        commitment.
+\end{enumerate}
+
+These acceptance rules matter because the proof binds the posted ciphertext
+bytes through note-data hashes, but does not prove that the viewing or outgoing
+ciphertexts decrypt to the same commitment preimage used inside the circuit.
+
+\section{Rollup Verification and DAL}
+
+The STARK proves private consistency. The rollup still has to enforce public
+state-transition rules that are not handled inside the proof. These include:
+
+\begin{itemize}
+  \item proof verification for the intended executable;
+  \item \(auth\_domain\) matching the configured deployment domain for
+        spending transactions;
+  \item the input root being a recognized historical root;
+  \item global freshness of every published nullifier;
+  \item equality between posted note commitments and the commitments in the
+        proof outputs;
+  \item equality between posted note data and the note-data hashes in the
+        proof outputs;
+  \item correct binding of shield to the exact secret-bound deposit receipt
+        being consumed;
+  \item correct binding of unshield to the intended public recipient encoding;
+  \item enough remaining commitment-tree capacity for every output note before
+        any balance, nullifier, or outbox mutation is applied;
+  \item satisfaction of the current burned-fee policy.
+\end{itemize}
+
+These checks must be implemented and should be treated as part of the protocol.
+Without historical-root validation, a prover could spend against a fabricated local
+tree. Without executable binding, a verifier could accept the wrong Cairo task.
+Without note-data binding, a relayer could swap ciphertext fields after the
+proof was produced.
+
+The large proof and note payloads are why the Tezos DAL is structurally part of
+the design. The DAL is a companion data-availability network for rollups: it
+lets rollups publish large blobs without forcing them into L1 block bandwidth.
+That matters here because recursive proofs are roughly 300 KB and each encrypted
+output note is roughly 3 KB. The intended path is therefore to publish the
+heavy payload through DAL, inject only a small pointer into the rollup inbox,
+and let the kernel resolve that pointer before applying the state transition.
+
+\TzEL{}'s post-quantum claims concern the shielded transaction layer. Tezos L1
+consensus, bridge mechanics, and DAL attestation are separate systems with
+their own security assumptions. Even before those layers reach a fully
+post-quantum profile, protecting note ciphertexts, spend authorizations, and
+proof objects at the shielded layer still blocks the harvest-now-decrypt-later
+attack against archived shielded data.
+
+\section{Security Properties and Limitations}
+
+\subsection{What the design gives you}
+
+\begin{itemize}
+  \item \textbf{Balance conservation.} Values are range-checked and the value
+        equations for shield, transfer, and unshield are enforced inside the
+        circuit.
+  \item \textbf{Double-spend resistance.} Nullifiers are unique per
+        note-position pair, pairwise distinct within a transaction, and checked
+        against a global on-chain set.
+  \item \textbf{Commitment binding.} The chain
+        \(nk\_spend \rightarrow nk\_tag \rightarrow owner\_tag \rightarrow \cm\)
+        ties each note to the nullifier lineage that will later be used to
+        spend it.
+  \item \textbf{Local spend control.} A valid spend proof implies both note
+        ownership and a valid one-time authorization over the exact public
+        effects of the transaction.
+  \item \textbf{No public authorization artifacts.} Authorization leaves,
+        one-time public keys, and one-time signatures do not appear in the
+        public transaction outputs.
+  \item \textbf{Post-quantum shielded path.} Incoming-note delivery, spend
+        authorization, and zero-knowledge proving do not depend on classical
+        discrete-log assumptions.
+\end{itemize}
+
+\subsection{What still remains visible}
+
+\begin{itemize}
+  \item Transaction type, ordering, and timing are public.
+  \item The number of published nullifiers reveals the number of spent inputs.
+  \item Observers can tell whether an unshield carries a change note.
+  \item A delegated prover sees per-address witness material such as
+        \(nk\_spend_j\) and \(auth\_root_j\). Combined with public commitments,
+        positions, and the global nullifier set, that is enough to infer
+        spent-state for notes associated with that address.
+\end{itemize}
+
+Users who want delegated proving with weaker witness exposure can treat TEE-based
+provers or equivalent isolation as an operational mitigation, but that is not a
+protocol guarantee.
+
+\subsection{Current caveats}
+
+\begin{itemize}
+  \item \textbf{Detection is honest-sender.} A malicious sender can post bogus
+        detection data for a note. That does not let them steal funds or read
+        wallet state; it simply forces the recipient or its watch service to
+        fall back to broader viewing-key scanning. Detection should therefore
+        be understood as a performance optimization, not as the source of note
+        correctness.
+  \item \textbf{Ciphertext correctness is not proved in-circuit.} Wallets must
+        recompute commitments before treating incoming or outgoing recovered
+        records as valid.
+  \item \textbf{Address fields are not self-authenticating to the sender.}
+        Shield and transfer outputs can be formed with malformed public address
+        metadata, producing unspendable notes. This is sender self-griefing,
+        not theft.
+  \item \textbf{One-time keys must still be treated as one-time.} Reuse does
+        not create a public on-chain linking issue by itself because signatures
+        are not published. But once the same external prover sees two
+        authorizations under the same one-time key, it may be able to forge
+        further authorizations. Wallets should therefore allocate one leaf per
+        spend and persist that state durably.
+  \item \textbf{Shield is not yet domain-bound the way transfer and unshield
+        are.} Because shield carries \(deposit\_id\) but no \(auth\_domain\),
+        mirrored deployments with matching funded deposit identifiers still
+        require external deployment separation.
+\end{itemize}
+
+\section{Size and Data Path}
+
+Each encrypted output note is roughly 3487 bytes on chain:
+
+\begin{itemize}
+  \item 32 bytes for the commitment;
+  \item 1088 bytes for the detection ciphertext;
+  \item 2 bytes for the detection tag;
+  \item 1088 bytes for the viewing ciphertext;
+  \item 12 bytes for the AEAD nonce;
+  \item 1080 bytes for the encrypted \((v, rseed, memo)\) payload;
+  \item 185 bytes for the outgoing recovery ciphertext.
+\end{itemize}
+
+Typical transaction sizes are therefore dominated by the recursive proof rather
+than by authorization artifacts:
+
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.20\linewidth} >{\raggedright\arraybackslash}p{0.22\linewidth} >{\raggedright\arraybackslash}p{0.36\linewidth}}
+\toprule
+Transaction & Output note data & Approximate total \\
+\midrule
+Shield & 2 notes & about 302 KB \\
+Transfer & 3 notes & about 305 KB plus 32 bytes per input nullifier \\
+Unshield & 1--2 notes & about 299--302 KB plus 32 bytes per input nullifier \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Those numbers are why DAL is not an optional add-on for this design. A rollup
+that wants shielded transactions with recursive proofs needs a high-bandwidth
+data path, not only a small inbox.
+
+\section{Conclusion}
+
+\TzEL{} preserves the core shielded-ledger logic of notes, commitments,
+nullifiers, and Merkle-root-anchored spends, but retools the privacy layer for
+a post-quantum setting and a rollup execution model. Hash-based constructions
+cover commitments, nullifiers, and one-time spend authorization wherever they
+can. ML-KEM is used where the protocol genuinely needs public-key delivery of
+incoming notes and watch-only detection. Recursive STARKs replace pairing-based
+proof systems while keeping spend authorization inside the proof itself.
+
+The result is a shielded transaction protocol for Tezos smart rollups that aims
+to protect the data most exposed to harvest-now-decrypt-later pressure: durable
+note ciphertexts, spend authorizations, and the proof path that validates
+private state transitions.
+\end{document}
