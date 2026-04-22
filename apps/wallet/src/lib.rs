@@ -2958,8 +2958,74 @@ struct UserCli {
     #[arg(long, default_value = "cairo/target/dev")]
     executables_dir: String,
 
+    /// Emit user-facing output as structured JSON on stdout instead of
+    /// human-readable text. Human progress messages go to stderr.
+    ///
+    /// Schema: `{"schema_version":1,"command":"<subcommand>","result":{...}}`.
+    #[arg(long, global = true)]
+    json: bool,
+
+    /// Override the proving-service URL. When set, delegates STARK proof
+    /// generation to an HTTP proving-service (POST /v1/jobs) instead of
+    /// spawning the local `reprove` binary.
+    ///
+    /// See tzel-infra/docs/proving-service-api.md for the API contract. The
+    /// wiring lands in patch ②; patch ① only declares the flag.
+    #[arg(long, global = true)]
+    proving_service_url: Option<String>,
+
     #[command(subcommand)]
     cmd: UserCmd,
+}
+
+// ── JSON output mode (upstream patch ①) ────────────────────────────────
+//
+// The `--json` flag flips a process-global atomic. `user_out!` chooses
+// between `println!` (default) and a queued JSON envelope emitted at
+// end-of-command by `emit_json_envelope`.
+
+static JSON_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+thread_local! {
+    static USER_JSON_BUFFER: std::cell::RefCell<serde_json::Map<String, serde_json::Value>>
+        = std::cell::RefCell::new(serde_json::Map::new());
+}
+
+const JSON_SCHEMA_VERSION: u32 = 1;
+
+fn json_mode() -> bool {
+    JSON_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_json_mode(v: bool) {
+    JSON_MODE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn user_json_put(key: &str, value: serde_json::Value) {
+    USER_JSON_BUFFER.with(|b| {
+        b.borrow_mut().insert(key.to_string(), value);
+    });
+}
+
+fn emit_json_envelope(command: &str) {
+    let result = USER_JSON_BUFFER.with(|b| std::mem::take(&mut *b.borrow_mut()));
+    let envelope = serde_json::json!({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "command": command,
+        "result": serde_json::Value::Object(result),
+    });
+    println!("{}", serde_json::to_string(&envelope).unwrap());
+}
+
+macro_rules! user_out {
+    (json: { $($key:expr => $value:expr),* $(,)? }, human: $fmt:literal $(, $arg:expr)* $(,)?) => {{
+        if json_mode() {
+            $(user_json_put($key, serde_json::json!($value));)*
+            eprintln!($fmt $(, $arg)*);
+        } else {
+            println!($fmt $(, $arg)*);
+        }
+    }};
 }
 
 #[derive(Subcommand)]
@@ -3240,13 +3306,38 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         },
     };
 
+    // Upstream patch ①: propagate --json into the process-global flag so
+    // the 14 subcommand handlers' `user_out!` calls pick it up without
+    // needing a per-call parameter.
+    set_json_mode(cli.json);
+
     let pc = ProveConfig {
         skip_proof: false,
         reprove_bin: cli.reprove_bin,
         executables_dir: cli.executables_dir,
     };
 
-    match cli.cmd {
+    // Name of the subcommand — used as the `command` field of the JSON
+    // envelope emitted at end-of-run when --json is set.
+    let command_name: &'static str = match &cli.cmd {
+        UserCmd::Init => "init",
+        UserCmd::Profile { .. } => "profile",
+        UserCmd::Receive => "receive",
+        UserCmd::Sync { .. } => "sync",
+        UserCmd::Balance => "balance",
+        UserCmd::Check => "check",
+        UserCmd::Deposit { .. } => "deposit",
+        UserCmd::Shield { .. } => "shield",
+        UserCmd::Send { .. } => "send",
+        UserCmd::Unshield { .. } => "unshield",
+        UserCmd::Status { .. } => "status",
+        UserCmd::ExportDetect { .. } => "export-detect",
+        UserCmd::ExportView { .. } => "export-view",
+        UserCmd::ExportOutgoing { .. } => "export-outgoing",
+        UserCmd::Watch { .. } => "watch",
+    };
+
+    let outcome: Result<(), String> = match cli.cmd {
         UserCmd::Init => cmd_keygen(&cli.wallet),
         UserCmd::Profile { cmd } => run_user_profile(&cli.wallet, cmd),
         UserCmd::Receive => cmd_address(&cli.wallet),
@@ -3321,7 +3412,15 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::ExportView { out } => cmd_export_view(&cli.wallet, out.as_deref()),
         UserCmd::ExportOutgoing { out } => cmd_export_outgoing(&cli.wallet, out.as_deref()),
         UserCmd::Watch { cmd } => run_watch_wallet(&cli.wallet, cmd),
+    };
+
+    // Upstream patch ①: emit the accumulated JSON envelope exactly once
+    // on success. On error we fall through so the caller's error handler
+    // reports via stderr + non-zero exit.
+    if outcome.is_ok() && json_mode() {
+        emit_json_envelope(command_name);
     }
+    outcome
 }
 
 fn run_user_profile(wallet_path: &str, cmd: UserProfileCmd) -> Result<(), String> {
@@ -3395,13 +3494,32 @@ fn run_user_profile(wallet_path: &str, cmd: UserProfileCmd) -> Result<(), String
                 burn_cap,
             );
             save_network_profile(&path, &profile)?;
-            println!("Saved {} profile to {}", profile.network, path.display());
-            println!("{}", display_network_profile_json(&profile));
+            let profile_value =
+                serde_json::to_value(&profile).unwrap_or(serde_json::Value::Null);
+            user_out!(
+                json: {
+                    "saved" => true,
+                    "network" => &profile.network,
+                    "path" => path.display().to_string(),
+                    "profile" => profile_value,
+                },
+                human: "Saved {} profile to {}",
+                profile.network, path.display()
+            );
+            if !json_mode() {
+                println!("{}", display_network_profile_json(&profile));
+            }
             Ok(())
         }
         UserProfileCmd::Show => {
             let profile = load_network_profile(&path)?;
-            println!("{}", display_network_profile_json(&profile));
+            if json_mode() {
+                let profile_value =
+                    serde_json::to_value(&profile).unwrap_or(serde_json::Value::Null);
+                user_json_put("profile", profile_value);
+            } else {
+                println!("{}", display_network_profile_json(&profile));
+            }
             Ok(())
         }
     }
@@ -3543,7 +3661,14 @@ fn cmd_keygen(path: &str) -> Result<(), String> {
         pending_deposits: vec![],
     };
     save_wallet(path, &w)?;
-    println!("Wallet created: {}", path);
+    // Upstream patch ①.
+    user_out!(
+        json: {
+            "created" => true,
+            "path" => path,
+        },
+        human: "Wallet created: {}", path
+    );
     Ok(())
 }
 
@@ -3552,8 +3677,18 @@ fn cmd_address(path: &str) -> Result<(), String> {
     let (state, addr) = w.next_address()?;
 
     save_wallet(path, &w)?;
-    println!("Address #{}", state.index);
-    println!("{}", serde_json::to_string_pretty(&addr).unwrap());
+    // Upstream patch ①.
+    user_out!(
+        json: {
+            "index" => state.index,
+            "address" => serde_json::to_value(&addr).unwrap_or(serde_json::Value::Null),
+        },
+        human: "Address #{}",
+        state.index
+    );
+    if !json_mode() {
+        println!("{}", serde_json::to_string_pretty(&addr).unwrap());
+    }
     Ok(())
 }
 
@@ -3561,7 +3696,21 @@ fn write_json_stdout_or_file<T: Serialize>(value: &T, out: Option<&str>) -> Resu
     let data = serde_json::to_string_pretty(value).map_err(|e| format!("serialize json: {}", e))?;
     if let Some(path) = out {
         save_private_json(path, value, "export")?;
-        println!("Wrote {}", path);
+        // Upstream patch ①.
+        user_out!(
+            json: {
+                "wrote" => true,
+                "path" => path,
+            },
+            human: "Wrote {}", path
+        );
+    } else if json_mode() {
+        // When --json is set and no --out is given, surface the exported
+        // material inline under `content`.
+        let value =
+            serde_json::to_value(value).map_err(|e| format!("serialize json: {}", e))?;
+        user_json_put("wrote", serde_json::Value::Bool(false));
+        user_json_put("content", value);
     } else {
         println!("{data}");
     }
@@ -3607,7 +3756,14 @@ fn cmd_watch_init(path: &str, material_path: &str, force: bool) -> Result<(), St
     let material = load_watch_material(material_path)?;
     let watch = WatchWalletFile::from_material(material);
     save_watch_wallet(path, &watch)?;
-    println!("Watch wallet created: {}", path);
+    // Upstream patch ①.
+    user_out!(
+        json: {
+            "created" => true,
+            "path" => path,
+        },
+        human: "Watch wallet created: {}", path
+    );
     Ok(())
 }
 
@@ -3637,31 +3793,68 @@ fn cmd_watch_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), Stri
     let summary = sync_watch_wallet_once(path, profile)?;
     let watch = load_watch_wallet(path)?;
     let status = watch.status();
-    match status.mode {
-        "detect" => println!(
-            "Watch sync: {} new candidate matches, cursor={}, tracked={}, mode={}",
-            summary.found, status.scanned, status.tracked, status.mode
-        ),
-        "view" => println!(
-            "Watch sync: {} new validated notes, cursor={}, tracked={}, incoming_total={}, spend_status={}",
-            summary.found,
-            status.scanned,
-            status.tracked,
-            status.incoming_total,
-            status.spend_status
-        ),
-        "outgoing" => println!(
-            "Watch sync: {} new outgoing notes, cursor={}, tracked={}, outgoing_total={}, spend_status={}",
-            summary.found,
-            status.scanned,
-            status.tracked,
-            status.outgoing_total,
-            status.spend_status
-        ),
-        _ => println!(
-            "Watch sync: {} new records, cursor={}, tracked={}",
-            summary.found, status.scanned, status.tracked
-        ),
+    // Upstream patch ①: consolidate the mode-specific prints into a single
+    // JSON object while preserving the original human text for each mode.
+    if json_mode() {
+        user_json_put("found", serde_json::json!(summary.found));
+        user_json_put("next_cursor", serde_json::json!(summary.next_cursor));
+        user_json_put(
+            "status",
+            serde_json::to_value(&status).unwrap_or(serde_json::Value::Null),
+        );
+        match status.mode {
+            "detect" => eprintln!(
+                "Watch sync: {} new candidate matches, cursor={}, tracked={}, mode={}",
+                summary.found, status.scanned, status.tracked, status.mode
+            ),
+            "view" => eprintln!(
+                "Watch sync: {} new validated notes, cursor={}, tracked={}, incoming_total={}, spend_status={}",
+                summary.found,
+                status.scanned,
+                status.tracked,
+                status.incoming_total,
+                status.spend_status
+            ),
+            "outgoing" => eprintln!(
+                "Watch sync: {} new outgoing notes, cursor={}, tracked={}, outgoing_total={}, spend_status={}",
+                summary.found,
+                status.scanned,
+                status.tracked,
+                status.outgoing_total,
+                status.spend_status
+            ),
+            _ => eprintln!(
+                "Watch sync: {} new records, cursor={}, tracked={}",
+                summary.found, status.scanned, status.tracked
+            ),
+        }
+    } else {
+        match status.mode {
+            "detect" => println!(
+                "Watch sync: {} new candidate matches, cursor={}, tracked={}, mode={}",
+                summary.found, status.scanned, status.tracked, status.mode
+            ),
+            "view" => println!(
+                "Watch sync: {} new validated notes, cursor={}, tracked={}, incoming_total={}, spend_status={}",
+                summary.found,
+                status.scanned,
+                status.tracked,
+                status.incoming_total,
+                status.spend_status
+            ),
+            "outgoing" => println!(
+                "Watch sync: {} new outgoing notes, cursor={}, tracked={}, outgoing_total={}, spend_status={}",
+                summary.found,
+                status.scanned,
+                status.tracked,
+                status.outgoing_total,
+                status.spend_status
+            ),
+            _ => println!(
+                "Watch sync: {} new records, cursor={}, tracked={}",
+                summary.found, status.scanned, status.tracked
+            ),
+        }
     }
     Ok(())
 }
@@ -3679,11 +3872,20 @@ fn cmd_watch_sync_watch(
 
 fn cmd_watch_show(path: &str) -> Result<(), String> {
     let watch = load_watch_wallet(path)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&watch.status())
-            .map_err(|e| format!("serialize watch status: {}", e))?
-    );
+    let status = watch.status();
+    if json_mode() {
+        // Upstream patch ①.
+        user_json_put(
+            "status",
+            serde_json::to_value(&status).unwrap_or(serde_json::Value::Null),
+        );
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status)
+                .map_err(|e| format!("serialize watch status: {}", e))?
+        );
+    }
     Ok(())
 }
 
@@ -5924,11 +6126,26 @@ fn cmd_balance(path: &str) -> Result<(), String> {
 
 fn cmd_user_balance(path: &str) -> Result<(), String> {
     let w = load_wallet(path)?;
-    println!("Private available: {}", w.available_balance());
-    println!("Private tracked total: {}", w.balance());
-    println!("Private pending outgoing: {}", w.pending_outgoing_balance());
-    println!("Tracked notes: {}", w.notes.len());
-    println!("Pending operations: {}", w.pending_spends.len());
+    user_out!(
+        json: { "private_available" => w.available_balance() },
+        human: "Private available: {}", w.available_balance()
+    );
+    user_out!(
+        json: { "private_tracked_total" => w.balance() },
+        human: "Private tracked total: {}", w.balance()
+    );
+    user_out!(
+        json: { "private_pending_outgoing" => w.pending_outgoing_balance() },
+        human: "Private pending outgoing: {}", w.pending_outgoing_balance()
+    );
+    user_out!(
+        json: { "tracked_notes" => w.notes.len() },
+        human: "Tracked notes: {}", w.notes.len()
+    );
+    user_out!(
+        json: { "pending_operations" => w.pending_spends.len() },
+        human: "Pending operations: {}", w.pending_spends.len()
+    );
 
     let profile_path = default_network_profile_path(path);
     if profile_path.exists() {
@@ -5949,22 +6166,33 @@ fn cmd_user_balance(path: &str) -> Result<(), String> {
                     .unwrap_or(0)
             })
             .sum::<u64>();
-        println!(
-            "Public rollup balance ({}): {}",
+        user_out!(
+            json: {
+                "public_rollup_account" => &public_account,
+                "public_rollup_balance" => public_balance,
+            },
+            human: "Public rollup balance ({}): {}",
             public_account, public_balance
         );
         if let Some((legacy_label, legacy_balance)) = legacy_public_balance {
             if legacy_balance > 0 {
-                println!(
-                    "Legacy unowned public balance ({}): {}",
+                user_out!(
+                    json: {
+                        "legacy_public_account" => &legacy_label,
+                        "legacy_public_balance" => legacy_balance,
+                    },
+                    human: "Legacy unowned public balance ({}): {}",
                     legacy_label, legacy_balance
                 );
             }
         }
-        println!(
-            "Secret-bound deposit balance: {} across {} pending deposits",
-            pending_deposit_balance,
-            w.pending_deposits.len()
+        user_out!(
+            json: {
+                "secret_bound_deposit_balance" => pending_deposit_balance,
+                "pending_deposits_count" => w.pending_deposits.len(),
+            },
+            human: "Secret-bound deposit balance: {} across {} pending deposits",
+            pending_deposit_balance, w.pending_deposits.len()
         );
     }
     Ok(())
@@ -5994,49 +6222,84 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
         })
         .sum::<u64>();
 
-    println!("Wallet file: {}", path);
-    println!("Network: {}", profile.network);
-    println!("Rollup head: {}", head_hash);
-    println!("Auth domain: {}", short(&auth_domain));
-    println!("Tree size: {}", tree_size);
-    println!(
-        "Current required burn fee: {} mutez ({} tez)",
-        required_tx_fee,
-        mutez_to_tez_string(required_tx_fee)
+    user_out!(json: { "wallet_file" => path }, human: "Wallet file: {}", path);
+    user_out!(
+        json: { "network" => &profile.network },
+        human: "Network: {}", profile.network
     );
-    println!(
-        "Local wallet: notes={}, pending={}, scanned={}",
-        wallet.notes.len(),
-        wallet.pending_spends.len(),
-        wallet.scanned
+    user_out!(
+        json: { "rollup_head" => &head_hash },
+        human: "Rollup head: {}", head_hash
     );
-    println!(
-        "Public rollup balance ({}): {}",
+    user_out!(
+        json: { "auth_domain" => short(&auth_domain) },
+        human: "Auth domain: {}", short(&auth_domain)
+    );
+    user_out!(
+        json: { "tree_size" => tree_size },
+        human: "Tree size: {}", tree_size
+    );
+    user_out!(
+        json: {
+            "required_tx_fee_mutez" => required_tx_fee,
+            "required_tx_fee_tez" => mutez_to_tez_string(required_tx_fee),
+        },
+        human: "Current required burn fee: {} mutez ({} tez)",
+        required_tx_fee, mutez_to_tez_string(required_tx_fee)
+    );
+    user_out!(
+        json: {
+            "local_notes" => wallet.notes.len(),
+            "local_pending" => wallet.pending_spends.len(),
+            "local_scanned" => wallet.scanned,
+        },
+        human: "Local wallet: notes={}, pending={}, scanned={}",
+        wallet.notes.len(), wallet.pending_spends.len(), wallet.scanned
+    );
+    user_out!(
+        json: {
+            "public_rollup_account" => &public_account,
+            "public_rollup_balance" => public_balance,
+        },
+        human: "Public rollup balance ({}): {}",
         public_account, public_balance
     );
     if let Some((legacy_label, legacy_balance)) = legacy_public_balance {
         if legacy_balance > 0 {
-            println!(
-                "Legacy unowned public balance ({}): {}",
+            user_out!(
+                json: {
+                    "legacy_public_account" => &legacy_label,
+                    "legacy_public_balance" => legacy_balance,
+                },
+                human: "Legacy unowned public balance ({}): {}",
                 legacy_label, legacy_balance
             );
         }
     }
-    println!(
-        "Secret-bound deposit balance: {} across {} pending deposits",
-        pending_deposit_balance,
-        wallet.pending_deposits.len()
+    user_out!(
+        json: {
+            "secret_bound_deposit_balance" => pending_deposit_balance,
+            "pending_deposits_count" => wallet.pending_deposits.len(),
+        },
+        human: "Secret-bound deposit balance: {} across {} pending deposits",
+        pending_deposit_balance, wallet.pending_deposits.len()
     );
 
     if let Some(operator_url) = &profile.operator_url {
         let health_url = format!("{}/healthz", operator_url.trim_end_matches('/'));
         let health = get_text(&health_url)?;
-        println!("Operator health: {}", health.trim());
+        user_out!(
+            json: { "operator_health" => health.trim() },
+            human: "Operator health: {}", health.trim()
+        );
     } else {
-        println!("Operator health: not configured");
+        user_out!(
+            json: { "operator_health" => "not_configured" },
+            human: "Operator health: not configured"
+        );
     }
 
-    println!("Check passed");
+    user_out!(json: { "check_passed" => true }, human: "Check passed");
     Ok(())
 }
 
@@ -6065,8 +6328,18 @@ fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), Str
                 .unwrap_or(0)
         })
         .sum::<u64>();
-    println!(
-        "Synced: {} new notes, {} spent removed, {} pending confirmed, private_available={}, public_balance={}, secret_deposit_balance={}",
+    // Upstream patch ①.
+    user_out!(
+        json: {
+            "new_notes" => summary.found,
+            "spent_removed" => summary.spent,
+            "pending_confirmed" => summary.confirmed_pending,
+            "private_available" => w.available_balance(),
+            "public_balance" => public_balance,
+            "secret_deposit_balance" => pending_deposit_balance,
+            "public_rollup_account" => &profile.public_account,
+        },
+        human: "Synced: {} new notes, {} spent removed, {} pending confirmed, private_available={}, public_balance={}, secret_deposit_balance={}",
         summary.found,
         summary.spent,
         summary.confirmed_pending,
@@ -6083,10 +6356,19 @@ fn cmd_rollup_sync_watch(
     interval_secs: u64,
 ) -> Result<(), String> {
     let interval = std::time::Duration::from_secs(interval_secs.max(1));
-    println!(
-        "Watching rollup state every {}s. Press Ctrl-C to stop.",
-        interval.as_secs()
-    );
+    // Upstream patch ①: this is a loop; emit the banner on stderr when
+    // --json is set so automation callers see only per-iteration output.
+    if json_mode() {
+        eprintln!(
+            "Watching rollup state every {}s. Press Ctrl-C to stop.",
+            interval.as_secs()
+        );
+    } else {
+        println!(
+            "Watching rollup state every {}s. Press Ctrl-C to stop.",
+            interval.as_secs()
+        );
+    }
     loop {
         cmd_rollup_sync(path, profile)?;
         std::thread::sleep(interval);
@@ -6151,18 +6433,29 @@ fn cmd_bridge_deposit(
         pending.operation_hash = submission.operation_hash.clone();
     }
     save_wallet(path, &wallet)?;
-    println!(
-        "Submitted L1 bridge deposit of {} mutez for deposit {}",
-        amount,
-        deposit_id_hex(&deposit_id)
+    // Upstream patch ①.
+    let deposit_id_hex_str = deposit_id_hex(&deposit_id);
+    let next_step = "Run `tzel-wallet shield --amount ...` after the deposit is processed by the rollup.";
+    user_out!(
+        json: {
+            "amount" => amount,
+            "deposit_id" => &deposit_id_hex_str,
+            "operation_hash" => submission.operation_hash.clone(),
+            "output" => &submission.output,
+            "next_step" => next_step,
+        },
+        human: "Submitted L1 bridge deposit of {} mutez for deposit {}",
+        amount, deposit_id_hex_str
     );
-    if let Some(op_hash) = submission.operation_hash {
-        println!("Operation hash: {}", op_hash);
+    if !json_mode() {
+        if let Some(op_hash) = submission.operation_hash {
+            println!("Operation hash: {}", op_hash);
+        }
+        if !submission.output.is_empty() {
+            println!("{}", submission.output);
+        }
+        println!("{}", next_step);
     }
-    if !submission.output.is_empty() {
-        println!("{}", submission.output);
-    }
-    println!("Run `tzel-wallet shield --amount ...` after the deposit is processed by the rollup.");
     Ok(())
 }
 
@@ -6176,11 +6469,53 @@ fn cmd_operator_status(profile: &WalletNetworkProfile, submission_id: &str) -> R
         profile.operator_bearer_token.as_deref(),
         submission_id,
     )?;
-    println!("{}", format_rollup_submission(&resp.submission));
+    // Upstream patch ①.
+    if json_mode() {
+        user_json_put(
+            "submission",
+            serde_json::to_value(&resp.submission).unwrap_or(serde_json::Value::Null),
+        );
+        eprintln!("{}", format_rollup_submission(&resp.submission));
+    } else {
+        println!("{}", format_rollup_submission(&resp.submission));
+    }
     Ok(())
 }
 
 fn print_rollup_submission(submission: &RollupSubmissionReceipt) {
+    // Upstream patch ①: in --json mode these fields are merged into the
+    // caller's top-level result; the human-readable form still appears on
+    // stderr for progress visibility.
+    if json_mode() {
+        user_json_put(
+            "submission_id",
+            match &submission.submission_id {
+                Some(id) => serde_json::Value::String(id.clone()),
+                None => serde_json::Value::Null,
+            },
+        );
+        user_json_put(
+            "operation_hash",
+            match &submission.operation_hash {
+                Some(h) => serde_json::Value::String(h.clone()),
+                None => serde_json::Value::Null,
+            },
+        );
+        user_json_put(
+            "submission_output",
+            serde_json::Value::String(submission.output.clone()),
+        );
+        if let Some(submission_id) = &submission.submission_id {
+            eprintln!("Submission id: {}", submission_id);
+        }
+        if let Some(op_hash) = &submission.operation_hash {
+            eprintln!("Operation hash: {}", op_hash);
+        }
+        if !submission.output.is_empty() {
+            eprintln!("{}", submission.output);
+        }
+        return;
+    }
     if let Some(submission_id) = &submission.submission_id {
         println!("Submission id: {}", submission_id);
     }
@@ -6193,12 +6528,18 @@ fn print_rollup_submission(submission: &RollupSubmissionReceipt) {
 }
 
 fn print_rollup_sync_hint(submission: &RollupSubmissionReceipt) {
-    if submission.pending_dal {
-        println!(
-            "The operator has parked this message for DAL publication; wait for it to reach L1 before syncing."
-        );
+    let hint = if submission.pending_dal {
+        "The operator has parked this message for DAL publication; wait for it to reach L1 before syncing."
     } else {
-        println!("Run `tzel-wallet sync` after the rollup processes the message.");
+        "Run `tzel-wallet sync` after the rollup processes the message."
+    };
+    // Upstream patch ①.
+    if json_mode() {
+        user_json_put("pending_dal", serde_json::Value::Bool(submission.pending_dal));
+        user_json_put("sync_hint", serde_json::Value::String(hint.to_string()));
+        eprintln!("{}", hint);
+    } else {
+        println!("{}", hint);
     }
 }
 
@@ -6922,13 +7263,20 @@ fn cmd_shield_rollup(
 
     let kernel_req = shield_req_to_kernel(&req)?;
     let submission = rollup.submit_kernel_message(&KernelInboxMessage::Shield(kernel_req))?;
-    println!(
-        "Submitted shield of {} from deposit {} into note {} (fee {}, deposit balance before {})",
-        amount,
-        deposit_id_hex(&deposit_id),
-        short(&req.client_cm),
-        fee,
-        public_balance
+    // Upstream patch ①.
+    let deposit_id_hex_str = deposit_id_hex(&deposit_id);
+    let client_cm_hex = hex::encode(&req.client_cm);
+    user_out!(
+        json: {
+            "deposit_id" => &deposit_id_hex_str,
+            "amount" => amount,
+            "fee" => fee,
+            "dal_fee" => profile.dal_fee,
+            "client_cm" => &client_cm_hex,
+            "deposit_balance_before" => public_balance,
+        },
+        human: "Submitted shield of {} from deposit {} into note {} (fee {}, deposit balance before {})",
+        amount, deposit_id_hex_str, short(&req.client_cm), fee, public_balance
     );
     print_rollup_submission(&submission);
     print_rollup_sync_hint(&submission);
@@ -7127,6 +7475,8 @@ fn cmd_transfer_rollup(
     };
     let kernel_req = transfer_req_to_kernel(&req)?;
     let submission = rollup.submit_kernel_message(&KernelInboxMessage::Transfer(kernel_req))?;
+    // Upstream patch ①: pre-compute hex forms before nullifiers is moved.
+    let nullifiers_hex: Vec<String> = nullifiers.iter().map(hex::encode).collect();
     w.register_pending_spend(
         nullifiers,
         format!("transfer {}", amount),
@@ -7134,8 +7484,22 @@ fn cmd_transfer_rollup(
     );
     save_wallet(path, &w)?;
 
-    println!(
-        "Submitted transfer of {} with fee {} + dal fee {} and change {}",
+    // Upstream patch ①.
+    let cm_1_hex = hex::encode(&note_1.cm);
+    let cm_2_hex = hex::encode(&note_2.cm);
+    let cm_3_hex = hex::encode(&note_3.cm);
+    user_out!(
+        json: {
+            "amount" => amount,
+            "fee" => fee,
+            "dal_fee" => profile.dal_fee,
+            "change" => change,
+            "nullifiers" => nullifiers_hex,
+            "recipient_cm" => &cm_1_hex,
+            "change_cm" => &cm_2_hex,
+            "producer_cm" => &cm_3_hex,
+        },
+        human: "Submitted transfer of {} with fee {} + dal fee {} and change {}",
         amount, fee, profile.dal_fee, change
     );
     print_rollup_submission(&submission);
@@ -7339,6 +7703,8 @@ fn cmd_unshield_rollup(
     };
     let kernel_req = unshield_req_to_kernel(&req)?;
     let submission = rollup.submit_kernel_message(&KernelInboxMessage::Unshield(kernel_req))?;
+    // Upstream patch ①: pre-compute hex forms before nullifiers is moved.
+    let nullifiers_hex: Vec<String> = nullifiers.iter().map(hex::encode).collect();
     w.register_pending_spend(
         nullifiers,
         format!("unshield {}", amount),
@@ -7346,12 +7712,36 @@ fn cmd_unshield_rollup(
     );
     save_wallet(path, &w)?;
 
-    println!(
-        "Submitted unshield of {} to L1 recipient {} with fee {} + dal fee {}",
+    // Upstream patch ①: emit a structured envelope while preserving the new
+    // L1-recipient outbox/cementation wording introduced by the streamline-
+    // unshield-withdrawals rewrite.
+    let change_cm_hex = if change > 0 {
+        Some(hex::encode(&cm_change))
+    } else {
+        None
+    };
+    let outbox_note = "The L1 release now comes from this unshield via the normal smart-rollup outbox/cementation flow.";
+    user_out!(
+        json: {
+            "amount" => amount,
+            "fee" => fee,
+            "dal_fee" => profile.dal_fee,
+            "change" => change,
+            "recipient" => recipient,
+            "nullifiers" => nullifiers_hex,
+            "change_cm" => change_cm_hex,
+            "producer_cm" => hex::encode(&producer_note.cm),
+            "outbox_note" => outbox_note,
+        },
+        human: "Submitted unshield of {} to L1 recipient {} with fee {} + dal fee {}",
         amount, recipient, fee, profile.dal_fee
     );
     print_rollup_submission(&submission);
-    println!("The L1 release now comes from this unshield via the normal smart-rollup outbox/cementation flow.");
+    if json_mode() {
+        eprintln!("{}", outbox_note);
+    } else {
+        println!("{}", outbox_note);
+    }
     Ok(())
 }
 
