@@ -29,7 +29,7 @@ use tezos_smart_rollup_encoding::{
     outbox::{OutboxMessage as TezosOutboxMessage, OutboxMessageTransaction},
 };
 use tzel_core::{
-    apply_deposit, apply_shield, apply_transfer, apply_unshield, apply_withdraw,
+    apply_deposit, apply_shield, apply_transfer, apply_unshield,
     canonical_wire::{decode_published_note, encode_published_note},
     default_auth_domain, hash, hash_merkle,
     kernel_wire::{
@@ -42,7 +42,7 @@ use tzel_core::{
         KERNEL_BRIDGE_CONFIG_KEY_INDEX, KERNEL_VERIFIER_CONFIG_KEY_INDEX,
     },
     required_tx_fee_for_private_tx_count, verify_wots_signature_against_leaf, EncryptedNote,
-    Ledger, LedgerState, WithdrawalRecord, DEPTH, F, ZERO,
+    Ledger, LedgerState, WithdrawResp, WithdrawalRecord, DEPTH, F, ZERO,
 };
 #[cfg(any(test, debug_assertions))]
 use tzel_core::{auth_leaf_hash, derive_auth_pub_seed};
@@ -1003,28 +1003,9 @@ fn apply_kernel_message<H: Host>(
         }
         KernelInboxMessage::Withdraw(req) => {
             let host_req = kernel_withdraw_req_to_host(&req);
-            if tzel_core::is_deposit_balance_key(&host_req.sender) {
-                return Err(
-                    "cannot withdraw from a secret-bound deposit balance; shield it first".into(),
-                );
-            }
-            let ticketer = ledger
-                .read_string(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)?
-                .ok_or_else(|| "bridge ticketer is not configured".to_string())?;
-            let balance = ledger.balance(&host_req.sender)?;
-            if balance < host_req.amount {
-                return Err("insufficient balance".into());
-            }
-            let outbox = encode_withdrawal_outbox_message(
-                &ticketer,
-                &WithdrawalRecord {
-                    recipient: host_req.recipient.clone(),
-                    amount: host_req.amount,
-                },
-            )?;
-            ledger.host.write_output(&outbox)?;
-            let resp = apply_withdraw(ledger, &host_req)?;
-            Ok(KernelResult::Withdraw(resp))
+            let prepared = prepare_withdraw(ledger, &host_req)?;
+            ledger.host.write_output(&prepared.outbox)?;
+            commit_withdraw(ledger, &host_req, prepared)
         }
         KernelInboxMessage::DalPointer(pointer) => {
             let nested = fetch_kernel_message_from_dal(ledger.host, &pointer)?;
@@ -1034,6 +1015,72 @@ fn apply_kernel_message<H: Host>(
             apply_kernel_message(ledger, nested)
         }
     }
+}
+
+struct PreparedWithdraw {
+    outbox: Vec<u8>,
+    withdrawal_index: u64,
+    balance_after: u64,
+    new_balance_account_index: Option<u64>,
+}
+
+fn prepare_withdraw<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    req: &tzel_core::WithdrawReq,
+) -> Result<PreparedWithdraw, String> {
+    if tzel_core::is_deposit_balance_key(&req.sender) {
+        return Err("cannot withdraw from a secret-bound deposit balance; shield it first".into());
+    }
+    let ticketer = ledger
+        .read_string(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)?
+        .ok_or_else(|| "bridge ticketer is not configured".to_string())?;
+    let balance = ledger.balance(&req.sender)?;
+    if balance < req.amount {
+        return Err("insufficient balance".into());
+    }
+    let balance_path = balance_path(&req.sender);
+    let new_balance_account_index = if ledger.host.read_store(&balance_path, 8).is_none() {
+        Some(ledger.read_u64(PATH_BALANCE_ACCOUNT_COUNT)?.unwrap_or(0))
+    } else {
+        None
+    };
+    let withdrawal_index = ledger.read_u64(PATH_WITHDRAWAL_COUNT)?.unwrap_or(0);
+    let outbox = encode_withdrawal_outbox_message(
+        &ticketer,
+        &WithdrawalRecord {
+            recipient: req.recipient.clone(),
+            amount: req.amount,
+        },
+    )?;
+    Ok(PreparedWithdraw {
+        outbox,
+        withdrawal_index,
+        balance_after: balance - req.amount,
+        new_balance_account_index,
+    })
+}
+
+fn commit_withdraw<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    req: &tzel_core::WithdrawReq,
+    prepared: PreparedWithdraw,
+) -> Result<KernelResult, String> {
+    ledger.write_withdrawal_at_index(
+        prepared.withdrawal_index,
+        &WithdrawalRecord {
+            recipient: req.recipient.clone(),
+            amount: req.amount,
+        },
+    );
+    ledger.write_u64(PATH_WITHDRAWAL_COUNT, prepared.withdrawal_index + 1);
+    if let Some(index) = prepared.new_balance_account_index {
+        ledger.write_account_key_at_index(index, &req.sender);
+        ledger.write_u64(PATH_BALANCE_ACCOUNT_COUNT, index + 1);
+    }
+    ledger.write_u64(&balance_path(&req.sender), prepared.balance_after);
+    let withdrawal_index = usize::try_from(prepared.withdrawal_index)
+        .map_err(|_| "withdrawal index does not fit in usize".to_string())?;
+    Ok(KernelResult::Withdraw(WithdrawResp { withdrawal_index }))
 }
 
 fn process_input<H: Host>(host: &mut H, input: &InputMessage) {
@@ -2645,6 +2692,44 @@ mod tests {
         assert!(host.outputs.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => assert!(message.contains("outbox full")),
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn malformed_withdrawal_counter_does_not_emit_outbox() {
+        let mut host = MockHost::default();
+        install_test_bridge(&mut host);
+        {
+            let mut state = DurableLedgerState::new(&mut host).unwrap();
+            apply_deposit(&mut state, "bob", 44).unwrap();
+        }
+        host.write_store(PATH_WITHDRAWAL_COUNT, &[0xAA; 7]);
+
+        let message =
+            encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(KernelWithdrawReq {
+                sender: "bob".into(),
+                recipient: sample_l1_receiver().into(),
+                amount: 33,
+            }))
+            .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 6,
+            id: 31,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.balances.get("bob"), Some(&44));
+        assert!(ledger.withdrawals.is_empty());
+        assert!(host.outputs.is_empty());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("bad u64"));
+                assert!(message.contains("/tzel/v1/state/withdrawals/count"));
+            }
             other => panic!("unexpected rollup result: {:?}", other),
         }
     }
