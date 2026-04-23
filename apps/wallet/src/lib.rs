@@ -3393,6 +3393,18 @@ enum UserCmd {
         /// L1 mutez to credit to the pool.
         #[arg(long)]
         amount: u64,
+        /// Emit the Michelson parameters for the bridge deposit call instead of
+        /// broadcasting it via octez-client. The caller is responsible for
+        /// signing + broadcasting the operation (e.g. via Temple wallet over
+        /// Beacon SDK). The pending deposit entry is still saved to wallet.json
+        /// so subsequent `--json` reads and `shield` can find it.
+        ///
+        /// Emits JSON under the `--json` envelope with fields:
+        ///   bridge_contract, entrypoint, params, deposit_id, amount, pending_saved.
+        /// Without `--json`, prints human-readable lines; machine callers
+        /// should always combine `--json --prepare-only`.
+        #[arg(long)]
+        prepare_only: bool,
     },
     /// Reconstruct `PendingDeposit` entries from the seed alone after a
     /// wallet-file loss. For each candidate `(address_index,
@@ -3725,9 +3737,12 @@ fn run_user(cli: UserCli) -> Result<(), String> {
             let profile = load_required_network_profile(&cli.wallet)?;
             cmd_wallet_check(&cli.wallet, &profile)
         }
-        UserCmd::Deposit { amount } => {
+        UserCmd::Deposit {
+            amount,
+            prepare_only,
+        } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            cmd_bridge_deposit(&cli.wallet, &profile, amount)
+            cmd_bridge_deposit(&cli.wallet, &profile, amount, prepare_only)
         }
         UserCmd::RecoverDeposits {
             max_address_index,
@@ -7518,6 +7533,29 @@ fn select_pending_deposit_by_pubkey_hash<'a>(
         })
 }
 
+/// Build the Michelson micheline-JSON argument for the bridge ticketer's
+/// `mint` entrypoint. Matches `RollupRpc::deposit_to_bridge` which passes
+/// the equivalent textual expression:
+///     `Pair 0x<recipient_hex> "<rollup_address>"`
+///
+/// The recipient is the ASCII-encoded `deposit:<hex>` durable-state key built
+/// via `deposit_recipient_string`; the rollup address is the kernel-receiver
+/// `sr1…` address. Temple / Beacon SDK accepts micheline JSON for
+/// `parameters.value`, so we emit that shape directly. (Upstream patch ③.)
+fn deposit_mint_michelson_params(
+    pubkey_hash: &F,
+    rollup_address: &str,
+) -> serde_json::Value {
+    let recipient = deposit_recipient_string(pubkey_hash);
+    serde_json::json!({
+        "prim": "Pair",
+        "args": [
+            { "bytes": hex::encode(recipient.as_bytes()) },
+            { "string": rollup_address },
+        ],
+    })
+}
+
 /// Derive a deterministic blinding factor for a fresh deposit pool.
 /// The blind is `H("tzel-deposit-blind", master_sk, address_index,
 /// deposit_nonce)`, so the *blind itself* is recoverable from the
@@ -7548,6 +7586,7 @@ fn cmd_bridge_deposit(
     path: &str,
     profile: &WalletNetworkProfile,
     amount: u64,
+    prepare_only: bool,
 ) -> Result<(), String> {
     let rollup = RollupRpc::new(profile);
     let head_hash = rollup.head_hash()?;
@@ -7609,6 +7648,45 @@ fn cmd_bridge_deposit(
     };
     wallet.pending_deposits.push(pending);
     save_wallet(path, &wallet)?;
+
+    if prepare_only {
+        // Upstream patch ③. Emit the Michelson parameters instead of driving
+        // octez-client. The caller (e.g. tzel-wallet-daemon) will pass them
+        // to a browser-side signer (Temple/Beacon), wait for broadcast, and
+        // POST the resulting op_hash to /api/deposit/submitted.
+        //
+        // Pool-model adaptation: the deposit identifier is now `pubkey_hash`,
+        // not the legacy per-secret `deposit_id`. The rollup recipient string
+        // is `deposit_recipient_string(pubkey_hash)` ⇒ `deposit:<hex>`, which
+        // is exactly what the bridge ticketer's `mint` entrypoint expects.
+        let pubkey_hash_hex_str = pubkey_hash_hex(&pubkey_hash);
+        let params = deposit_mint_michelson_params(&pubkey_hash, &profile.rollup_address);
+        user_out!(
+            json: {
+                "bridge_contract" => &profile.bridge_ticketer,
+                "entrypoint" => "mint",
+                "params" => params.clone(),
+                "pubkey_hash" => &pubkey_hash_hex_str,
+                "amount" => amount,
+                "pending_saved" => true,
+            },
+            human: "Prepared bridge deposit of {} mutez for pool {} (not submitted)",
+            amount, pubkey_hash_hex_str
+        );
+        if !json_mode() {
+            println!("bridge_contract: {}", profile.bridge_ticketer);
+            println!("entrypoint:      mint");
+            println!(
+                "params:          {}",
+                serde_json::to_string(&params).unwrap_or_default()
+            );
+            println!(
+                "Caller must sign + broadcast the operation (e.g. via Temple) \
+                 and then notify the daemon via POST /api/deposit/submitted."
+            );
+        }
+        return Ok(());
+    }
 
     let submission = rollup.deposit_to_bridge(&pubkey_hash, amount)?;
     if let Some(p) = wallet
