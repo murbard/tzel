@@ -537,13 +537,59 @@ mod tests {
     /// these tests (we're testing the ledger's validation, not STARK crypto).
     fn fake_stark(mut output_preimage: Vec<F>) -> Proof {
         let auth_domain = default_auth_domain();
-        if output_preimage.len() >= 6 && output_preimage.first() != Some(&auth_domain) {
+        // Flat transfer/unshield public outputs include auth_domain as the first
+        // felt; flat shield public outputs do not. Bootloader-wrapped outputs
+        // already carry their own structure and must stay untouched.
+        if output_preimage.len() >= 9
+            && output_preimage.first() != Some(&auth_domain)
+            && parse_single_task_output_preimage(&output_preimage).is_err()
+        {
             output_preimage.insert(0, auth_domain);
         }
         Proof::Stark {
             proof_bytes: vec![0xDE; 128], // non-empty garbage
             output_preimage,
         }
+    }
+
+    fn stark_output_preimage(proof: &Proof) -> &[F] {
+        match proof {
+            Proof::Stark {
+                proof_bytes: _,
+                output_preimage,
+            } => output_preimage,
+            Proof::TrustMeBro => panic!("expected Stark proof"),
+        }
+    }
+
+    #[test]
+    fn test_fake_stark_keeps_flat_shield_public_outputs_unprefixed() {
+        let preimage = vec![u(1), u(2), u(3), u(4), u(5), u(6), u(7), u(8)];
+
+        let proof = fake_stark(preimage.clone());
+
+        assert_eq!(stark_output_preimage(&proof), preimage.as_slice());
+    }
+
+    #[test]
+    fn test_fake_stark_prefixes_auth_domain_for_flat_transfer_like_outputs() {
+        let auth_domain = default_auth_domain();
+        let preimage = vec![u(10), u(11), u(12), u(13), u(14), u(15), u(16), u(17), u(18)];
+
+        let proof = fake_stark(preimage.clone());
+        let output_preimage = stark_output_preimage(&proof);
+
+        assert_eq!(output_preimage[0], auth_domain);
+        assert_eq!(&output_preimage[1..], preimage.as_slice());
+    }
+
+    #[test]
+    fn test_fake_stark_does_not_prefix_bootloader_wrapped_outputs() {
+        let wrapped = vec![u(1), u(5), u(12345), u(11), u(22), u(33)];
+
+        let proof = fake_stark(wrapped.clone());
+
+        assert_eq!(stark_output_preimage(&proof), wrapped.as_slice());
     }
 
     /// Helper: set up a ledger with one shielded note, return (ledger, cm, nf, root, enc).
