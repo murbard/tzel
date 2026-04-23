@@ -2829,6 +2829,10 @@ struct ProveConfig {
     skip_proof: bool,
     reprove_bin: String,
     executables_dir: String,
+    /// Upstream patch ②: when set, the CLI delegates proof generation to an
+    /// HTTP proving-service (POST /v1/jobs + long-poll) instead of spawning
+    /// `reprove` as a subprocess.
+    proving_service_url: Option<String>,
 }
 
 impl ProveConfig {
@@ -2839,6 +2843,14 @@ impl ProveConfig {
                 "WARNING: Transaction has NO cryptographic guarantee. DO NOT use in production."
             );
             Ok(Proof::TrustMeBro)
+        } else if let Some(url) = &self.proving_service_url {
+            generate_proof_via_service(
+                url,
+                &self.reprove_bin,
+                &self.executables_dir,
+                circuit,
+                args,
+            )
         } else {
             generate_proof(&self.reprove_bin, &self.executables_dir, circuit, args)
         }
@@ -2863,6 +2875,7 @@ fn run(cli: Cli) -> Result<(), String> {
         skip_proof: cli.trust_me_bro,
         reprove_bin: cli.reprove_bin,
         executables_dir: cli.executables_dir,
+        proving_service_url: None,
     };
     match cli.cmd {
         Cmd::Keygen => cmd_keygen(&cli.wallet),
@@ -3315,6 +3328,9 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         skip_proof: false,
         reprove_bin: cli.reprove_bin,
         executables_dir: cli.executables_dir,
+        // Upstream patch ②: propagate --proving-service-url (declared by
+        // patch ① on UserCli) into ProveConfig.
+        proving_service_url: cli.proving_service_url,
     };
 
     // Name of the subcommand — used as the `command` field of the JSON
@@ -3627,6 +3643,279 @@ fn generate_proof(
         proof_bytes: bundle.proof_bytes,
         output_preimage: bundle.output_preimage,
     })
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Proving via HTTP proving-service (upstream patch ②)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// POST the witness to a proving-service endpoint and long-poll until the
+// proof bundle is ready. Returns a `Proof::Stark` equivalent to what
+// `generate_proof` returns when spawning `reprove` locally.
+//
+// API contract (see tzel-infra/docs/proving-service-api.md):
+//   POST {url}/v1/jobs    {"program_hash": "<64-hex>", "arguments": [...]}
+//     → 202 {"job_id": "...", "status": "queued", ...}
+//   GET  {url}/v1/jobs/{id}?wait=30
+//     → 200 {"status": "queued|running|done|failed", "proof_bundle": {...}, ...}
+//
+// The `program_hash` is computed locally by invoking `reprove --program-hash`
+// — the reprove binary is still required at runtime to derive the hash for
+// the specific cairo executable. Deferring this to the service would
+// require the service to know which executable corresponds to which
+// `circuit` name, which is a premature coupling.
+//
+// HTTP transport uses `ureq` (already a wallet dep — same crate that
+// powers `get_text`, `get_json`, `post_json` above) with explicit
+// per-request timeouts to match the CLI-wide liveness story:
+//   - connect timeout  5 s — slow DNS / unreachable host fails fast
+//   - global  timeout 35 s — per call, covering ?wait=30 long-poll + slack
+//
+// The poll loop is capped at `PROVING_SERVICE_POLL_CAP` iterations × 30 s
+// per wait = documented worst-case ceiling below.
+
+/// Max number of 30-second long-poll iterations before we give up on a job.
+/// 60 × 30 s = 30 min worst-case before the CLI aborts with a timeout
+/// error. This is deliberately generous: shield proofs typically complete
+/// in 30-60 s, but shadownet retry backoffs can push a job into minutes.
+const PROVING_SERVICE_POLL_CAP: usize = 60;
+
+/// Number of consecutive polls returning `status:"unknown"` before we
+/// abort — a healthy service never reports this.
+const PROVING_SERVICE_MAX_UNKNOWN: usize = 3;
+
+/// Per-request connect timeout.
+const PROVING_SERVICE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Per-request global timeout. Must be > long-poll `wait` so the server
+/// has a chance to respond before the client side aborts.
+const PROVING_SERVICE_GLOBAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(35);
+
+fn generate_proof_via_service(
+    service_url: &str,
+    reprove_bin: &str,
+    executables_dir: &str,
+    circuit: &str,
+    args: &[String],
+) -> Result<Proof, String> {
+    // Resolve program_hash by querying the proving-service's program
+    // registry (`GET /v1/programs`). This avoids requiring the CLI's
+    // environment to have the cairo executables at `{executables_dir}/
+    // {circuit}.executable.json`: when the daemon spawns the CLI as a
+    // subprocess with only `--proving-service-url` set, it does not also
+    // pass `--executables-dir`, so the legacy local-hash path fails with
+    // a spurious "Failed to open file" error before the HTTP POST runs.
+    //
+    // Falls back to the local `reprove --program-hash` path if the service
+    // does not expose `/v1/programs` or the circuit is not registered.
+    let program_hash = match resolve_program_hash_via_service(service_url, circuit) {
+        Ok(hash) => hash,
+        Err(e) => {
+            eprintln!(
+                "proving-service: /v1/programs lookup failed ({}), falling back to local reprove --program-hash",
+                e
+            );
+            let executable = format!("{}/{}.executable.json", executables_dir, circuit);
+            compute_program_hash(reprove_bin, &executable)?
+        }
+    };
+
+    let url = format!("{}/v1/jobs", service_url.trim_end_matches('/'));
+    let body = serde_json::json!({
+        "program_hash": program_hash,
+        "arguments": args,
+    });
+    eprintln!(
+        "Generating proof for {} ({} args) via proving-service {}...",
+        circuit,
+        args.len(),
+        service_url
+    );
+
+    let submit = http_post_json(&url, &body)
+        .map_err(|e| format!("proving-service submit failed: {} (url={})", e, url))?;
+    let job_id = submit
+        .get("job_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("proving-service: POST {} missing job_id", url))?
+        .to_string();
+
+    let poll_url_base = format!("{}/v1/jobs/{}", service_url.trim_end_matches('/'), job_id);
+    // Long-poll cap: PROVING_SERVICE_POLL_CAP × 30 s wait = documented
+    // worst-case ceiling. Each call has an independent 35 s client-side
+    // timeout so a stalled server can't wedge the CLI.
+    //
+    // The proving-service's GET /v1/jobs/{id}?wait=N only actually blocks
+    // when the client passes `if_state_changed_from=<last-seen-status>`
+    // (see services/proving-service/src/registry.rs::long_poll — without
+    // the reference state, the handler short-circuits and returns
+    // immediately). We track the last status we observed and feed it back
+    // on each iteration so 60 iterations × 30 s really is ~30 min of
+    // wall time, not ~30 ms of tight polling.
+    let mut consecutive_unknown = 0usize;
+    let mut last_status: Option<&'static str> = None;
+    for _ in 0..PROVING_SERVICE_POLL_CAP {
+        let poll_url = match last_status {
+            Some(s) => format!("{}?wait=30&if_state_changed_from={}", poll_url_base, s),
+            None => format!("{}?wait=30", poll_url_base),
+        };
+        let resp = http_get_json(&poll_url)
+            .map_err(|e| format!("proving-service poll failed: {} (url={})", e, poll_url))?;
+        let status = resp
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        match status {
+            "done" => {
+                let bundle_value = resp.get("proof_bundle").ok_or_else(|| {
+                    "proving-service: done response missing proof_bundle".to_string()
+                })?;
+                let bundle: VerifyProofBundle = serde_json::from_value(bundle_value.clone())
+                    .map_err(|e| format!("parse proof bundle: {}", e))?;
+                eprintln!(
+                    "Proof generated: {} KB, {} public outputs",
+                    bundle.proof_bytes.len() / 1024,
+                    bundle.output_preimage.len()
+                );
+                return Ok(Proof::Stark {
+                    proof_bytes: bundle.proof_bytes,
+                    output_preimage: bundle.output_preimage,
+                });
+            }
+            "failed" => {
+                let err = resp
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("unknown");
+                return Err(format!("proving-service reported failure: {}", err));
+            }
+            "queued" => {
+                consecutive_unknown = 0;
+                last_status = Some("queued");
+                continue;
+            }
+            "running" => {
+                consecutive_unknown = 0;
+                last_status = Some("running");
+                continue;
+            }
+            "unknown" => {
+                consecutive_unknown += 1;
+                if consecutive_unknown >= PROVING_SERVICE_MAX_UNKNOWN {
+                    return Err(format!(
+                        "proving-service: job {} stuck reporting status=unknown for {} consecutive polls",
+                        job_id, consecutive_unknown,
+                    ));
+                }
+                continue;
+            }
+            other => {
+                return Err(format!("proving-service: unknown status '{}'", other));
+            }
+        }
+    }
+    Err(format!(
+        "proving-service: job {} did not complete within poll budget ({} iterations × 30 s wait)",
+        job_id, PROVING_SERVICE_POLL_CAP,
+    ))
+}
+
+/// Query the proving-service's program registry (`GET /v1/programs`) and
+/// return the `program_hash` whose `name` matches `circuit`. The
+/// proving-service strips `.executable.json` from the filename stem, so
+/// `circuit = "run_shield"` matches a registered program at
+/// `…/run_shield.executable.json`.
+///
+/// This is the preferred way to resolve the hash in daemon / container
+/// environments where the CLI does not have access to the cairo
+/// executables on disk. Falls through to the caller's `reprove
+/// --program-hash` path on any error (network failure, non-2xx, empty
+/// result, or unknown circuit).
+fn resolve_program_hash_via_service(service_url: &str, circuit: &str) -> Result<String, String> {
+    let url = format!("{}/v1/programs", service_url.trim_end_matches('/'));
+    let resp = http_get_json(&url)
+        .map_err(|e| format!("GET {} failed: {}", url, e))?;
+    let programs = resp
+        .get("programs")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| format!("GET {}: response missing 'programs' array", url))?;
+    for prog in programs {
+        let name = prog.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if name == circuit {
+            let hash = prog
+                .get("program_hash")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    format!("GET {}: program {} missing program_hash", url, circuit)
+                })?;
+            return Ok(hash.to_string());
+        }
+    }
+    Err(format!(
+        "proving-service has no registered program named '{}' (found {} programs)",
+        circuit,
+        programs.len()
+    ))
+}
+
+fn compute_program_hash(reprove_bin: &str, executable: &str) -> Result<String, String> {
+    let out = std::process::Command::new(reprove_bin)
+        .arg(executable)
+        .arg("--program-hash")
+        .output()
+        .map_err(|e| format!("reprove --program-hash failed to start: {}", e))?;
+    if !out.status.success() {
+        return Err(format!(
+            "reprove --program-hash failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// HTTP JSON POST via `ureq` — the wallet CLI already depends on ureq
+/// (see `post_json`, `get_text` above). Adds explicit connect + global
+/// timeouts so a stalled proving-service cannot wedge the CLI. Non-2xx
+/// responses are surfaced as errors (no retry at this layer — the caller
+/// does the long-polling).
+fn http_post_json(url: &str, body: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let req = ureq::post(url)
+        .config()
+        .timeout_connect(Some(PROVING_SERVICE_CONNECT_TIMEOUT))
+        .timeout_global(Some(PROVING_SERVICE_GLOBAL_TIMEOUT))
+        .build();
+    let resp = req
+        .send_json(body.clone())
+        .map_err(|e| format!("HTTP POST error: {}", e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.into_body().read_to_string().unwrap_or_default();
+        return Err(format!("HTTP {}: {}", status, body));
+    }
+    resp.into_body()
+        .read_json()
+        .map_err(|e| format!("parse response: {}", e))
+}
+
+/// HTTP JSON GET via `ureq`, with the same timeout discipline as
+/// `http_post_json`. Matches the error semantics of upstream's `get_text`
+/// so failures surface consistently across the CLI.
+fn http_get_json(url: &str) -> Result<serde_json::Value, String> {
+    let req = ureq::get(url)
+        .config()
+        .timeout_connect(Some(PROVING_SERVICE_CONNECT_TIMEOUT))
+        .timeout_global(Some(PROVING_SERVICE_GLOBAL_TIMEOUT))
+        .build();
+    let resp = req.call().map_err(|e| format!("HTTP GET error: {}", e))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.into_body().read_to_string().unwrap_or_default();
+        return Err(format!("HTTP {}: {}", status, body));
+    }
+    resp.into_body()
+        .read_json()
+        .map_err(|e| format!("parse response: {}", e))
 }
 
 fn persist_wallet_and_make_proof(
@@ -5999,6 +6288,7 @@ mod tests {
             skip_proof: false,
             reprove_bin: "/definitely/missing/reprove".into(),
             executables_dir: "cairo/target/dev".into(),
+            proving_service_url: None,
         };
         let err =
             persist_wallet_and_make_proof(wallet_path_str, &loaded, &pc, "run_transfer", &args)
@@ -6040,6 +6330,7 @@ mod tests {
             skip_proof: false,
             reprove_bin: "/definitely/missing/reprove".into(),
             executables_dir: "cairo/target/dev".into(),
+            proving_service_url: None,
         };
         let err =
             persist_wallet_and_make_proof(wallet_path_str, &loaded, &pc, "run_unshield", &args)
@@ -8293,6 +8584,7 @@ mod network_profile_tests {
             skip_proof: false,
             reprove_bin: reprove.to_str().unwrap().into(),
             executables_dir: "cairo/target/dev".into(),
+            proving_service_url: None,
         };
         let recipient = "tz1LhXujSfRndomkcC64pCpkkjLWQwsmCUMk";
         let amount = note_value - MIN_TX_FEE - profile.dal_fee;
@@ -8960,6 +9252,7 @@ mod network_profile_tests {
             skip_proof: false,
             reprove_bin: "/definitely/missing/reprove".into(),
             executables_dir: "cairo/target/dev".into(),
+            proving_service_url: None,
         };
 
         let err = cmd_shield_rollup(
