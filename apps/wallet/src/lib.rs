@@ -2653,7 +2653,7 @@ enum Cmd {
         #[arg(long)]
         recipient: String,
     },
-    /// Fund a public address (calls ledger /fund)
+    /// Fund a local shield deposit label (calls ledger /fund)
     Fund {
         #[arg(short, long, default_value = "http://localhost:8080")]
         ledger: String,

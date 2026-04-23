@@ -18,6 +18,10 @@ type AppState = Arc<LedgerState>;
 
 #[derive(Parser)]
 struct Cli {
+    /// Interface to bind sp-ledger to. Defaults to loopback because /fund is demo-only.
+    #[arg(long, default_value = "127.0.0.1")]
+    listen: String,
+
     #[arg(short, long, default_value = "8080")]
     port: u16,
 
@@ -70,11 +74,6 @@ async fn fund_handler(
     State(st): State<AppState>,
     Json(req): Json<FundReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    if is_deposit_balance_key(&req.recipient) {
-        return Err(err(
-            "fund endpoint refuses secret-bound deposit key recipients".into(),
-        ));
-    }
     let mut ledger = st.ledger.lock().unwrap();
     ledger.fund(&req.recipient, req.amount).map_err(err)?;
     eprintln!("[fund] {} += {}", req.recipient, req.amount);
@@ -272,7 +271,14 @@ async fn main() {
         .route("/balances", get(balances_handler))
         .with_state(state);
 
-    let addr = format!("0.0.0.0:{}", cli.port);
+    let addr = format!("{}:{}", cli.listen, cli.port);
+    if !matches!(cli.listen.as_str(), "127.0.0.1" | "::1" | "localhost") {
+        eprintln!(
+            "WARNING: sp-ledger is binding to a non-loopback interface ({}). \
+             The /fund endpoint is demo-only and unauthenticated.",
+            cli.listen
+        );
+    }
     eprintln!("sp-ledger listening on {}", addr);
     let listener = TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -372,11 +378,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fund_handler_rejects_secret_bound_deposit_balances() {
+    async fn test_fund_handler_accepts_secret_bound_deposit_balances_for_local_shield_flow() {
         let st = test_state(default_auth_domain());
         let deposit_key = deposit_balance_key(&u64_to_felt(0xAB));
 
-        let err = fund_handler(
+        let _ = fund_handler(
             State(st.clone()),
             Json(FundReq {
                 recipient: deposit_key.clone(),
@@ -384,13 +390,24 @@ mod tests {
             }),
         )
         .await
-        .unwrap_err();
-
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(err.1.contains("secret-bound deposit key"));
+        .expect("deposit funding should remain available for local shield tests");
 
         let Json(resp) = balances_handler(State(st)).await;
-        assert!(resp.balances.get(&deposit_key).is_none());
+        assert_eq!(resp.balances.get(&deposit_key), Some(&55));
+    }
+
+    #[test]
+    fn test_cli_defaults_to_loopback_listen_address() {
+        let cli = Cli::parse_from(["sp-ledger"]);
+        assert_eq!(cli.listen, "127.0.0.1");
+        assert_eq!(cli.port, 8080);
+    }
+
+    #[test]
+    fn test_cli_accepts_custom_listen_address() {
+        let cli = Cli::parse_from(["sp-ledger", "--listen", "0.0.0.0", "--port", "9090"]);
+        assert_eq!(cli.listen, "0.0.0.0");
+        assert_eq!(cli.port, 9090);
     }
 
     #[tokio::test]
