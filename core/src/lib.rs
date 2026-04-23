@@ -1946,37 +1946,39 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
                     "Stark proof requires client_enc (cannot use server-generated note)".into(),
                 );
             }
-            if output_preimage.len() < 8 {
-                return Err("shield output_preimage too short".into());
+            let public_outputs = transition_public_outputs(output_preimage, 8)?;
+            if public_outputs.len() != 8 {
+                return Err(format!(
+                    "shield public output length mismatch: {} != 8",
+                    public_outputs.len()
+                ));
             }
-            let tail_start = output_preimage.len() - 8;
-            let tail = &output_preimage[tail_start..];
-            if tail[0] != u64_to_felt(req.v) {
+            if public_outputs[0] != u64_to_felt(req.v) {
                 return Err("proof note value mismatch".into());
             }
-            if tail[1] != u64_to_felt(req.fee) {
+            if public_outputs[1] != u64_to_felt(req.fee) {
                 return Err("proof fee mismatch".into());
             }
-            if tail[2] != u64_to_felt(req.producer_fee) {
+            if public_outputs[2] != u64_to_felt(req.producer_fee) {
                 return Err("proof producer_fee mismatch".into());
             }
-            if tail[3] != req.client_cm {
+            if public_outputs[3] != req.client_cm {
                 return Err("proof cm mismatch".into());
             }
-            if tail[4] != req.producer_cm {
+            if public_outputs[4] != req.producer_cm {
                 return Err("proof producer_cm mismatch".into());
             }
-            if tail[5] != req.deposit_id {
+            if public_outputs[5] != req.deposit_id {
                 return Err("proof deposit_id mismatch".into());
             }
             if let Some(ref enc) = req.client_enc {
                 let mh = memo_ct_hash(enc);
-                if tail[6] != mh {
+                if public_outputs[6] != mh {
                     return Err("proof memo_ct_hash mismatch".into());
                 }
             }
             let producer_mh = memo_ct_hash(producer_enc);
-            if tail[7] != producer_mh {
+            if public_outputs[7] != producer_mh {
                 return Err("proof producer memo_ct_hash mismatch".into());
             }
         }
@@ -3541,6 +3543,55 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("proof deposit_id mismatch"));
+        assert_eq!(
+            ledger.balance(&test_deposit_key("alice")).unwrap(),
+            125 + producer_fee + fee
+        );
+        assert!(ledger.memos.is_empty());
+    }
+
+    #[test]
+    fn test_apply_shield_rejects_extra_flat_public_outputs_even_if_tail_matches() {
+        let (_acc, addr, _dk_v, _dk_d, _nk_spend) = sample_address_bundle(0x92, 0);
+        let mut ledger = Ledger::new();
+        let fee = MIN_TX_FEE;
+        let producer_fee = 7;
+        ledger
+            .fund(&test_deposit_key("alice"), 125 + producer_fee + fee)
+            .unwrap();
+
+        let (enc, cm) = deterministic_note(&addr, 125, u(19), Some(b"shield"));
+        let (producer_enc, producer_cm) =
+            deterministic_note(&addr, producer_fee, u(20), Some(b"dal"));
+        let err = apply_shield(
+            &mut ledger,
+            &ShieldReq {
+                deposit_id: test_deposit_id("alice"),
+                fee,
+                v: 125,
+                producer_fee,
+                address: addr,
+                memo: None,
+                proof: fake_stark(vec![
+                    u(999),
+                    u(125),
+                    u(fee),
+                    u(producer_fee),
+                    cm,
+                    producer_cm,
+                    test_deposit_id("alice"),
+                    memo_ct_hash(&enc),
+                    memo_ct_hash(&producer_enc),
+                ]),
+                client_cm: cm,
+                client_enc: Some(enc),
+                producer_cm,
+                producer_enc: Some(producer_enc),
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("shield public output length mismatch"));
         assert_eq!(
             ledger.balance(&test_deposit_key("alice")).unwrap(),
             125 + producer_fee + fee
