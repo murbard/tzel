@@ -222,6 +222,11 @@ impl<'a, H: Host> DurableLedgerState<'a, H> {
             && self.read_u64(PATH_BALANCE_ACCOUNT_COUNT)?.unwrap_or(0) == 0)
     }
 
+    fn is_private_state_pristine(&self) -> Result<bool, String> {
+        Ok(self.read_u64(PATH_TREE_SIZE)?.unwrap_or(0) == 0
+            && self.read_u64(PATH_NULLIFIER_COUNT)?.unwrap_or(0) == 0)
+    }
+
     fn read_u64(&self, path: &[u8]) -> Result<Option<u64>, String> {
         match self.host.read_store(path, 8) {
             None => Ok(None),
@@ -1340,16 +1345,14 @@ fn configure_verifier<H: Host>(
     #[cfg(feature = "proof-verifier")]
     DirectProofVerifier::from_kernel_config(config)?;
 
-    if !ledger.is_pristine()? {
-        if let Some(existing) = read_verifier_config(ledger.host)? {
-            if existing != *config {
-                return Err(
-                    "cannot change verifier configuration after ledger state exists".into(),
-                );
-            }
-        } else {
-            return Err("cannot configure verifier after ledger state exists".into());
+    let existing = read_verifier_config(ledger.host)?;
+    if let Some(existing) = existing {
+        if existing != *config && !ledger.is_pristine()? {
+            return Err("cannot change verifier configuration after ledger state exists".into());
         }
+    } else if !ledger.is_private_state_pristine()? {
+        // Public bridge deposits are safe to precede the initial verifier config.
+        return Err("cannot configure verifier after private state exists".into());
     }
 
     ledger.write_felt(PATH_AUTH_DOMAIN, &config.auth_domain);
@@ -2952,6 +2955,39 @@ mod tests {
 
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(ledger.auth_domain, new_domain);
+        assert!(matches!(
+            read_last_result(&host).unwrap(),
+            KernelResult::Configured
+        ));
+    }
+
+    #[test]
+    fn configures_verifier_after_bridge_deposit_before_private_state_exists() {
+        let mut host = MockHost::default();
+        install_test_bridge(&mut host);
+        let deposit_key = deposit_balance_key(&deposit_id_from_label("alice"));
+        let config = KernelVerifierConfig {
+            auth_domain: sample_felt(0x57),
+            verified_program_hashes: sample_program_hashes(),
+        };
+
+        host.inputs.push_back(InputMessage {
+            level: 8,
+            id: 1,
+            payload: encode_ticket_deposit_message(&deposit_key, 12),
+        });
+        host.inputs.push_back(InputMessage {
+            level: 9,
+            id: 2,
+            payload: encode_kernel_inbox_message(&signed_verifier_message(config.clone()))
+                .unwrap(),
+        });
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(ledger.auth_domain, config.auth_domain);
+        assert_eq!(ledger.balances.get(&deposit_key), Some(&12));
         assert!(matches!(
             read_last_result(&host).unwrap(),
             KernelResult::Configured
