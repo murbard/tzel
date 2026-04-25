@@ -7,6 +7,9 @@ let json_list = function `List l -> l | _ -> failwith "expected list"
 let json_assoc = function `Assoc a -> a | _ -> failwith "expected assoc"
 let json_field key j = List.assoc key (json_assoc j)
 
+let withdrawal_list =
+  Alcotest.(list (pair string int64))
+
 let rec find_manifest_up dir remaining =
   let candidate = Filename.concat dir "Cargo.toml" in
   if Sys.file_exists candidate then Some candidate
@@ -120,12 +123,16 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
     (felt_of_hex (json_string (json_field "cm_fee" unshield)));
 
   let expected = json_field "expected" json in
-  Alcotest.(check int64) "alice balance"
-    (Int64.of_int (json_int (json_field "alice_public_balance" expected)))
-    (Tzel.Ledger.get_balance ledger "alice");
-  Alcotest.(check int64) "bob balance"
-    (Int64.of_int (json_int (json_field "bob_public_balance" expected)))
-    (Tzel.Ledger.get_balance ledger "bob");
+  let expected_withdrawals =
+    json_list (json_field "withdrawals" expected)
+    |> List.map (fun entry ->
+         let recipient = json_string (json_field "recipient" entry) in
+         let amount = Int64.of_int (json_int (json_field "amount" entry)) in
+         (recipient, amount))
+  in
+  Alcotest.(check withdrawal_list) "withdrawals"
+    expected_withdrawals
+    (Tzel.Ledger.withdrawals ledger);
   Alcotest.(check int) "tree size"
     (json_int (json_field "tree_size" expected))
     (Tzel.Ledger.tree_size ledger);

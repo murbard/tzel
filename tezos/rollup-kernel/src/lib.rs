@@ -29,20 +29,20 @@ use tezos_smart_rollup_encoding::{
     outbox::{OutboxMessage as TezosOutboxMessage, OutboxMessageTransaction},
 };
 use tzel_core::{
-    apply_deposit, apply_shield, apply_transfer, apply_unshield,
+    apply_deposit, apply_shield, apply_transfer,
     canonical_wire::{decode_published_note, encode_published_note},
     default_auth_domain, hash, hash_merkle,
     kernel_wire::{
         decode_kernel_inbox_message, decode_kernel_result, decode_kernel_verifier_config,
         encode_kernel_result, encode_kernel_verifier_config, kernel_bridge_config_sighash,
         kernel_shield_req_to_host, kernel_transfer_req_to_host, kernel_unshield_req_to_host,
-        kernel_verifier_config_sighash, kernel_withdraw_req_to_host, KernelBridgeConfig,
-        KernelDalPayloadKind, KernelDalPayloadPointer, KernelInboxMessage, KernelResult,
-        KernelSignedBridgeConfig, KernelSignedVerifierConfig, KernelVerifierConfig,
-        KERNEL_BRIDGE_CONFIG_KEY_INDEX, KERNEL_VERIFIER_CONFIG_KEY_INDEX,
+        kernel_verifier_config_sighash, KernelBridgeConfig, KernelDalPayloadKind,
+        KernelDalPayloadPointer, KernelInboxMessage, KernelResult, KernelSignedBridgeConfig,
+        KernelSignedVerifierConfig, KernelVerifierConfig, KERNEL_BRIDGE_CONFIG_KEY_INDEX,
+        KERNEL_VERIFIER_CONFIG_KEY_INDEX,
     },
-    required_tx_fee_for_private_tx_count, verify_wots_signature_against_leaf, EncryptedNote,
-    Ledger, LedgerState, WithdrawResp, WithdrawalRecord, DEPTH, F, ZERO,
+    prepare_unshield, required_tx_fee_for_private_tx_count, verify_wots_signature_against_leaf,
+    EncryptedNote, Ledger, LedgerState, UnshieldResp, WithdrawalRecord, DEPTH, F, ZERO,
 };
 #[cfg(any(test, debug_assertions))]
 use tzel_core::{auth_leaf_hash, derive_auth_pub_seed};
@@ -1004,14 +1004,17 @@ fn apply_kernel_message<H: Host>(
         KernelInboxMessage::Unshield(req) => {
             validate_transition_proof(ledger.host, &req.proof, tzel_core::CircuitKind::Unshield)?;
             let req = host_unshield_req_for_transition(&req);
-            apply_unshield(ledger, &req).map(KernelResult::Unshield)
+            let prepared = prepare_unshield(ledger, &req)?;
+            let outbox = prepare_unshield_outbox(ledger, &prepared)?;
+            let commit = prepare_durable_unshield_commit(ledger, &prepared)?;
+            ledger.host.write_output(&outbox)?;
+            Ok(KernelResult::Unshield(apply_durable_unshield_commit(
+                ledger, commit,
+            )))
         }
-        KernelInboxMessage::Withdraw(req) => {
-            let host_req = kernel_withdraw_req_to_host(&req);
-            let prepared = prepare_withdraw(ledger, &host_req)?;
-            ledger.host.write_output(&prepared.outbox)?;
-            commit_withdraw(ledger, &host_req, prepared)
-        }
+        KernelInboxMessage::Withdraw(_) => Err(
+            "withdraw messages are no longer supported; unshield emits the outbox directly".into(),
+        ),
         KernelInboxMessage::DalPointer(pointer) => {
             let nested = fetch_kernel_message_from_dal(ledger.host, &pointer)?;
             if matches!(nested, KernelInboxMessage::DalPointer(_)) {
@@ -1022,70 +1025,160 @@ fn apply_kernel_message<H: Host>(
     }
 }
 
-struct PreparedWithdraw {
-    outbox: Vec<u8>,
-    withdrawal_index: u64,
-    balance_after: u64,
-    new_balance_account_index: Option<u64>,
-}
-
-fn prepare_withdraw<H: Host>(
+fn prepare_unshield_outbox<H: Host>(
     ledger: &mut DurableLedgerState<'_, H>,
-    req: &tzel_core::WithdrawReq,
-) -> Result<PreparedWithdraw, String> {
-    if tzel_core::is_deposit_balance_key(&req.sender) {
-        return Err("cannot withdraw from a secret-bound deposit balance; shield it first".into());
-    }
+    req: &tzel_core::PreparedUnshield,
+) -> Result<Vec<u8>, String> {
     let ticketer = ledger
         .read_string(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)?
         .ok_or_else(|| "bridge ticketer is not configured".to_string())?;
-    let balance = ledger.balance(&req.sender)?;
-    if balance < req.amount {
-        return Err("insufficient balance".into());
+    encode_withdrawal_outbox_message(
+        &ticketer,
+        &WithdrawalRecord {
+            recipient: req.recipient().to_string(),
+            amount: req.amount(),
+        },
+    )
+}
+
+struct PreparedDurableUnshieldCommit {
+    encoded_notes: Vec<(u64, Vec<u8>)>,
+    branch_values: Vec<(usize, F)>,
+    new_tree_root: F,
+    new_tree_size: u64,
+    nullifier_start_index: u64,
+    nullifiers: Vec<F>,
+    withdrawal_index: u64,
+    withdrawal_record: WithdrawalRecord,
+    root_marker: Option<(u64, F)>,
+    response: UnshieldResp,
+}
+
+fn simulate_frontier_append(
+    zero_hashes: &[F],
+    branches: &mut [Option<F>],
+    start_index: u64,
+    cm: F,
+) -> Result<F, String> {
+    let mut current = cm;
+    let mut index = start_index;
+    for level in 0..DEPTH {
+        if index & 1 == 0 {
+            branches[level] = Some(current);
+            current = hash_merkle(&current, &zero_hashes[level]);
+        } else {
+            let left = branches[level]
+                .ok_or_else(|| format!("missing Merkle frontier at level {}", level))?;
+            current = hash_merkle(&left, &current);
+        }
+        index >>= 1;
     }
-    let balance_path = balance_path(&req.sender);
-    let new_balance_account_index = if ledger.host.read_store(&balance_path, 8).is_none() {
-        Some(ledger.read_u64(PATH_BALANCE_ACCOUNT_COUNT)?.unwrap_or(0))
+    Ok(current)
+}
+
+fn prepare_durable_unshield_commit<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    prepared: &tzel_core::PreparedUnshield,
+) -> Result<PreparedDurableUnshieldCommit, String> {
+    let mut encoded_notes = Vec::new();
+    let mut branches = (0..DEPTH)
+        .map(|level| ledger.read_felt(&branch_path(level)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut tree_size = ledger.read_u64(PATH_TREE_SIZE)?.unwrap_or(0);
+    let change_index = if let Some((cm, enc)) = prepared.change_note() {
+        let index = tree_size;
+        encoded_notes.push((index, encode_published_note(cm, enc)?));
+        let _ = simulate_frontier_append(&ledger.zero_hashes, &mut branches, index, *cm)?;
+        tree_size += 1;
+        Some(usize::try_from(index).map_err(|_| "note index does not fit in usize".to_string())?)
     } else {
         None
     };
-    let withdrawal_index = ledger.read_u64(PATH_WITHDRAWAL_COUNT)?.unwrap_or(0);
-    let outbox = encode_withdrawal_outbox_message(
-        &ticketer,
-        &WithdrawalRecord {
-            recipient: req.recipient.clone(),
-            amount: req.amount,
-        },
+    let (producer_cm, producer_enc) = prepared.producer_note();
+    let producer_index_u64 = tree_size;
+    encoded_notes.push((
+        producer_index_u64,
+        encode_published_note(producer_cm, producer_enc)?,
+    ));
+    let next_root = simulate_frontier_append(
+        &ledger.zero_hashes,
+        &mut branches,
+        producer_index_u64,
+        *producer_cm,
     )?;
-    Ok(PreparedWithdraw {
-        outbox,
+    tree_size += 1;
+
+    let nullifier_start_index = ledger.read_u64(PATH_NULLIFIER_COUNT)?.unwrap_or(0);
+    let withdrawal_index = ledger.read_u64(PATH_WITHDRAWAL_COUNT)?.unwrap_or(0);
+    let root_marker = if ledger.has_marker(&root_marker_path(&next_root)) {
+        None
+    } else {
+        Some((
+            ledger.read_u64(PATH_VALID_ROOT_COUNT)?.unwrap_or(0),
+            next_root,
+        ))
+    };
+
+    let producer_index = usize::try_from(producer_index_u64)
+        .map_err(|_| "note index does not fit in usize".to_string())?;
+    Ok(PreparedDurableUnshieldCommit {
+        encoded_notes,
+        branch_values: branches
+            .into_iter()
+            .enumerate()
+            .filter_map(|(level, value)| value.map(|felt| (level, felt)))
+            .collect(),
+        new_tree_root: next_root,
+        new_tree_size: tree_size,
+        nullifier_start_index,
+        nullifiers: prepared.nullifiers().to_vec(),
         withdrawal_index,
-        balance_after: balance - req.amount,
-        new_balance_account_index,
+        withdrawal_record: WithdrawalRecord {
+            recipient: prepared.recipient().to_string(),
+            amount: prepared.amount(),
+        },
+        root_marker,
+        response: UnshieldResp {
+            change_index,
+            producer_index,
+        },
     })
 }
 
-fn commit_withdraw<H: Host>(
+fn apply_durable_unshield_commit<H: Host>(
     ledger: &mut DurableLedgerState<'_, H>,
-    req: &tzel_core::WithdrawReq,
-    prepared: PreparedWithdraw,
-) -> Result<KernelResult, String> {
-    ledger.write_withdrawal_at_index(
-        prepared.withdrawal_index,
-        &WithdrawalRecord {
-            recipient: req.recipient.clone(),
-            amount: req.amount,
-        },
-    );
-    ledger.write_u64(PATH_WITHDRAWAL_COUNT, prepared.withdrawal_index + 1);
-    if let Some(index) = prepared.new_balance_account_index {
-        ledger.write_account_key_at_index(index, &req.sender);
-        ledger.write_u64(PATH_BALANCE_ACCOUNT_COUNT, index + 1);
+    commit: PreparedDurableUnshieldCommit,
+) -> UnshieldResp {
+    for (index, encoded) in &commit.encoded_notes {
+        write_note_payload(ledger.host, *index, encoded);
     }
-    ledger.write_u64(&balance_path(&req.sender), prepared.balance_after);
-    let withdrawal_index = usize::try_from(prepared.withdrawal_index)
-        .map_err(|_| "withdrawal index does not fit in usize".to_string())?;
-    Ok(KernelResult::Withdraw(WithdrawResp { withdrawal_index }))
+    for (level, felt) in &commit.branch_values {
+        ledger.write_felt(&branch_path(*level), felt);
+    }
+    ledger.write_felt(PATH_TREE_ROOT, &commit.new_tree_root);
+    ledger.write_u64(PATH_TREE_SIZE, commit.new_tree_size);
+
+    let mut nullifier_index = commit.nullifier_start_index;
+    for nf in &commit.nullifiers {
+        let path = nullifier_path(nf);
+        ledger.write_marker(&path);
+        ledger.write_key_at_index(PATH_NULLIFIER_INDEX_PREFIX, nullifier_index, nf);
+        nullifier_index += 1;
+    }
+    ledger.write_u64(PATH_NULLIFIER_COUNT, nullifier_index);
+
+    ledger.write_withdrawal_at_index(commit.withdrawal_index, &commit.withdrawal_record);
+    ledger.write_u64(PATH_WITHDRAWAL_COUNT, commit.withdrawal_index + 1);
+
+    if let Some((root_index, root)) = &commit.root_marker {
+        let path = root_marker_path(root);
+        ledger.write_marker(&path);
+        ledger.write_key_at_index(PATH_VALID_ROOT_INDEX_PREFIX, *root_index, root);
+        ledger.write_u64(PATH_VALID_ROOT_COUNT, root_index + 1);
+    }
+
+    ledger.note_private_tx_applied();
+    commit.response
 }
 
 fn process_input<H: Host>(host: &mut H, input: &InputMessage) {
@@ -1623,7 +1716,7 @@ mod tests {
             KernelTransferReq, KernelUnshieldReq, KernelVerifierConfig, KernelWithdrawReq,
         },
         owner_tag, u64_to_felt, PaymentAddress, ProgramHashes, Proof, ShieldReq, ShieldResp,
-        TransferResp, UnshieldResp, WithdrawResp, MIN_TX_FEE, ZERO,
+        TransferResp, UnshieldResp, MIN_TX_FEE, ZERO,
     };
 
     #[derive(Default)]
@@ -2502,9 +2595,10 @@ mod tests {
     }
 
     #[test]
-    fn applies_unshield_message_with_change_and_balance_update() {
+    fn applies_unshield_message_with_change_and_records_withdrawal() {
         let mut host = MockHost::default();
         install_test_verifier(&mut host);
+        install_test_bridge(&mut host);
 
         let address = sample_payment_address();
         let enc_change = sample_encrypted_note(&address, 7, [0x21; 32], b"change");
@@ -2513,13 +2607,14 @@ mod tests {
         let cm_fee = sample_commitment(&address, 1, [0x22; 32]);
         let nf = sample_felt(0xA2);
         let root = read_ledger(&host).unwrap().tree.root();
+        let recipient = sample_l1_receiver().to_string();
 
         let req = KernelUnshieldReq {
             root,
             nullifiers: vec![nf],
             v_pub: 33,
             fee: MIN_TX_FEE,
-            recipient: "bob".into(),
+            recipient: recipient.clone(),
             cm_change,
             enc_change: Some(enc_change.clone()),
             cm_fee,
@@ -2550,19 +2645,26 @@ mod tests {
         }
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get("bob"), Some(&33));
+        assert_eq!(
+            ledger.withdrawals,
+            vec![WithdrawalRecord {
+                recipient: recipient.clone(),
+                amount: 33,
+            }]
+        );
         assert_eq!(ledger.tree.leaves, vec![cm_change, cm_fee]);
         assert!(ledger.nullifiers.contains(&nf));
-        assert!(host.store.contains_key(&balance_path("bob")));
         assert!(host.store.contains_key(&nullifier_path(&nf)));
         assert!(read_persisted_note(&host, 0).is_some());
         assert!(read_persisted_note(&host, 1).is_some());
+        assert_eq!(host.outputs.len(), 1);
     }
 
     #[test]
     fn rejects_unshield_with_duplicate_public_nullifiers_before_state_change() {
         let mut host = MockHost::default();
         install_test_verifier(&mut host);
+        install_test_bridge(&mut host);
 
         let address = sample_payment_address();
         let enc_change = sample_encrypted_note(&address, 7, [0x41; 32], b"change");
@@ -2571,13 +2673,14 @@ mod tests {
         let cm_fee = sample_commitment(&address, 1, [0x42; 32]);
         let nf = sample_felt(0xA3);
         let root = read_ledger(&host).unwrap().tree.root();
+        let recipient = sample_l1_receiver().to_string();
 
         let req = KernelUnshieldReq {
             root,
             nullifiers: vec![nf, nf],
             v_pub: 33,
             fee: MIN_TX_FEE,
-            recipient: "bob".into(),
+            recipient: recipient.clone(),
             cm_change,
             enc_change: Some(enc_change),
             cm_fee,
@@ -2599,29 +2702,138 @@ mod tests {
         }
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get("bob"), None);
+        assert!(ledger.withdrawals.is_empty());
         assert!(ledger.tree.leaves.is_empty());
         assert!(ledger.nullifiers.is_empty());
-        assert!(!host.store.contains_key(&balance_path("bob")));
         assert!(!host.store.contains_key(&nullifier_path(&nf)));
         assert!(read_persisted_note(&host, 0).is_none());
+        assert!(host.outputs.is_empty());
     }
 
     #[test]
-    fn applies_withdraw_message_and_emits_outbox_payload() {
+    fn rejects_unshield_to_invalid_l1_recipient() {
         let mut host = MockHost::default();
+        install_test_verifier(&mut host);
         install_test_bridge(&mut host);
-        {
-            let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "bob", 44).unwrap();
-        }
 
+        let address = sample_payment_address();
+        let enc_fee = sample_encrypted_note(&address, 1, [0x52; 32], b"dal");
+        let cm_fee = sample_commitment(&address, 1, [0x52; 32]);
+        let nf = sample_felt(0xA4);
+        let root = read_ledger(&host).unwrap().tree.root();
+
+        let req = KernelUnshieldReq {
+            root,
+            nullifiers: vec![nf],
+            v_pub: 33,
+            fee: MIN_TX_FEE,
+            recipient: "bob".into(),
+            cm_change: ZERO,
+            enc_change: None,
+            cm_fee,
+            enc_fee,
+            proof: sample_kernel_test_proof(),
+        };
+        let message = encode_kernel_inbox_message(&KernelInboxMessage::Unshield(req)).unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 6,
+            id: 24,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert!(ledger.withdrawals.is_empty());
+        assert!(ledger.tree.leaves.is_empty());
+        assert!(ledger.nullifiers.is_empty());
+        assert!(host.outputs.is_empty());
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("invalid L1 withdrawal recipient"));
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unshield_whitespace_padded_l1_recipient_is_normalized() {
+        let mut host = MockHost::default();
+        install_test_verifier(&mut host);
+        install_test_bridge(&mut host);
+
+        let address = sample_payment_address();
+        let enc_fee = sample_encrypted_note(&address, 1, [0x53; 32], b"dal");
+        let cm_fee = sample_commitment(&address, 1, [0x53; 32]);
+        let nf = sample_felt(0xAB);
+        let root = read_ledger(&host).unwrap().tree.root();
         let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(KernelWithdrawReq {
-                sender: "bob".into(),
+            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+                root,
+                vec![nf],
+                33,
+                " tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx ",
+                ZERO,
+                None,
+                cm_fee,
+                enc_fee,
+            )))
+            .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 6,
+            id: 25,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(
+            ledger.withdrawals,
+            vec![WithdrawalRecord {
                 recipient: sample_l1_receiver().into(),
                 amount: 33,
-            }))
+            }]
+        );
+        assert!(ledger.nullifiers.contains(&nf));
+        assert_eq!(host.outputs.len(), 1);
+        match read_last_result(&host).unwrap() {
+            KernelResult::Unshield(UnshieldResp {
+                change_index,
+                producer_index,
+            }) => {
+                assert_eq!(change_index, None);
+                assert_eq!(producer_index, 0);
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn applies_unshield_message_and_emits_outbox_payload() {
+        let mut host = MockHost::default();
+        install_test_verifier(&mut host);
+        install_test_bridge(&mut host);
+
+        let address = sample_payment_address();
+        let enc_change = sample_encrypted_note(&address, 7, [0x21; 32], b"change");
+        let enc_fee = sample_encrypted_note(&address, 1, [0x22; 32], b"dal");
+        let cm_change = sample_commitment(&address, 7, [0x21; 32]);
+        let cm_fee = sample_commitment(&address, 1, [0x22; 32]);
+        let nf = sample_felt(0xA5);
+        let root = read_ledger(&host).unwrap().tree.root();
+
+        let message =
+            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+                root,
+                vec![nf],
+                33,
+                sample_l1_receiver(),
+                cm_change,
+                Some(enc_change.clone()),
+                cm_fee,
+                enc_fee.clone(),
+            )))
             .unwrap();
         host.inputs.push_back(InputMessage {
             level: 6,
@@ -2632,17 +2844,20 @@ mod tests {
         run_with_host(&mut host);
 
         match read_last_result(&host).unwrap() {
-            KernelResult::Withdraw(WithdrawResp { withdrawal_index }) => {
-                assert_eq!(withdrawal_index, 0)
+            KernelResult::Unshield(UnshieldResp {
+                change_index,
+                producer_index,
+            }) => {
+                assert_eq!(change_index, Some(0));
+                assert_eq!(producer_index, 1);
             }
             KernelResult::Error { message } => {
-                panic!("withdraw failed: {} | debug: {}", message, host.debug)
+                panic!("unshield failed: {} | debug: {}", message, host.debug)
             }
             other => panic!("unexpected rollup result: {:?}", other),
         }
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get("bob"), Some(&11));
         assert_eq!(
             ledger.withdrawals,
             vec![WithdrawalRecord {
@@ -2650,6 +2865,8 @@ mod tests {
                 amount: 33,
             }]
         );
+        assert_eq!(ledger.tree.leaves, vec![cm_change, cm_fee]);
+        assert!(ledger.nullifiers.contains(&nf));
         assert_eq!(host.outputs.len(), 1);
         let outbox = decode_test_withdrawal_outbox(&host.outputs[0]);
         let batch = match outbox {
@@ -2665,21 +2882,28 @@ mod tests {
     }
 
     #[test]
-    fn withdraw_output_failure_does_not_mutate_ledger() {
+    fn unshield_output_failure_does_not_mutate_ledger() {
         let mut host = MockHost::default();
         host.fail_output = Some("outbox full".into());
+        install_test_verifier(&mut host);
         install_test_bridge(&mut host);
-        {
-            let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "bob", 44).unwrap();
-        }
 
+        let address = sample_payment_address();
+        let enc_fee = sample_encrypted_note(&address, 1, [0x31; 32], b"dal");
+        let cm_fee = sample_commitment(&address, 1, [0x31; 32]);
+        let nf = sample_felt(0xA6);
+        let root = read_ledger(&host).unwrap().tree.root();
         let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(KernelWithdrawReq {
-                sender: "bob".into(),
-                recipient: sample_l1_receiver().into(),
-                amount: 33,
-            }))
+            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+                root,
+                vec![nf],
+                33,
+                sample_l1_receiver(),
+                ZERO,
+                None,
+                cm_fee,
+                enc_fee,
+            )))
             .unwrap();
         host.inputs.push_back(InputMessage {
             level: 6,
@@ -2690,8 +2914,9 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get("bob"), Some(&44));
         assert!(ledger.withdrawals.is_empty());
+        assert!(ledger.tree.leaves.is_empty());
+        assert!(ledger.nullifiers.is_empty());
         assert!(host.outputs.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => assert!(message.contains("outbox full")),
@@ -2700,95 +2925,74 @@ mod tests {
     }
 
     #[test]
-    fn malformed_withdrawal_counter_does_not_emit_outbox() {
+    fn unshield_bad_withdrawal_count_does_not_emit_output_or_mutate_ledger() {
         let mut host = MockHost::default();
+        install_test_verifier(&mut host);
         install_test_bridge(&mut host);
-        {
-            let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "bob", 44).unwrap();
-        }
-        host.write_store(PATH_WITHDRAWAL_COUNT, &[0xAA; 7]);
 
+        let address = sample_payment_address();
+        let enc_fee = sample_encrypted_note(&address, 1, [0x34; 32], b"dal");
+        let cm_fee = sample_commitment(&address, 1, [0x34; 32]);
+        let nf = sample_felt(0xA8);
+        let root = read_ledger(&host).unwrap().tree.root();
+        host.write_store(PATH_WITHDRAWAL_COUNT, &[0x01]);
         let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(KernelWithdrawReq {
-                sender: "bob".into(),
-                recipient: sample_l1_receiver().into(),
-                amount: 33,
-            }))
+            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+                root,
+                vec![nf],
+                33,
+                sample_l1_receiver(),
+                ZERO,
+                None,
+                cm_fee,
+                enc_fee,
+            )))
             .unwrap();
         host.inputs.push_back(InputMessage {
             level: 6,
-            id: 31,
+            id: 30,
             payload: message,
         });
 
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get("bob"), Some(&44));
         assert!(ledger.withdrawals.is_empty());
+        assert!(ledger.tree.leaves.is_empty());
+        assert!(ledger.nullifiers.is_empty());
+        assert!(!host.store.contains_key(&nullifier_path(&nf)));
+        assert!(read_persisted_note(&host, 0).is_none());
         assert!(host.outputs.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
-                assert!(message.contains("bad u64"));
-                assert!(message.contains("/tzel/v1/state/withdrawals/count"));
+                assert!(message.contains("bad u64 at /tzel/v1/state/withdrawals/count"))
             }
             other => panic!("unexpected rollup result: {:?}", other),
         }
     }
 
     #[test]
-    fn withdraw_from_secret_bound_deposit_key_does_not_emit_outbox() {
+    fn unshield_invalid_l1_recipient_does_not_mutate_ledger() {
         let mut host = MockHost::default();
+        install_test_verifier(&mut host);
         install_test_bridge(&mut host);
-        let deposit_key = deposit_balance_key(&deposit_id_from_label("alice"));
-        {
-            let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, &deposit_key, 44).unwrap();
-        }
 
+        let address = sample_payment_address();
+        let enc_fee = sample_encrypted_note(&address, 1, [0x32; 32], b"dal");
+        let cm_fee = sample_commitment(&address, 1, [0x32; 32]);
+        let nf = sample_felt(0xA7);
+        let root = read_ledger(&host).unwrap().tree.root();
         let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(KernelWithdrawReq {
-                sender: deposit_key.clone(),
-                recipient: sample_l1_receiver().into(),
-                amount: 33,
-            }))
-            .unwrap();
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 33,
-            payload: message,
-        });
-
-        run_with_host(&mut host);
-
-        let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get(&deposit_key), Some(&44));
-        assert!(ledger.withdrawals.is_empty());
-        assert!(host.outputs.is_empty());
-        match read_last_result(&host).unwrap() {
-            KernelResult::Error { message } => {
-                assert!(message.contains("secret-bound deposit balance"))
-            }
-            other => panic!("unexpected rollup result: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn withdraw_invalid_l1_recipient_does_not_mutate_ledger() {
-        let mut host = MockHost::default();
-        install_test_bridge(&mut host);
-        {
-            let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "bob", 44).unwrap();
-        }
-
-        let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(KernelWithdrawReq {
-                sender: "bob".into(),
-                recipient: "not-a-contract".into(),
-                amount: 33,
-            }))
+            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+                root,
+                vec![nf],
+                33,
+                "not-a-contract",
+                ZERO,
+                None,
+                cm_fee,
+                enc_fee,
+            )))
             .unwrap();
         host.inputs.push_back(InputMessage {
             level: 6,
@@ -2799,31 +3003,116 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get("bob"), Some(&44));
         assert!(ledger.withdrawals.is_empty());
+        assert!(ledger.tree.leaves.is_empty());
+        assert!(ledger.nullifiers.is_empty());
         assert!(host.outputs.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
-                assert!(message.contains("invalid withdrawal recipient contract"))
+                assert!(message.contains("invalid L1 withdrawal recipient"))
             }
             other => panic!("unexpected rollup result: {:?}", other),
         }
     }
 
     #[test]
-    fn withdraw_requires_bridge_configuration_even_with_balance() {
+    fn unshield_missing_frontier_does_not_emit_output_or_partial_commit() {
         let mut host = MockHost::default();
-        {
-            let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "bob", 44).unwrap();
-        }
+        install_test_verifier(&mut host);
+        install_test_bridge(&mut host);
 
-        let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(KernelWithdrawReq {
-                sender: "bob".into(),
+        let address = sample_payment_address();
+        let first_enc_fee = sample_encrypted_note(&address, 1, [0x35; 32], b"dal-1");
+        let first_cm_fee = sample_commitment(&address, 1, [0x35; 32]);
+        let first_nf = sample_felt(0xA9);
+        let first_message =
+            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+                read_ledger(&host).unwrap().tree.root(),
+                vec![first_nf],
+                33,
+                sample_l1_receiver(),
+                ZERO,
+                None,
+                first_cm_fee,
+                first_enc_fee,
+            )))
+            .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 6,
+            id: 31,
+            payload: first_message,
+        });
+        run_with_host(&mut host);
+        assert_eq!(host.outputs.len(), 1);
+
+        let second_root = read_ledger(&host).unwrap().tree.root();
+        host.store.remove(&branch_path(0));
+        let second_enc_fee = sample_encrypted_note(&address, 1, [0x36; 32], b"dal-2");
+        let second_cm_fee = sample_commitment(&address, 1, [0x36; 32]);
+        let second_nf = sample_felt(0xAA);
+        let second_message =
+            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+                second_root,
+                vec![second_nf],
+                34,
+                sample_l1_receiver(),
+                ZERO,
+                None,
+                second_cm_fee,
+                second_enc_fee,
+            )))
+            .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 6,
+            id: 32,
+            payload: second_message,
+        });
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(
+            ledger.withdrawals,
+            vec![WithdrawalRecord {
                 recipient: sample_l1_receiver().into(),
                 amount: 33,
-            }))
+            }]
+        );
+        assert_eq!(ledger.tree.leaves.len(), 1);
+        assert!(ledger.nullifiers.contains(&first_nf));
+        assert!(!ledger.nullifiers.contains(&second_nf));
+        assert!(!host.store.contains_key(&nullifier_path(&second_nf)));
+        assert!(read_persisted_note(&host, 1).is_none());
+        assert_eq!(host.outputs.len(), 1);
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("missing Merkle frontier at level 0"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unshield_requires_bridge_configuration_even_with_valid_proof() {
+        let mut host = MockHost::default();
+        install_test_verifier(&mut host);
+
+        let address = sample_payment_address();
+        let enc_fee = sample_encrypted_note(&address, 1, [0x33; 32], b"dal");
+        let cm_fee = sample_commitment(&address, 1, [0x33; 32]);
+        let nf = sample_felt(0xA8);
+        let root = read_ledger(&host).unwrap().tree.root();
+        let message =
+            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+                root,
+                vec![nf],
+                33,
+                sample_l1_receiver(),
+                ZERO,
+                None,
+                cm_fee,
+                enc_fee,
+            )))
             .unwrap();
         host.inputs.push_back(InputMessage {
             level: 6,
@@ -2834,12 +3123,41 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get("bob"), Some(&44));
         assert!(ledger.withdrawals.is_empty());
+        assert!(ledger.tree.leaves.is_empty());
+        assert!(ledger.nullifiers.is_empty());
         assert!(host.outputs.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("bridge ticketer is not configured"))
+            }
+            other => panic!("unexpected rollup result: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn withdraw_message_is_rejected() {
+        let mut host = MockHost::default();
+        let message =
+            encode_kernel_inbox_message(&KernelInboxMessage::Withdraw(KernelWithdrawReq {
+                sender: "tz1LhXujSfRndomkcC64pCpkkjLWQwsmCUMk".into(),
+                recipient: sample_l1_receiver().into(),
+                amount: 1,
+                public_key: None,
+                signature: None,
+            }))
+            .unwrap();
+        host.inputs.push_back(InputMessage {
+            level: 6,
+            id: 6,
+            payload: message,
+        });
+
+        run_with_host(&mut host);
+
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => {
+                assert!(message.contains("withdraw messages are no longer supported"))
             }
             other => panic!("unexpected rollup result: {:?}", other),
         }
@@ -2979,8 +3297,7 @@ mod tests {
         host.inputs.push_back(InputMessage {
             level: 9,
             id: 2,
-            payload: encode_kernel_inbox_message(&signed_verifier_message(config.clone()))
-                .unwrap(),
+            payload: encode_kernel_inbox_message(&signed_verifier_message(config.clone())).unwrap(),
         });
 
         run_with_host(&mut host);
@@ -3717,6 +4034,30 @@ mod tests {
 
     fn sample_l1_source() -> PublicKeyHash {
         PublicKeyHash::from_b58check("tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN").unwrap()
+    }
+
+    fn sample_kernel_unshield_req(
+        root: F,
+        nullifiers: Vec<F>,
+        v_pub: u64,
+        recipient: &str,
+        cm_change: F,
+        enc_change: Option<EncryptedNote>,
+        cm_fee: F,
+        enc_fee: EncryptedNote,
+    ) -> KernelUnshieldReq {
+        KernelUnshieldReq {
+            root,
+            nullifiers,
+            v_pub,
+            fee: MIN_TX_FEE,
+            recipient: recipient.into(),
+            cm_change,
+            enc_change,
+            cm_fee,
+            enc_fee,
+            proof: sample_kernel_test_proof(),
+        }
     }
 
     fn sample_rollup_address() -> SmartRollupAddress {

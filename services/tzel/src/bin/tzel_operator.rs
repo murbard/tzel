@@ -739,6 +739,13 @@ fn process_submission(
     config: &OperatorConfig,
     req: SubmitRollupMessageReq,
 ) -> Result<RollupSubmission, String> {
+    if matches!(req.kind, RollupSubmissionKind::Withdraw) {
+        return Err(
+            "withdraw submissions are no longer supported; unshield emits the outbox directly"
+                .into(),
+        );
+    }
+
     let id = next_submission_id(config);
     let targeted_bytes = encode_targeted_rollup_message(&req.rollup_address, &req.payload)?;
     let mut stored = StoredSubmission {
@@ -794,9 +801,6 @@ fn process_submission(
     }
 
     let message = decode_and_validate_submission_payload(req.kind, &req.payload)?;
-    if matches!(req.kind, RollupSubmissionKind::Withdraw) {
-        return Err("withdraw submissions do not support DAL publication".into());
-    }
     if submission_kind_requires_dal_fee_policy(req.kind) {
         enforce_dal_fee_policy(config, &message)?;
     }
@@ -1654,16 +1658,22 @@ mod tests {
                 sender: "alice".into(),
                 recipient: "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx".into(),
                 amount: 1,
+                public_key: None,
+                signature: None,
             },
         ))
         .unwrap()
     }
 
+    fn sample_small_direct_payload() -> Vec<u8> {
+        vec![0x54, 0x5a, 0x45, 0x4c]
+    }
+
     #[test]
-    fn direct_l1_withdraw_message_fits_protocol_limit() {
+    fn direct_small_payload_fits_protocol_limit() {
         let framed = encode_targeted_rollup_message(
             "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP",
-            &sample_withdraw_payload(),
+            &sample_small_direct_payload(),
         )
         .unwrap();
         assert!(
@@ -1731,7 +1741,7 @@ mod tests {
 
     fn sample_submit_req() -> SubmitRollupMessageReq {
         SubmitRollupMessageReq {
-            kind: RollupSubmissionKind::Withdraw,
+            kind: RollupSubmissionKind::ConfigureBridge,
             rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
             payload: vec![1, 2, 3, 4],
         }
@@ -2129,7 +2139,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("withdraw submissions do not support DAL publication"));
+        assert!(err.contains("withdraw submissions are no longer supported"));
     }
 
     #[test]
@@ -2192,9 +2202,9 @@ mod tests {
             make_client_script("#!/bin/sh\necho 'Operation hash is ooTestHash123456789ABCDEFG'\n");
         let config = config_with_client(&script_dir.path().join("octez-client"));
         let req = SubmitRollupMessageReq {
-            kind: RollupSubmissionKind::Withdraw,
+            kind: RollupSubmissionKind::Shield,
             rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
-            payload: vec![1, 2, 3, 4],
+            payload: sample_small_direct_payload(),
         };
         let submission = process_submission(&config, req).unwrap();
         assert_eq!(submission.status, RollupSubmissionStatus::SubmittedToL1);

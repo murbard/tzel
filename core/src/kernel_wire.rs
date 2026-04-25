@@ -12,7 +12,7 @@ use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const KERNEL_WIRE_VERSION: u16 = 11;
+pub const KERNEL_WIRE_VERSION: u16 = 12;
 pub const KERNEL_VERIFIER_CONFIG_KEY_INDEX: u32 = 0;
 pub const KERNEL_BRIDGE_CONFIG_KEY_INDEX: u32 = 1;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
@@ -112,6 +112,8 @@ pub struct KernelWithdrawReq {
     pub sender: String,
     pub recipient: String,
     pub amount: u64,
+    pub public_key: Option<String>,
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,6 +278,8 @@ struct WireKernelWithdrawReq {
     #[encoding(string = "MAX_ACCOUNT_ID_BYTES")]
     recipient: String,
     amount: WireU64Le,
+    public_key: WireOptionalAccountId,
+    signature: WireOptionalAccountId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -335,6 +339,11 @@ struct WireErrorMessage {
 struct WireAccountId {
     #[encoding(string = "MAX_ACCOUNT_ID_BYTES")]
     value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
+struct WireOptionalAccountId {
+    value: Option<WireAccountId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -1208,6 +1217,8 @@ fn kernel_withdraw_req_to_wire(req: &KernelWithdrawReq) -> WireKernelWithdrawReq
         sender: req.sender.clone(),
         recipient: req.recipient.clone(),
         amount: u64_to_wire(req.amount),
+        public_key: account_id_option_to_wire(req.public_key.as_deref()),
+        signature: account_id_option_to_wire(req.signature.as_deref()),
     }
 }
 
@@ -1216,6 +1227,8 @@ fn kernel_withdraw_req_from_wire(wire: WireKernelWithdrawReq) -> Result<KernelWi
         sender: wire.sender,
         recipient: wire.recipient,
         amount: wire_to_u64(wire.amount)?,
+        public_key: account_id_option_from_wire(wire.public_key),
+        signature: account_id_option_from_wire(wire.signature),
     })
 }
 
@@ -1235,6 +1248,18 @@ fn withdraw_resp_from_wire(wire: WireWithdrawResp) -> Result<WithdrawResp, Strin
             .try_into()
             .map_err(|_| "withdrawal index does not fit in usize".to_string())?,
     })
+}
+
+fn account_id_option_to_wire(value: Option<&str>) -> WireOptionalAccountId {
+    WireOptionalAccountId {
+        value: value.map(|value| WireAccountId {
+            value: value.to_string(),
+        }),
+    }
+}
+
+fn account_id_option_from_wire(wire: WireOptionalAccountId) -> Option<String> {
+    wire.value.map(|value| value.value)
 }
 
 #[cfg(test)]
@@ -1670,6 +1695,8 @@ mod tests {
             sender: "alice".into(),
             recipient: "tz1-target".into(),
             amount: 33,
+            public_key: Some("edpk-test".into()),
+            signature: Some("sig-test".into()),
         });
         let encoded = encode_kernel_inbox_message(&message).unwrap();
         let decoded = decode_kernel_inbox_message(&encoded).unwrap();
@@ -1678,6 +1705,8 @@ mod tests {
                 assert_eq!(req.sender, "alice");
                 assert_eq!(req.recipient, "tz1-target");
                 assert_eq!(req.amount, 33);
+                assert_eq!(req.public_key.as_deref(), Some("edpk-test"));
+                assert_eq!(req.signature.as_deref(), Some("sig-test"));
             }
             other => panic!("unexpected decoded message: {:?}", other),
         }

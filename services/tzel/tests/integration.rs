@@ -16,6 +16,7 @@ use tzel_verifier::{DirectProofVerifier, ProofBundle as VerifyProofBundle};
 use ureq::{http, RequestExt};
 
 const PROVER_TOOLCHAIN: &str = "+nightly-2025-07-14";
+const TEST_L1_RECIPIENT: &str = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx";
 
 static SP_CLIENT_BIN: OnceLock<String> = OnceLock::new();
 static SP_LEDGER_BIN: OnceLock<String> = OnceLock::new();
@@ -556,7 +557,7 @@ fn test_e2e_trust_me_bro() {
         assert!(out.contains("Private balance: 200001"));
         assert!(out.contains("Notes: 1"));
 
-        // ── Exact unshield (no change address generation) ───────────
+        // ── Reject malformed local unshield recipients early ────────
         let (ok, out) = client_tmb(
             &alice,
             &[
@@ -573,6 +574,34 @@ fn test_e2e_trust_me_bro() {
                 "alice_pub",
             ],
         );
+        assert!(
+            !ok,
+            "unshield with invalid recipient unexpectedly succeeded: {}",
+            out
+        );
+        assert!(out.contains("invalid L1 withdrawal recipient: alice_pub"));
+
+        let (ok, out) = client_tmb(&alice, &["balance"]);
+        assert!(ok, "alice balance after rejected unshield: {}", out);
+        assert!(out.contains("Private balance: 200001"));
+
+        // ── Exact unshield to an L1 recipient (no change generation) ─
+        let (ok, out) = client_tmb(
+            &alice,
+            &[
+                "unshield",
+                "-l",
+                &l,
+                "--amount",
+                "100000",
+                "--dal-fee",
+                "1",
+                "--dal-fee-address",
+                &producer_addr,
+                "--recipient",
+                TEST_L1_RECIPIENT,
+            ],
+        );
         assert!(ok, "unshield: {}", out);
         assert!(out.contains("Unshielded 100000"));
 
@@ -580,7 +609,7 @@ fn test_e2e_trust_me_bro() {
         assert!(ok, "alice balance 2: {}", out);
         assert!(out.contains("Private balance: 0"));
 
-        // ── Public balances ─────────────────────────────────────────
+        // ── Public balances remain empty after direct withdrawal ────
         let resp: serde_json::Value = ureq::get(&format!("{}/balances", l))
             .call()
             .unwrap()
@@ -593,8 +622,11 @@ fn test_e2e_trust_me_bro() {
             0
         );
         assert_eq!(
-            balances.get("alice_pub").and_then(|v| v.as_u64()),
-            Some(100000)
+            balances
+                .get(TEST_L1_RECIPIENT)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            0
         );
 
         // ── Tree integrity ──────────────────────────────────────────
@@ -1019,7 +1051,7 @@ fn test_unshield_proof_roundtrip() {
                 "--dal-fee-address",
                 &producer_addr,
                 "--recipient",
-                "bob_pub",
+                TEST_L1_RECIPIENT,
             ],
         );
         assert!(ok, "real unshield failed: {}", out);
@@ -1037,8 +1069,11 @@ fn test_unshield_proof_roundtrip() {
             .unwrap();
         let balances = resp.get("balances").unwrap();
         assert_eq!(
-            balances.get("bob_pub").and_then(|v| v.as_u64()),
-            Some(100000)
+            balances
+                .get(TEST_L1_RECIPIENT)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            0
         );
     }));
 

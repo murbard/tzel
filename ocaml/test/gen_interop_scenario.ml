@@ -32,6 +32,8 @@ let json_felt f = `String (Tzel.Felt.to_hex f)
 
 let json_felt_list xs = `List (List.map json_felt xs)
 
+let interop_l1_recipient = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx"
+
 let test_auth_root d_j auth_pub_seed =
   Tzel.Hash.hash2 (Tzel.Hash.felt_tag "interop-auth-root")
     (Tzel.Hash.hash2 d_j auth_pub_seed)
@@ -173,7 +175,7 @@ let () =
         "nullifiers", json_felt_list [bob_nf];
         "v_pub", `Int 99_999;
         "fee", `Int fee;
-        "recipient", `String "bob";
+        "recipient", `String interop_l1_recipient;
         "cm_change", json_felt Tzel.Felt.zero;
         "enc_change", `Null;
         "memo_ct_hash_change", json_felt Tzel.Felt.zero;
@@ -182,8 +184,12 @@ let () =
         "memo_ct_hash_fee", json_felt unshield_fee_memo_ct_hash;
       ];
       "expected", `Assoc [
-        "alice_public_balance", `Int 0;
-        "bob_public_balance", `Int 99_999;
+        "withdrawals", `List [
+          `Assoc [
+            "recipient", `String interop_l1_recipient;
+            "amount", `Int 99_999;
+          ];
+        ];
         "tree_size", `Int 6;
         "nullifier_count", `Int 2;
       ];

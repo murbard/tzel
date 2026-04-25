@@ -158,14 +158,8 @@ fn test_ocaml_wallet_scenario_applies_on_rust_ledger() {
     assert_eq!(unshield_resp.change_index, None);
     assert_eq!(unshield_resp.producer_index, 5);
 
-    assert_eq!(
-        ledger.balances.get("alice").copied().unwrap_or(0),
-        scenario.expected.alice_public_balance
-    );
-    assert_eq!(
-        ledger.balances.get("bob").copied().unwrap_or(0),
-        scenario.expected.bob_public_balance
-    );
+    assert_eq!(ledger.balances.get("alice").copied().unwrap_or(0), 0);
+    assert_eq!(ledger.withdrawals, scenario.expected.withdrawals.clone());
     assert_eq!(ledger.tree.leaves.len(), scenario.expected.tree_size);
     assert_eq!(ledger.nullifiers.len(), scenario.expected.nullifier_count);
 }

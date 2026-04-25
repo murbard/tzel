@@ -6,6 +6,7 @@ use axum::{
 };
 use clap::Parser;
 use std::sync::{Arc, Mutex};
+use tezos_smart_rollup_encoding::contract::Contract as TezosContract;
 use tokio::net::TcpListener;
 use tzel_services::*;
 
@@ -70,6 +71,16 @@ fn parse_felt_be_hex(s: &str) -> Result<F, String> {
     Ok(le)
 }
 
+fn validate_l1_withdrawal_recipient(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("L1 withdrawal recipient must not be empty".into());
+    }
+    TezosContract::from_b58check(value)
+        .map(|_| value.to_string())
+        .map_err(|_| format!("invalid L1 withdrawal recipient: {}", value))
+}
+
 async fn fund_handler(
     State(st): State<AppState>,
     Json(req): Json<FundReq>,
@@ -124,6 +135,9 @@ async fn unshield_handler(
     State(st): State<AppState>,
     Json(req): Json<UnshieldReq>,
 ) -> Result<Json<UnshieldResp>, (StatusCode, String)> {
+    let recipient = validate_l1_withdrawal_recipient(&req.recipient).map_err(err)?;
+    let mut req = req;
+    req.recipient = recipient;
     st.proof_verifier
         .validate(&req.proof, CircuitKind::Unshield)
         .map_err(err)?;
@@ -580,7 +594,7 @@ mod tests {
                 nullifiers: vec![u64_to_felt(1)],
                 v_pub: 7,
                 fee: MIN_TX_FEE,
-                recipient: "bob".into(),
+                recipient: "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx".into(),
                 cm_change: ZERO,
                 enc_change: None,
                 cm_fee: u64_to_felt(2),
@@ -592,5 +606,72 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert!(err.1.contains("TrustMeBro proofs rejected"));
+    }
+
+    #[tokio::test]
+    async fn test_unshield_handler_rejects_invalid_l1_recipient_before_mutation() {
+        let st = test_state(default_auth_domain());
+        let err = unshield_handler(
+            State(st.clone()),
+            Json(UnshieldReq {
+                root: ZERO,
+                nullifiers: vec![u64_to_felt(1)],
+                v_pub: 7,
+                fee: MIN_TX_FEE,
+                recipient: "bob_pub".into(),
+                cm_change: ZERO,
+                enc_change: None,
+                cm_fee: u64_to_felt(2),
+                enc_fee: dummy_note(8),
+                proof: Proof::TrustMeBro,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("invalid L1 withdrawal recipient: bob_pub"));
+
+        let ledger = st.ledger.lock().unwrap();
+        assert!(ledger.withdrawals.is_empty());
+        assert!(ledger.balances.is_empty());
+        assert!(ledger.nullifiers.is_empty());
+        assert_eq!(ledger.tree.leaves.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_unshield_handler_normalizes_l1_recipient_before_queueing() {
+        let st = test_state(default_auth_domain());
+        let root = {
+            let ledger = st.ledger.lock().unwrap();
+            ledger.tree.root()
+        };
+        let resp = unshield_handler(
+            State(st.clone()),
+            Json(UnshieldReq {
+                root,
+                nullifiers: vec![u64_to_felt(1)],
+                v_pub: 7,
+                fee: MIN_TX_FEE,
+                recipient: " tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx ".into(),
+                cm_change: ZERO,
+                enc_change: None,
+                cm_fee: u64_to_felt(2),
+                enc_fee: dummy_note(8),
+                proof: Proof::TrustMeBro,
+            }),
+        )
+        .await
+        .expect("whitespace-padded recipient should normalize");
+        assert_eq!(resp.0.change_index, None);
+        assert_eq!(resp.0.producer_index, 0);
+
+        let ledger = st.ledger.lock().unwrap();
+        assert_eq!(
+            ledger.withdrawals,
+            vec![WithdrawalRecord {
+                recipient: "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx".into(),
+                amount: 7,
+            }]
+        );
     }
 }

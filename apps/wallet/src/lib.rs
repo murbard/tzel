@@ -4,10 +4,13 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tezos_data_encoding_05::enc::BinWriter as _;
-use tezos_smart_rollup_encoding::{inbox::ExternalMessageFrame, smart_rollup::SmartRollupAddress};
+use tezos_smart_rollup_encoding::{
+    contract::Contract as TezosContract, inbox::ExternalMessageFrame,
+    smart_rollup::SmartRollupAddress,
+};
 use tzel_services::kernel_wire::{
     encode_kernel_inbox_message, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
-    KernelTransferReq, KernelUnshieldReq, KernelWithdrawReq,
+    KernelTransferReq, KernelUnshieldReq,
 };
 use tzel_services::operator_api::{
     RollupSubmission, RollupSubmissionKind, RollupSubmissionStatus, RollupSubmissionTransport,
@@ -1502,6 +1505,18 @@ fn get_text(url: &str) -> Result<String, String> {
         .map_err(|e| format!("read response: {}", e))
 }
 
+fn get_text_allow_404(url: &str) -> Result<Option<String>, String> {
+    match ureq::get(url).call() {
+        Ok(resp) => resp
+            .into_body()
+            .read_to_string()
+            .map(Some)
+            .map_err(|e| format!("read response: {}", e)),
+        Err(ureq::Error::StatusCode(404)) => Ok(None),
+        Err(e) => Err(format!("HTTP error: {}", e)),
+    }
+}
+
 fn ensure_path_matches_root(
     path_root: &F,
     expected_root: &F,
@@ -1550,6 +1565,10 @@ fn default_network_profile_path(wallet_path: &str) -> PathBuf {
 
 fn default_octez_client_bin() -> String {
     "octez-client".into()
+}
+
+fn default_shadownet_octez_protocol() -> &'static str {
+    "PtTALLiN"
 }
 
 fn default_octez_burn_cap() -> String {
@@ -1686,6 +1705,109 @@ struct RollupSubmissionReceipt {
     pending_dal: bool,
 }
 
+struct OctezAddressInfo {
+    hash: String,
+}
+
+fn is_implicit_tezos_account_id(value: &str) -> bool {
+    matches!(
+        TezosContract::from_b58check(value),
+        Ok(TezosContract::Implicit(_))
+    )
+}
+
+fn canonicalize_public_balance_key(source_hash: &str, value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("public rollup account must not be empty".into());
+    }
+    if is_implicit_tezos_account_id(value) {
+        return Ok(value.to_string());
+    }
+    if parse_public_balance_key(value).is_some() {
+        let _ = withdraw_owner_from_public_balance_key(value)?;
+        return Ok(value.to_string());
+    }
+    public_balance_key(source_hash, value)
+}
+
+fn withdraw_owner_from_public_balance_key<'a>(value: &'a str) -> Result<&'a str, String> {
+    if is_implicit_tezos_account_id(value) {
+        return Ok(value);
+    }
+    if let Some((owner, _label)) = parse_public_balance_key(value) {
+        if is_implicit_tezos_account_id(owner) {
+            return Ok(owner);
+        }
+        return Err(format!(
+            "public rollup account {} has non-implicit owner {}",
+            value, owner
+        ));
+    }
+    Err(format!(
+        "public rollup account {} must be a tz1/tz2/tz3 address or public:<tz-address>:<label>",
+        value
+    ))
+}
+
+fn validate_l1_withdrawal_recipient(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("L1 withdrawal recipient must not be empty".into());
+    }
+    TezosContract::from_b58check(value)
+        .map(|_| value.to_string())
+        .map_err(|_| format!("invalid L1 withdrawal recipient: {}", value))
+}
+
+fn resolve_rollup_unshield_recipient(
+    rollup: &RollupRpc,
+    recipient: Option<&str>,
+) -> Result<String, String> {
+    match recipient {
+        Some(value) => validate_l1_withdrawal_recipient(value),
+        None => Ok(rollup.source_address_info()?.hash),
+    }
+}
+
+fn resolved_profile_public_balance_key(
+    profile: &WalletNetworkProfile,
+    rollup: &RollupRpc,
+) -> Result<String, String> {
+    if is_implicit_tezos_account_id(&profile.public_account)
+        || parse_public_balance_key(&profile.public_account).is_some()
+    {
+        return Ok(profile.public_account.clone());
+    }
+    let source = rollup.source_address_info()?;
+    canonicalize_public_balance_key(&source.hash, &profile.public_account)
+}
+
+fn legacy_plain_public_balance_label(
+    profile: &WalletNetworkProfile,
+    canonical_key: &str,
+) -> Option<String> {
+    let raw = profile.public_account.trim();
+    if raw.is_empty()
+        || raw == canonical_key
+        || is_implicit_tezos_account_id(raw)
+        || parse_public_balance_key(raw).is_some()
+    {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+fn effective_octez_protocol(profile: &WalletNetworkProfile) -> Option<&str> {
+    profile.octez_protocol.as_deref().or_else(|| {
+        if profile.network == "shadownet" {
+            Some(default_shadownet_octez_protocol())
+        } else {
+            None
+        }
+    })
+}
+
 #[derive(Clone)]
 struct RollupStateSnapshot {
     auth_domain: F,
@@ -1761,7 +1883,11 @@ impl<'a> RollupRpc<'a> {
         key: &str,
     ) -> Result<Option<usize>, String> {
         let url = self.block_durable_length_url(block_ref, key);
-        let raw = get_text(&url).map_err(|e| format!("rollup RPC {} failed: {}", url, e))?;
+        let Some(raw) =
+            get_text_allow_404(&url).map_err(|e| format!("rollup RPC {} failed: {}", url, e))?
+        else {
+            return Ok(None);
+        };
         Self::parse_durable_length(key, &raw)
     }
 
@@ -2150,7 +2276,27 @@ impl<'a> RollupRpc<'a> {
         self.run_octez_client(&mut args)
     }
 
+    fn source_address_info(&self) -> Result<OctezAddressInfo, String> {
+        let mut args = vec![
+            "show".to_string(),
+            "address".to_string(),
+            self.profile.source_alias.clone(),
+        ];
+        let output = self.run_octez_client_output(&mut args)?;
+        parse_octez_address_info(&output)
+    }
+
     fn run_octez_client(&self, args: &mut Vec<String>) -> Result<RollupSubmissionReceipt, String> {
+        let combined = self.run_octez_client_output(args)?;
+        Ok(RollupSubmissionReceipt {
+            output: combined.clone(),
+            operation_hash: extract_operation_hash(&combined),
+            submission_id: None,
+            pending_dal: false,
+        })
+    }
+
+    fn run_octez_client_output(&self, args: &mut Vec<String>) -> Result<String, String> {
         let mut command = std::process::Command::new(&self.profile.octez_client_bin);
         if let Some(dir) = &self.profile.octez_client_dir {
             command.arg("-d").arg(dir);
@@ -2158,7 +2304,7 @@ impl<'a> RollupRpc<'a> {
         if let Some(endpoint) = &self.profile.octez_node_endpoint {
             command.arg("-E").arg(endpoint);
         }
-        if let Some(protocol) = &self.profile.octez_protocol {
+        if let Some(protocol) = effective_octez_protocol(self.profile) {
             command.arg("-p").arg(protocol);
         }
         command.arg("-w").arg("none");
@@ -2188,12 +2334,7 @@ impl<'a> RollupRpc<'a> {
             });
         }
 
-        Ok(RollupSubmissionReceipt {
-            operation_hash: extract_operation_hash(&combined),
-            output: combined,
-            submission_id: None,
-            pending_dal: false,
-        })
+        Ok(combined)
     }
 }
 
@@ -2478,6 +2619,26 @@ fn extract_operation_hash(output: &str) -> Option<String> {
         })
 }
 
+fn extract_octez_prefixed_value(output: &str, prefix: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let line = line.trim();
+        line.strip_prefix(prefix)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string())
+    })
+}
+
+fn parse_octez_address_info(output: &str) -> Result<OctezAddressInfo, String> {
+    let hash = extract_octez_prefixed_value(output, "Hash:").ok_or_else(|| {
+        format!(
+            "could not parse octez-client address hash from output: {}",
+            output
+        )
+    })?;
+    Ok(OctezAddressInfo { hash })
+}
+
 fn host_stark_proof_to_kernel(proof: &Proof) -> Result<KernelStarkProof, String> {
     match proof {
         Proof::TrustMeBro => Err("rollup submission requires a real STARK proof".into()),
@@ -2535,14 +2696,6 @@ fn unshield_req_to_kernel(req: &UnshieldReq) -> Result<KernelUnshieldReq, String
         enc_fee: req.enc_fee.clone(),
         proof: host_stark_proof_to_kernel(&req.proof)?,
     })
-}
-
-fn withdraw_req_to_kernel(req: &WithdrawReq) -> KernelWithdrawReq {
-    KernelWithdrawReq {
-        sender: req.sender.clone(),
-        recipient: req.recipient.clone(),
-        amount: req.amount,
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -2638,7 +2791,7 @@ enum Cmd {
         #[arg(long)]
         memo: Option<String>,
     },
-    /// Unshield: withdraw private notes to a public address
+    /// Unshield: withdraw private notes to an L1 address
     Unshield {
         #[arg(short, long, default_value = "http://localhost:8080")]
         ledger: String,
@@ -2864,26 +3017,15 @@ enum UserCmd {
         #[arg(long)]
         memo: Option<String>,
     },
-    /// Move private funds back into a public rollup balance.
+    /// Unshield private notes directly to an L1 tz/KT1 recipient.
     Unshield {
         #[arg(long)]
         amount: u64,
         #[arg(long)]
         fee: Option<u64>,
-        /// Override the public rollup account to receive the transparent balance.
+        /// Override the default L1 recipient. Defaults to the source alias address.
         #[arg(long)]
         recipient: Option<String>,
-    },
-    /// Withdraw public rollup balance back to an L1 tz1/KT1 address.
-    Withdraw {
-        #[arg(long)]
-        amount: u64,
-        /// Override the public rollup account to debit.
-        #[arg(long)]
-        sender: Option<String>,
-        /// L1 recipient for the withdrawal outbox message.
-        #[arg(long)]
-        recipient: String,
     },
     /// Query a submission previously accepted by the configured operator.
     Status {
@@ -3087,7 +3229,6 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         | UserCmd::Balance
         | UserCmd::Check
         | UserCmd::Status { .. }
-        | UserCmd::Withdraw { .. }
         | UserCmd::ExportDetect { .. }
         | UserCmd::ExportView { .. }
         | UserCmd::ExportOutgoing { .. } => None,
@@ -3163,17 +3304,14 @@ fn run_user(cli: UserCli) -> Result<(), String> {
             recipient,
         } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            let recipient = recipient.unwrap_or_else(|| profile.public_account.clone());
-            cmd_unshield_rollup(&cli.wallet, &profile, amount, fee, &recipient, &pc)
-        }
-        UserCmd::Withdraw {
-            amount,
-            sender,
-            recipient,
-        } => {
-            let profile = load_required_network_profile(&cli.wallet)?;
-            let sender = sender.unwrap_or_else(|| profile.public_account.clone());
-            cmd_withdraw_rollup(&profile, &sender, amount, &recipient)
+            cmd_unshield_rollup(
+                &cli.wallet,
+                &profile,
+                amount,
+                fee,
+                recipient.as_deref(),
+                &pc,
+            )
         }
         UserCmd::Status { submission_id } => {
             let profile = load_required_network_profile(&cli.wallet)?;
@@ -3213,6 +3351,33 @@ fn run_user_profile(wallet_path: &str, cmd: UserProfileCmd) -> Result<(), String
                 ));
             }
             let dal_fee_address = load_address(&dal_fee_address)?;
+            let public_account = {
+                let candidate = public_account.unwrap_or_else(|| source_alias.clone());
+                if is_implicit_tezos_account_id(&candidate)
+                    || parse_public_balance_key(&candidate).is_some()
+                {
+                    Some(candidate)
+                } else {
+                    let probe_profile = shadownet_profile(
+                        rollup_node_url.clone(),
+                        rollup_address.clone(),
+                        bridge_ticketer.clone(),
+                        dal_fee,
+                        dal_fee_address.clone(),
+                        operator_url.clone(),
+                        operator_bearer_token.clone(),
+                        source_alias.clone(),
+                        Some(candidate.clone()),
+                        octez_client_dir.clone(),
+                        octez_node_endpoint.clone(),
+                        octez_protocol.clone(),
+                        octez_client_bin.clone(),
+                        burn_cap.clone(),
+                    );
+                    let source = RollupRpc::new(&probe_profile).source_address_info()?;
+                    Some(canonicalize_public_balance_key(&source.hash, &candidate)?)
+                }
+            };
             let profile = shadownet_profile(
                 rollup_node_url,
                 rollup_address,
@@ -3712,7 +3877,7 @@ mod tests {
             bridge_ticketer: "KT1Jg4fj5wwnKHuW8aa9uDX6dRYBdjXhm2sJ".into(),
             dal_fee: 1,
             dal_fee_address: payment_address_for_wallet_address(&wallet, 0),
-            public_account: "alice".into(),
+            public_account: "tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN".into(),
             operator_url: None,
             operator_bearer_token: None,
             source_alias: "alice".into(),
@@ -3779,6 +3944,33 @@ mod tests {
         assert_eq!(
             balance_durable_key("tzelshadownet"),
             "/tzel/v1/state/balances/by-key/747a656c736861646f776e6574"
+        );
+    }
+
+    #[test]
+    fn canonicalize_public_balance_key_wraps_plain_labels_with_source_owner() {
+        assert_eq!(
+            canonicalize_public_balance_key("tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN", "alice")
+                .unwrap(),
+            "public:tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN:alice"
+        );
+    }
+
+    #[test]
+    fn canonicalize_public_balance_key_preserves_withdrawable_keys() {
+        let implicit = "tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN";
+        let owner_bound = "public:tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN:alice";
+        assert_eq!(
+            canonicalize_public_balance_key(implicit, implicit).unwrap(),
+            implicit
+        );
+        assert_eq!(
+            canonicalize_public_balance_key(implicit, owner_bound).unwrap(),
+            owner_bound
+        );
+        assert_eq!(
+            withdraw_owner_from_public_balance_key(owner_bound).unwrap(),
+            implicit
         );
     }
 
@@ -5743,7 +5935,10 @@ fn cmd_user_balance(path: &str) -> Result<(), String> {
         let profile = load_network_profile(&profile_path)?;
         let rollup = RollupRpc::new(&profile);
         let balances = rollup.load_balances()?;
-        let public_balance = balances.get(&profile.public_account).copied().unwrap_or(0);
+        let public_account = resolved_profile_public_balance_key(&profile, &rollup)?;
+        let public_balance = balances.get(&public_account).copied().unwrap_or(0);
+        let legacy_public_balance = legacy_plain_public_balance_label(&profile, &public_account)
+            .map(|legacy| (legacy.clone(), balances.get(&legacy).copied().unwrap_or(0)));
         let pending_deposit_balance = w
             .pending_deposits
             .iter()
@@ -5756,8 +5951,16 @@ fn cmd_user_balance(path: &str) -> Result<(), String> {
             .sum::<u64>();
         println!(
             "Public rollup balance ({}): {}",
-            profile.public_account, public_balance
+            public_account, public_balance
         );
+        if let Some((legacy_label, legacy_balance)) = legacy_public_balance {
+            if legacy_balance > 0 {
+                println!(
+                    "Legacy unowned public balance ({}): {}",
+                    legacy_label, legacy_balance
+                );
+            }
+        }
         println!(
             "Secret-bound deposit balance: {} across {} pending deposits",
             pending_deposit_balance,
@@ -5776,7 +5979,10 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
     let tree_size = snapshot.tree.leaves.len();
     let required_tx_fee = snapshot.required_tx_fee;
     let balances = rollup.load_balances_at_block(&head_hash)?;
-    let public_balance = balances.get(&profile.public_account).copied().unwrap_or(0);
+    let public_account = resolved_profile_public_balance_key(profile, &rollup)?;
+    let public_balance = balances.get(&public_account).copied().unwrap_or(0);
+    let legacy_public_balance = legacy_plain_public_balance_label(profile, &public_account)
+        .map(|legacy| (legacy.clone(), balances.get(&legacy).copied().unwrap_or(0)));
     let pending_deposit_balance = wallet
         .pending_deposits
         .iter()
@@ -5806,8 +6012,16 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
     );
     println!(
         "Public rollup balance ({}): {}",
-        profile.public_account, public_balance
+        public_account, public_balance
     );
+    if let Some((legacy_label, legacy_balance)) = legacy_public_balance {
+        if legacy_balance > 0 {
+            println!(
+                "Legacy unowned public balance ({}): {}",
+                legacy_label, legacy_balance
+            );
+        }
+    }
     println!(
         "Secret-bound deposit balance: {} across {} pending deposits",
         pending_deposit_balance,
@@ -5839,7 +6053,8 @@ fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), Str
     let summary = apply_scan_feed(&mut w, &feed, nullifiers);
     save_wallet(path, &w)?;
     let balances = rollup.load_balances()?;
-    let public_balance = balances.get(&profile.public_account).copied().unwrap_or(0);
+    let public_account = resolved_profile_public_balance_key(profile, &rollup)?;
+    let public_balance = balances.get(&public_account).copied().unwrap_or(0);
     let pending_deposit_balance = w
         .pending_deposits
         .iter()
@@ -6363,6 +6578,7 @@ fn cmd_unshield(
     recipient: &str,
     pc: &ProveConfig,
 ) -> Result<(), String> {
+    let recipient = validate_l1_withdrawal_recipient(recipient)?;
     let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
     let fee = resolve_requested_tx_fee(fee, cfg.required_tx_fee)?;
     ensure_positive_dal_fee(dal_fee)?;
@@ -6381,7 +6597,7 @@ fn cmd_unshield(
             fee,
             dal_fee,
             &producer_address,
-            recipient,
+            &recipient,
         )?;
         save_wallet(path, &w)?;
         let resp: UnshieldResp = post_json(&format!("{}/unshield", ledger), &prepared.req)?;
@@ -6593,7 +6809,7 @@ fn cmd_unshield(
         nullifiers,
         v_pub: amount,
         fee,
-        recipient: recipient.into(),
+        recipient: recipient.clone(),
         cm_change,
         enc_change,
         cm_fee: producer_note.cm,
@@ -6932,10 +7148,11 @@ fn cmd_unshield_rollup(
     profile: &WalletNetworkProfile,
     amount: u64,
     fee: Option<u64>,
-    recipient: &str,
+    recipient: Option<&str>,
     pc: &ProveConfig,
 ) -> Result<(), String> {
     let rollup = RollupRpc::new(profile);
+    let recipient = resolve_rollup_unshield_recipient(&rollup, recipient)?;
     let snapshot = rollup.load_state_snapshot()?;
     let fee = resolve_requested_tx_fee(fee, snapshot.required_tx_fee)?;
     ensure_positive_dal_fee(profile.dal_fee)?;
@@ -7113,7 +7330,7 @@ fn cmd_unshield_rollup(
         nullifiers: nullifiers.clone(),
         v_pub: amount,
         fee,
-        recipient: recipient.into(),
+        recipient: recipient.clone(),
         cm_change,
         enc_change,
         cm_fee: producer_note.cm,
@@ -7130,42 +7347,11 @@ fn cmd_unshield_rollup(
     save_wallet(path, &w)?;
 
     println!(
-        "Submitted unshield of {} into public account {} with fee {} + dal fee {}",
+        "Submitted unshield of {} to L1 recipient {} with fee {} + dal fee {}",
         amount, recipient, fee, profile.dal_fee
     );
     print_rollup_submission(&submission);
-    print_rollup_sync_hint(&submission);
-    Ok(())
-}
-
-fn cmd_withdraw_rollup(
-    profile: &WalletNetworkProfile,
-    sender: &str,
-    amount: u64,
-    recipient: &str,
-) -> Result<(), String> {
-    let rollup = RollupRpc::new(profile);
-    let balances = rollup.load_balances()?;
-    let public_balance = balances.get(sender).copied().unwrap_or(0);
-    if public_balance < amount {
-        return Err(format!(
-            "insufficient public rollup balance for {}: have {}, need {}",
-            sender, public_balance, amount
-        ));
-    }
-    let req = WithdrawReq {
-        sender: sender.into(),
-        recipient: recipient.into(),
-        amount,
-    };
-    let submission = rollup
-        .submit_kernel_message(&KernelInboxMessage::Withdraw(withdraw_req_to_kernel(&req)))?;
-    println!(
-        "Submitted withdrawal of {} from {} to {}",
-        amount, sender, recipient
-    );
-    print_rollup_submission(&submission);
-    println!("The L1 release still requires the normal smart-rollup outbox/cementation flow.");
+    println!("The L1 release now comes from this unshield via the normal smart-rollup outbox/cementation flow.");
     Ok(())
 }
 
@@ -7552,6 +7738,189 @@ mod network_profile_tests {
         assert_eq!(
             wallet.pending_deposits[0].operation_hash.as_deref(),
             Some("ooPersistedDepositSecret")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmd_unshield_rollup_skips_octez_lookup_for_explicit_l1_recipient() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let note_value = 200_000u64;
+        let mut wallet = super::tests::test_wallet(1);
+        let addr = wallet.addresses[0].clone();
+        let acc = wallet.account();
+        let nk_spend = derive_nk_spend(&acc.nk, &addr.d_j);
+        let nk_tag = derive_nk_tag(&nk_spend);
+        let otag = owner_tag(&addr.auth_root, &addr.auth_pub_seed, &nk_tag);
+        let rseed = felt_tag(b"canonical-unshield");
+        let rcm = derive_rcm(&rseed);
+        let cm = commit(&addr.d_j, note_value, &rcm, &otag);
+        wallet.notes.push(Note {
+            nk_spend,
+            nk_tag,
+            auth_root: addr.auth_root,
+            d_j: addr.d_j,
+            v: note_value,
+            rseed,
+            cm,
+            index: 0,
+            addr_index: 0,
+        });
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        let note = super::tests::note_memo_for_wallet_address(
+            &wallet,
+            0,
+            note_value,
+            wallet.notes[0].rseed,
+            None,
+        );
+        let encoded = canonical_wire::encode_published_note(&note.cm, &note.enc)
+            .expect("published note should encode");
+        let root = MerkleTree::from_leaves(vec![note.cm]).root();
+
+        let octez_log = dir.path().join("octez.log");
+        let octez_client = dir.path().join("fake-octez-client.sh");
+        let reprove = dir.path().join("fake-reprove.sh");
+        std::fs::write(
+            &octez_client,
+            format!(
+                "#!/bin/sh\nset -eu\necho \"$@\" >> '{}'\necho 'octez should not be invoked for canonical unshield recipients' >&2\nexit 64\n",
+                octez_log.display()
+            ),
+        )
+        .expect("write fake octez-client");
+        std::fs::set_permissions(&octez_client, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake octez-client");
+        std::fs::write(
+            &reprove,
+            "#!/bin/sh\nset -eu\nout=''\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--output' ]; then\n    out=\"$2\"\n    shift 2\n  else\n    shift\n  fi\ndone\nprintf '%s' '{\"proof_bytes\":\"de\",\"output_preimage\":[]}' > \"$out\"\n",
+        )
+        .expect("write fake reprove");
+        std::fs::set_permissions(&reprove, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake reprove");
+
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            (
+                "/global/block/head/hash".into(),
+                (200, "\"BLunshieldhead\"".into()),
+            ),
+            (
+                "/global/block/BLunshieldhead/level".into(),
+                (200, "10".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_AUTH_DOMAIN
+                ),
+                (200, format!("\"{}\"", hex::encode(default_auth_domain()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_SIZE
+                ),
+                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
+            ),
+            (
+                format!(
+                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_TREE_ROOT
+                ),
+                (200, format!("\"{}\"", hex::encode(root))),
+            ),
+            (
+                format!(
+                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/length?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, encoded.len().to_string()),
+            ),
+            (
+                format!(
+                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/value?key={}",
+                    indexed_durable_key(DURABLE_NOTE_PREFIX, 0)
+                ),
+                (200, format!("\"{}\"", hex::encode(encoded))),
+            ),
+            (
+                format!(
+                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_LAST_INPUT_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_FEE_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+            (
+                format!(
+                    "/global/block/BLunshieldhead/durable/wasm_2_0_0/length?key={}",
+                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
+                ),
+                (200, "null".into()),
+            ),
+        ]));
+        let operator_url = super::tests::spawn_mock_http_server(HashMap::from([(
+            "/v1/rollup/submissions".into(),
+            (
+                200,
+                serde_json::to_string(&SubmitRollupMessageResp {
+                    submission: RollupSubmission {
+                        id: "sub-unshield".into(),
+                        kind: RollupSubmissionKind::Unshield,
+                        rollup_address: "sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP".into(),
+                        status: RollupSubmissionStatus::PendingDal,
+                        transport: RollupSubmissionTransport::Dal,
+                        operation_hash: Some("ooCanonicalUnshield".into()),
+                        dal_chunks: vec![],
+                        commitment: None,
+                        published_level: None,
+                        slot_index: None,
+                        payload_hash: None,
+                        payload_len: 123,
+                        detail: Some("queued".into()),
+                    },
+                })
+                .expect("serialize operator response"),
+            ),
+        )]));
+        let mut profile = super::tests::rollup_profile_for_url(&base_url);
+        profile.operator_url = Some(operator_url);
+        profile.operator_bearer_token = Some("operator-secret".into());
+        profile.octez_client_bin = octez_client.to_str().unwrap().into();
+
+        let pc = ProveConfig {
+            skip_proof: false,
+            reprove_bin: reprove.to_str().unwrap().into(),
+            executables_dir: "cairo/target/dev".into(),
+        };
+        let recipient = "tz1LhXujSfRndomkcC64pCpkkjLWQwsmCUMk";
+        let amount = note_value - MIN_TX_FEE - profile.dal_fee;
+
+        cmd_unshield_rollup(
+            wallet_path_str,
+            &profile,
+            amount,
+            None,
+            Some(recipient),
+            &pc,
+        )
+        .expect("explicit L1 unshield recipient should not require octez source lookup");
+
+        let octez_log = std::fs::read_to_string(&octez_log).unwrap_or_default();
+        assert!(
+            octez_log.trim().is_empty(),
+            "unexpected octez invocations: {octez_log}"
         );
     }
 

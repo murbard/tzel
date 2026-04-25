@@ -6,4 +6,4 @@
  (c_library_flags
   -Lvendor/mlkem-native/test/build
   -lmlkem768)
- (libraries mirage-crypto hex cstruct yojson))
+ (libraries mirage-crypto hex cstruct yojson digestif))

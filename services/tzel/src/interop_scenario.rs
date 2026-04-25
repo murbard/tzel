@@ -68,8 +68,7 @@ pub struct InteropUnshieldStep {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct InteropExpected {
-    pub alice_public_balance: u64,
-    pub bob_public_balance: u64,
+    pub withdrawals: Vec<WithdrawalRecord>,
     pub tree_size: usize,
     pub nullifier_count: usize,
 }
@@ -110,6 +109,8 @@ fn fixed_ephemeral(seed: u8) -> [u8; 32] {
     }
     out
 }
+
+const INTEROP_L1_RECIPIENT: &str = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx";
 
 fn derive_scenario_address(acc: &Account, j: u32) -> DerivedScenarioAddress {
     let d_j = derive_address(&acc.incoming_seed, j);
@@ -282,7 +283,7 @@ pub fn generate_interop_scenario() -> InteropScenario {
             nullifiers: vec![bob_nf],
             v_pub: 99_999,
             fee: MIN_TX_FEE,
-            recipient: "bob".into(),
+            recipient: INTEROP_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
             memo_ct_hash_change: ZERO,
@@ -291,8 +292,10 @@ pub fn generate_interop_scenario() -> InteropScenario {
             memo_ct_hash_fee: unshield_fee_mh,
         },
         expected: InteropExpected {
-            alice_public_balance: 0,
-            bob_public_balance: 99_999,
+            withdrawals: vec![WithdrawalRecord {
+                recipient: INTEROP_L1_RECIPIENT.into(),
+                amount: 99_999,
+            }],
             tree_size: 6,
             nullifier_count: 2,
         },
@@ -372,7 +375,7 @@ mod tests {
 
         assert_eq!(scenario.unshield.v_pub, 99_999);
         assert_eq!(scenario.unshield.fee, MIN_TX_FEE);
-        assert_eq!(scenario.unshield.recipient, "bob");
+        assert_eq!(scenario.unshield.recipient, INTEROP_L1_RECIPIENT);
         assert_eq!(scenario.unshield.cm_change, ZERO);
         assert!(scenario.unshield.enc_change.is_none());
         assert_eq!(scenario.unshield.memo_ct_hash_change, ZERO);
@@ -382,8 +385,13 @@ mod tests {
         );
         tree.append(scenario.unshield.cm_fee);
 
-        assert_eq!(scenario.expected.alice_public_balance, 0);
-        assert_eq!(scenario.expected.bob_public_balance, 99_999);
+        assert_eq!(
+            scenario.expected.withdrawals,
+            vec![WithdrawalRecord {
+                recipient: INTEROP_L1_RECIPIENT.into(),
+                amount: 99_999,
+            }]
+        );
         assert_eq!(scenario.expected.tree_size, tree.leaves.len());
         assert_eq!(scenario.expected.nullifier_count, 2);
     }
@@ -413,7 +421,14 @@ mod tests {
             serde_json::from_str(&json).expect("interop scenario json should parse");
 
         assert_eq!(reparsed.shield.sender, "alice");
-        assert_eq!(reparsed.unshield.recipient, "bob");
+        assert_eq!(reparsed.unshield.recipient, INTEROP_L1_RECIPIENT);
+        assert_eq!(
+            reparsed.expected.withdrawals,
+            vec![WithdrawalRecord {
+                recipient: INTEROP_L1_RECIPIENT.into(),
+                amount: 99_999,
+            }]
+        );
         assert_eq!(reparsed.expected.tree_size, 6);
         assert_eq!(reparsed.expected.nullifier_count, 2);
     }

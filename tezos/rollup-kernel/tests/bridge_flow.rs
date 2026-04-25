@@ -23,7 +23,7 @@ use tezos_smart_rollup_encoding::{
 use tzel_core::kernel_wire::{
     encode_kernel_inbox_message, sign_kernel_bridge_config, KernelBridgeConfig,
     KernelDalChunkPointer, KernelDalPayloadKind, KernelDalPayloadPointer, KernelInboxMessage,
-    KernelResult, KernelWithdrawReq,
+    KernelResult,
 };
 #[cfg(feature = "proof-verifier")]
 use tzel_core::kernel_wire::{
@@ -39,9 +39,6 @@ use tzel_rollup_kernel::{
 };
 
 const PATH_BRIDGE_TICKETER: &[u8] = b"/tzel/v1/state/bridge/ticketer";
-const PATH_BALANCE_ACCOUNT_COUNT: &[u8] = b"/tzel/v1/state/balances/count";
-const PATH_BALANCE_PREFIX: &[u8] = b"/tzel/v1/state/balances/by-key/";
-const PATH_BALANCE_INDEX_PREFIX: &[u8] = b"/tzel/v1/state/balances/index/";
 const PATH_WITHDRAWAL_PREFIX: &[u8] = b"/tzel/v1/state/withdrawals/index/";
 
 #[derive(Clone, Default)]
@@ -176,121 +173,51 @@ fn signed_verifier_message(config: KernelVerifierConfig) -> KernelInboxMessage {
     )
 }
 
+#[cfg(feature = "proof-verifier")]
 #[test]
-fn bridge_roundtrip_survives_restarts_and_preserves_append_only_withdrawals() {
+fn verified_unshield_survives_restart_and_persists_withdrawal_record() {
+    let fixture = verified_bridge_fixture();
     let mut host = TestHost::default();
-    host.push_input(
-        0,
-        0,
-        encode_external_kernel_message(signed_bridge_message(KernelBridgeConfig {
-            ticketer: sample_ticketer().into(),
-        })),
-    );
-
-    run_with_host(&mut host);
-
-    assert_eq!(
-        host.read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
-            .expect("ticketer stored"),
-        sample_ticketer().as_bytes()
-    );
-    assert!(matches!(
-        read_last_result(&host).unwrap(),
-        KernelResult::Configured
-    ));
-
-    let alice_deposit_key = deposit_balance_key(&deposit_id_from_label("alice"));
-    host.push_input(1, 0, encode_ticket_deposit_message(&alice_deposit_key, 75));
-    run_with_host(&mut host);
-
-    assert!(matches!(
-        read_last_result(&host).unwrap(),
-        KernelResult::Deposit
-    ));
-    assert_eq!(
-        read_ledger(&host).unwrap().balances.get(&alice_deposit_key),
-        Some(&75)
-    );
-    write_public_balance(&mut host, "alice", 75);
-
-    let first_withdraw =
-        encode_external_kernel_message(KernelInboxMessage::Withdraw(KernelWithdrawReq {
-            sender: "alice".into(),
-            recipient: sample_l1_receiver().into(),
-            amount: 40,
-        }));
-    host.push_input(2, 0, first_withdraw);
-    run_with_host(&mut host);
-
-    match read_last_result(&host).unwrap() {
-        KernelResult::Withdraw(resp) => {
-            let withdrawal_index = resp.withdrawal_index;
-            assert_eq!(withdrawal_index, 0)
-        }
-        other => panic!("unexpected rollup result: {:?}", other),
-    }
-    assert_eq!(host.outputs.len(), 1);
-    assert_outbox_withdrawal(
-        &host.outputs[0],
-        sample_ticketer(),
-        sample_l1_receiver(),
-        40,
-    );
+    configure_verified_bridge(&mut host, fixture);
+    apply_fixture_deposit(&mut host, fixture, 2);
+    apply_fixture_shield(&mut host, fixture, 3);
+    apply_fixture_transfer(&mut host, fixture, 4);
 
     let mut restarted = TestHost::from_store(host.store.clone());
-    restarted.outputs = host.outputs.clone();
-    write_public_balance(&mut restarted, "alice", 45);
-    restarted.push_input(3, 0, encode_ticket_deposit_message(&alice_deposit_key, 10));
-    restarted.push_input(
-        4,
-        0,
-        encode_external_kernel_message(KernelInboxMessage::Withdraw(KernelWithdrawReq {
-            sender: "alice".into(),
-            recipient: sample_l1_receiver().into(),
-            amount: 5,
-        })),
-    );
-
-    run_with_host(&mut restarted);
-
-    let stats = read_stats(&restarted);
-    assert_eq!(stats.raw_input_count, 5);
-    assert_eq!(stats.last_input_level, Some(4));
-    assert_eq!(stats.last_input_id, Some(0));
-    assert_eq!(
-        read_last_input(&restarted)
-            .expect("last input persisted")
-            .level,
-        4
-    );
+    apply_fixture_unshield(&mut restarted, fixture, 5);
 
     match read_last_result(&restarted).unwrap() {
-        KernelResult::Withdraw(resp) => {
-            let withdrawal_index = resp.withdrawal_index;
-            assert_eq!(withdrawal_index, 1)
+        KernelResult::Unshield(resp) => {
+            assert_eq!(resp.change_index, None);
+            assert_eq!(resp.producer_index, 5);
         }
         other => panic!("unexpected rollup result: {:?}", other),
     }
 
     let ledger = read_ledger(&restarted).unwrap();
-    assert_eq!(ledger.balances.get("alice"), Some(&40));
-    assert_eq!(ledger.withdrawals.len(), 2);
-    assert_eq!(ledger.withdrawals[0].recipient, sample_l1_receiver());
-    assert_eq!(ledger.withdrawals[0].amount, 40);
-    assert_eq!(ledger.withdrawals[1].recipient, sample_l1_receiver());
-    assert_eq!(ledger.withdrawals[1].amount, 5);
+    assert_eq!(ledger.withdrawals.len(), 1);
+    assert_eq!(ledger.withdrawals[0].recipient, fixture.unshield.recipient);
+    assert_eq!(ledger.withdrawals[0].amount, fixture.unshield.v_pub);
     assert!(restarted
         .store
         .contains_key(&indexed_path(PATH_WITHDRAWAL_PREFIX, 0)));
-    assert!(restarted
-        .store
-        .contains_key(&indexed_path(PATH_WITHDRAWAL_PREFIX, 1)));
-    assert_eq!(restarted.outputs.len(), 2);
+    assert_eq!(restarted.outputs.len(), 1);
     assert_outbox_withdrawal(
-        &restarted.outputs[1],
-        sample_ticketer(),
-        sample_l1_receiver(),
-        5,
+        &restarted.outputs[0],
+        fixture.bridge_ticketer.as_str(),
+        fixture.unshield.recipient.as_str(),
+        fixture.unshield.v_pub,
+    );
+
+    let stats = read_stats(&restarted);
+    assert_eq!(stats.raw_input_count, 6);
+    assert_eq!(stats.last_input_level, Some(5));
+    assert_eq!(stats.last_input_id, Some(0));
+    assert_eq!(
+        read_last_input(&restarted)
+            .expect("last input persisted")
+            .level,
+        5
     );
 }
 
@@ -506,56 +433,38 @@ fn verified_bridge_roundtrip_uses_checked_in_real_proofs() {
         other => panic!("unexpected rollup result: {:?}", other),
     }
     let ledger = read_ledger(&restarted).unwrap();
-    assert_eq!(
-        ledger.balances.get(fixture.unshield.recipient.as_str()),
-        Some(&fixture.unshield.v_pub)
-    );
     assert_eq!(ledger.nullifiers.len(), 2);
     assert!(ledger.nullifiers.contains(&fixture.transfer.nullifiers[0]));
     assert!(ledger.nullifiers.contains(&fixture.unshield.nullifiers[0]));
-
-    restarted.push_input(
-        6,
-        0,
-        encode_external_kernel_message(KernelInboxMessage::Withdraw(KernelWithdrawReq {
-            sender: fixture.unshield.recipient.clone(),
-            recipient: fixture.withdrawal_recipient.clone(),
-            amount: fixture.unshield.v_pub,
-        })),
-    );
-    run_with_host(&mut restarted);
-
-    match read_last_result(&restarted).unwrap() {
-        KernelResult::Withdraw(resp) => assert_eq!(resp.withdrawal_index, 0),
-        other => panic!("unexpected rollup result: {:?}", other),
-    }
     let stats = read_stats(&restarted);
-    assert_eq!(stats.raw_input_count, 7);
-    assert_eq!(stats.last_input_level, Some(6));
+    assert_eq!(stats.raw_input_count, 6);
+    assert_eq!(stats.last_input_level, Some(5));
     assert_eq!(
         read_last_input(&restarted)
             .expect("last input persisted")
             .level,
-        6
+        5
     );
 
     let ledger = read_ledger(&restarted).unwrap();
-    assert_eq!(
-        ledger.balances.get(fixture.unshield.recipient.as_str()),
-        Some(&0)
-    );
     assert_eq!(ledger.withdrawals.len(), 1);
-    assert_eq!(
-        ledger.withdrawals[0].recipient,
-        fixture.withdrawal_recipient.as_str()
-    );
+    assert_eq!(ledger.withdrawals[0].recipient, fixture.unshield.recipient);
     assert_eq!(ledger.withdrawals[0].amount, fixture.unshield.v_pub);
     assert_eq!(restarted.outputs.len(), 1);
     assert_outbox_withdrawal(
         &restarted.outputs[0],
-        &fixture.bridge_ticketer,
-        &fixture.withdrawal_recipient,
+        fixture.bridge_ticketer.as_str(),
+        fixture.unshield.recipient.as_str(),
         fixture.unshield.v_pub,
+    );
+    let stats = read_stats(&restarted);
+    assert_eq!(stats.raw_input_count, 6);
+    assert_eq!(stats.last_input_level, Some(5));
+    assert_eq!(
+        read_last_input(&restarted)
+            .expect("last input persisted")
+            .level,
+        5
     );
 }
 
@@ -755,7 +664,7 @@ fn verified_unshield_rejects_tampered_recipient_without_mutating_state() {
 
     let before_unshield = read_ledger(&host).unwrap();
     let mut req = fixture.unshield.clone();
-    req.recipient = "mallory".into();
+    req.recipient = sample_other_l1_receiver().into();
     host.push_input(
         5,
         0,
@@ -866,30 +775,6 @@ fn indexed_path(prefix: &[u8], index: u64) -> Vec<u8> {
     path
 }
 
-fn balance_path(addr: &str) -> Vec<u8> {
-    let mut path = Vec::with_capacity(PATH_BALANCE_PREFIX.len() + addr.len() * 2);
-    path.extend_from_slice(PATH_BALANCE_PREFIX);
-    path.extend_from_slice(hex::encode(addr.as_bytes()).as_bytes());
-    path
-}
-
-fn write_public_balance(host: &mut TestHost, account: &str, amount: u64) {
-    let count = host
-        .read_store(PATH_BALANCE_ACCOUNT_COUNT, 8)
-        .map(|bytes| {
-            let mut raw = [0u8; 8];
-            raw.copy_from_slice(&bytes[..8]);
-            u64::from_le_bytes(raw)
-        })
-        .unwrap_or(0);
-    host.write_store(
-        &indexed_path(PATH_BALANCE_INDEX_PREFIX, count),
-        account.as_bytes(),
-    );
-    host.write_store(PATH_BALANCE_ACCOUNT_COUNT, &(count + 1).to_le_bytes());
-    host.write_store(&balance_path(account), &amount.to_le_bytes());
-}
-
 #[cfg(feature = "proof-verifier")]
 fn assert_ledger_state_unchanged(before: &tzel_core::Ledger, after: &tzel_core::Ledger) {
     assert_eq!(after.auth_domain, before.auth_domain);
@@ -909,7 +794,6 @@ struct VerifiedBridgeFixture {
     auth_domain: F,
     program_hashes: ProgramHashes,
     bridge_ticketer: String,
-    withdrawal_recipient: String,
     shield: ShieldReq,
     transfer: TransferReq,
     unshield: UnshieldReq,
@@ -1125,8 +1009,8 @@ fn sample_ticketer() -> &'static str {
     "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc"
 }
 
-fn sample_l1_receiver() -> &'static str {
-    "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx"
+fn sample_other_l1_receiver() -> &'static str {
+    "tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN"
 }
 
 fn sample_l1_source() -> PublicKeyHash {

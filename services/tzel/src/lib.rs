@@ -277,6 +277,8 @@ mod tests {
     use tzel_core::canonical_wire::ML_KEM768_ENCAPSULATION_KEY_BYTES;
 
     const TEST_FEE: u64 = MIN_TX_FEE;
+    const TEST_L1_RECIPIENT: &str = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx";
+    const TEST_ALT_L1_RECIPIENT: &str = "tz1gjaF81ZRRvdzjobyfVNsAeSC6PScjfQwN";
 
     fn random_nonzero_felt() -> F {
         let mut value = random_felt();
@@ -489,7 +491,7 @@ mod tests {
                 nullifiers: vec![nf],
                 v_pub: 100_000,
                 fee: TEST_FEE,
-                recipient: "alice".into(),
+                recipient: TEST_L1_RECIPIENT.into(),
                 cm_change: ZERO,
                 enc_change: None,
                 cm_fee: random_nonzero_felt(),
@@ -498,7 +500,14 @@ mod tests {
             })
             .unwrap();
         assert_eq!(resp.change_index, None);
-        assert_eq!(ledger.balances["alice"], 100_000);
+        assert_eq!(
+            ledger.withdrawals,
+            vec![WithdrawalRecord {
+                recipient: TEST_L1_RECIPIENT.into(),
+                amount: 100_000,
+            }]
+        );
+        assert_eq!(ledger.balances.get("alice"), None);
         assert_eq!(ledger.balances[&test_deposit_key("alice")], 9);
 
         // Double-spend rejected
@@ -508,7 +517,7 @@ mod tests {
                 nullifiers: vec![nf],
                 v_pub: 100_000,
                 fee: TEST_FEE,
-                recipient: "alice".into(),
+                recipient: TEST_L1_RECIPIENT.into(),
                 cm_change: ZERO,
                 enc_change: None,
                 cm_fee: random_nonzero_felt(),
@@ -574,7 +583,17 @@ mod tests {
     #[test]
     fn test_fake_stark_prefixes_auth_domain_for_flat_transfer_like_outputs() {
         let auth_domain = default_auth_domain();
-        let preimage = vec![u(10), u(11), u(12), u(13), u(14), u(15), u(16), u(17), u(18)];
+        let preimage = vec![
+            u(10),
+            u(11),
+            u(12),
+            u(13),
+            u(14),
+            u(15),
+            u(16),
+            u(17),
+            u(18),
+        ];
 
         let proof = fake_stark(preimage.clone());
         let output_preimage = stark_output_preimage(&proof);
@@ -735,7 +754,7 @@ mod tests {
     fn test_attack_unshield_redirect_recipient_rejected() {
         let (mut ledger, _cm, nf, root, _enc) = setup_with_note();
 
-        let alice_recipient = hash(b"alice");
+        let alice_recipient = hash(TEST_L1_RECIPIENT.as_bytes());
         let (cm_fee, enc_fee, mh_fee) = test_output_note(0x12);
 
         // Proof commits to alice as recipient
@@ -756,7 +775,7 @@ mod tests {
             nullifiers: vec![nf],
             v_pub: 1000,
             fee: TEST_FEE,
-            recipient: "attacker".into(), // attacker redirects to themselves
+            recipient: TEST_ALT_L1_RECIPIENT.into(), // attacker redirects to themselves
             cm_change: ZERO,
             enc_change: None,
             cm_fee,
@@ -786,7 +805,7 @@ mod tests {
             nf,
             u(100),
             fee_f(),
-            hash(b"alice"),
+            hash(TEST_L1_RECIPIENT.as_bytes()),
             ZERO,
             ZERO,
             cm_fee,
@@ -798,7 +817,7 @@ mod tests {
             nullifiers: vec![nf],
             v_pub: 1000000, // attacker claims 1000000
             fee: TEST_FEE,
-            recipient: "alice".into(),
+            recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
             cm_fee,
@@ -1044,7 +1063,7 @@ mod tests {
             nullifiers: vec![nf],
             v_pub: 1000,
             fee: TEST_FEE,
-            recipient: "alice".into(),
+            recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
             cm_fee,
@@ -1066,7 +1085,7 @@ mod tests {
                 nullifiers: vec![nf],
                 v_pub: 1000,
                 fee: TEST_FEE,
-                recipient: "alice".into(),
+                recipient: TEST_L1_RECIPIENT.into(),
                 cm_change: ZERO,
                 enc_change: None,
                 cm_fee: cm_fee_a,
@@ -1080,7 +1099,7 @@ mod tests {
             nullifiers: vec![nf],
             v_pub: 1000,
             fee: TEST_FEE,
-            recipient: "alice".into(),
+            recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
             cm_fee: cm_fee_b,
@@ -1101,7 +1120,7 @@ mod tests {
             nullifiers: vec![nf, nf],
             v_pub: 1000,
             fee: TEST_FEE,
-            recipient: "alice".into(),
+            recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
             cm_fee,
@@ -1266,7 +1285,7 @@ mod tests {
         let (mut ledger, _, nf, root, _) = setup_with_note();
 
         let fake_root = random_felt();
-        let recipient = hash(b"alice");
+        let recipient = hash(TEST_L1_RECIPIENT.as_bytes());
         let (cm_fee, enc_fee, mh_fee) = test_output_note(0x33);
 
         let preimage = vec![
@@ -1286,7 +1305,7 @@ mod tests {
             nullifiers: vec![nf],
             v_pub: 1000,
             fee: TEST_FEE,
-            recipient: "alice".into(),
+            recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
             cm_fee,
@@ -1305,7 +1324,7 @@ mod tests {
 
         let real_cm_change = random_felt();
         let fake_cm_change = random_felt(); // attacker's commitment
-        let recipient = hash(b"alice");
+        let recipient = hash(TEST_L1_RECIPIENT.as_bytes());
         let (cm_fee, enc_fee, mh_fee) = test_output_note(0x34);
 
         let preimage = vec![
@@ -1325,7 +1344,7 @@ mod tests {
             nullifiers: vec![nf],
             v_pub: 500,
             fee: TEST_FEE,
-            recipient: "alice".into(),
+            recipient: TEST_L1_RECIPIENT.into(),
             cm_change: fake_cm_change, // attacker substitutes a DIFFERENT change commitment
             enc_change: None,
             cm_fee,
@@ -1579,7 +1598,7 @@ mod tests {
     fn test_regression_unshield_mh_change_zero_enforced() {
         let (mut ledger, _, nf, root, _) = setup_with_note();
 
-        let recipient = hash(b"alice");
+        let recipient = hash(TEST_L1_RECIPIENT.as_bytes());
         let (cm_fee, enc_fee, _mh_fee) = test_output_note(0x38);
         // Proof has nonzero mh_change but no enc_change
         let preimage = vec![
@@ -1599,7 +1618,7 @@ mod tests {
             nullifiers: vec![nf],
             v_pub: 1000,
             fee: TEST_FEE,
-            recipient: "alice".into(),
+            recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
             cm_fee,
@@ -2113,7 +2132,7 @@ mod tests {
                 nullifiers: vec![nf],
                 v_pub: 1000,
                 fee: TEST_FEE,
-                recipient: "alice".into(),
+                recipient: TEST_L1_RECIPIENT.into(),
                 cm_change: ZERO,
                 enc_change: Some(enc),
                 cm_fee: random_nonzero_felt(),
@@ -2167,7 +2186,7 @@ mod tests {
             nullifiers: vec![],
             v_pub: 100,
             fee: TEST_FEE,
-            recipient: "alice".into(),
+            recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
             cm_fee,
@@ -2743,7 +2762,7 @@ mod tests {
             nullifiers: nfs8,
             v_pub: 100,
             fee: TEST_FEE,
-            recipient: "alice".into(),
+            recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
             cm_fee: cm_fee_a,
@@ -2760,7 +2779,7 @@ mod tests {
             nullifiers: nfs7,
             v_pub: 100,
             fee: TEST_FEE,
-            recipient: "alice".into(),
+            recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
             cm_fee: cm_fee_b,
@@ -3386,7 +3405,7 @@ exit 2
     }
 
     #[test]
-    fn test_unshield_rejects_public_balance_overflow() {
+    fn test_unshield_queues_withdrawal_without_touching_existing_public_balance() {
         let mut ledger = Ledger::new();
         ledger.balances.insert("alice".into(), u64::MAX);
         let (cm_fee, enc_fee, _mh_fee) = test_output_note(0x57);
@@ -3396,7 +3415,7 @@ exit 2
             nullifiers: vec![random_felt()],
             v_pub: 1,
             fee: TEST_FEE,
-            recipient: "alice".into(),
+            recipient: TEST_L1_RECIPIENT.into(),
             cm_change: ZERO,
             enc_change: None,
             cm_fee,
@@ -3404,21 +3423,22 @@ exit 2
             proof: Proof::TrustMeBro,
         };
 
-        let err = ledger.unshield(&req).unwrap_err();
-        assert!(
-            err.contains("public balance overflow"),
-            "unexpected error: {}",
-            err
-        );
+        let resp = ledger.unshield(&req).unwrap();
+        assert_eq!(resp.change_index, None);
+        assert_eq!(resp.producer_index, 0);
         assert_eq!(ledger.balances.get("alice"), Some(&u64::MAX));
-        assert!(
-            !ledger.nullifiers.contains(&req.nullifiers[0]),
-            "overflowing unshield must not consume nullifiers"
+        assert_eq!(
+            ledger.withdrawals,
+            vec![WithdrawalRecord {
+                recipient: TEST_L1_RECIPIENT.into(),
+                amount: 1,
+            }]
         );
+        assert!(ledger.nullifiers.contains(&req.nullifiers[0]));
     }
 
     #[test]
-    fn test_unshield_overflow_is_atomic_even_with_change_note() {
+    fn test_unshield_with_change_note_is_atomic_around_withdrawal_queueing() {
         let mut ledger = Ledger::new();
         ledger.balances.insert("alice".into(), u64::MAX);
         let tree_size_before = ledger.tree.leaves.len();
@@ -3437,7 +3457,7 @@ exit 2
             nullifiers: vec![random_felt()],
             v_pub: 1,
             fee: TEST_FEE,
-            recipient: "alice".into(),
+            recipient: TEST_L1_RECIPIENT.into(),
             cm_change: random_felt(),
             enc_change: Some(enc_change),
             cm_fee,
@@ -3445,17 +3465,19 @@ exit 2
             proof: Proof::TrustMeBro,
         };
 
-        let err = ledger.unshield(&req).unwrap_err();
-        assert!(
-            err.contains("public balance overflow"),
-            "unexpected error: {}",
-            err
+        let resp = ledger.unshield(&req).unwrap();
+        assert_eq!(resp.change_index, Some(tree_size_before));
+        assert_eq!(resp.producer_index, tree_size_before + 1);
+        assert_eq!(ledger.tree.leaves.len(), tree_size_before + 2);
+        assert_eq!(ledger.memos.len(), memo_count_before + 2);
+        assert_eq!(ledger.balances.get("alice"), Some(&u64::MAX));
+        assert_eq!(
+            ledger.withdrawals,
+            vec![WithdrawalRecord {
+                recipient: TEST_L1_RECIPIENT.into(),
+                amount: 1,
+            }]
         );
-        assert_eq!(ledger.tree.leaves.len(), tree_size_before);
-        assert_eq!(ledger.memos.len(), memo_count_before);
-        assert!(
-            !ledger.nullifiers.contains(&req.nullifiers[0]),
-            "overflowing unshield must not consume nullifiers"
-        );
+        assert!(ledger.nullifiers.contains(&req.nullifiers[0]));
     }
 }

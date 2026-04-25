@@ -12,6 +12,7 @@ use ml_kem::ml_kem_768;
 use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use tezos_smart_rollup_encoding::contract::Contract as TezosContract;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Core types
@@ -210,6 +211,7 @@ pub fn deposit_id_from_label(label: &str) -> F {
 }
 
 pub const DEPOSIT_BALANCE_KEY_PREFIX: &str = "deposit:";
+pub const PUBLIC_BALANCE_KEY_PREFIX: &str = "public:";
 
 pub fn deposit_balance_key(deposit_id: &F) -> String {
     format!("{}{}", DEPOSIT_BALANCE_KEY_PREFIX, hex::encode(deposit_id))
@@ -225,6 +227,35 @@ pub fn is_deposit_balance_key(value: &str) -> bool {
     hex::decode(hex_id)
         .map(|bytes| bytes.len() == 32 && hex::encode(bytes) == hex_id)
         .unwrap_or(false)
+}
+
+pub fn public_balance_key(owner: &str, label: &str) -> Result<String, String> {
+    if owner.is_empty() {
+        return Err("public balance owner must not be empty".into());
+    }
+    if label.is_empty() {
+        return Err("public balance label must not be empty".into());
+    }
+    Ok(format!("{}{}:{}", PUBLIC_BALANCE_KEY_PREFIX, owner, label))
+}
+
+pub fn parse_public_balance_key(value: &str) -> Option<(&str, &str)> {
+    let rest = value.strip_prefix(PUBLIC_BALANCE_KEY_PREFIX)?;
+    let (owner, label) = rest.split_once(':')?;
+    if owner.is_empty() || label.is_empty() {
+        return None;
+    }
+    Some((owner, label))
+}
+
+pub fn validate_l1_withdrawal_recipient(value: &str) -> Result<String, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("L1 withdrawal recipient must not be empty".into());
+    }
+    TezosContract::from_b58check(value)
+        .map(|_| value.to_string())
+        .map_err(|_| format!("invalid L1 withdrawal recipient: {}", value))
 }
 
 pub fn derive_nk_spend(nk: &F, d_j: &F) -> F {
@@ -1632,6 +1663,37 @@ pub struct UnshieldResp {
     pub producer_index: usize,
 }
 
+#[derive(Clone, Debug)]
+pub struct PreparedUnshield {
+    change_note: Option<(F, EncryptedNote)>,
+    producer_note: (F, EncryptedNote),
+    nullifiers: Vec<F>,
+    recipient: String,
+    amount: u64,
+}
+
+impl PreparedUnshield {
+    pub fn change_note(&self) -> Option<(&F, &EncryptedNote)> {
+        self.change_note.as_ref().map(|(cm, enc)| (cm, enc))
+    }
+
+    pub fn producer_note(&self) -> (&F, &EncryptedNote) {
+        (&self.producer_note.0, &self.producer_note.1)
+    }
+
+    pub fn nullifiers(&self) -> &[F] {
+        &self.nullifiers
+    }
+
+    pub fn recipient(&self) -> &str {
+        &self.recipient
+    }
+
+    pub fn amount(&self) -> u64 {
+        self.amount
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WithdrawReq {
     pub sender: String,
@@ -2142,10 +2204,11 @@ pub fn apply_transfer<S: LedgerState>(
     })
 }
 
-pub fn apply_unshield<S: LedgerState>(
-    state: &mut S,
+pub fn prepare_unshield<S: LedgerState>(
+    state: &S,
     req: &UnshieldReq,
-) -> Result<UnshieldResp, String> {
+) -> Result<PreparedUnshield, String> {
+    let recipient = validate_l1_withdrawal_recipient(&req.recipient)?;
     let required_fee = state.required_tx_fee()?;
     if req.fee < required_fee {
         return Err(format!("fee below minimum: {} < {}", req.fee, required_fee));
@@ -2213,7 +2276,7 @@ pub fn apply_unshield<S: LedgerState>(
             if tail[3 + n] != u64_to_felt(req.fee) {
                 return Err("proof fee mismatch".into());
             }
-            if tail[4 + n] != hash(req.recipient.as_bytes()) {
+            if tail[4 + n] != hash(recipient.as_bytes()) {
                 return Err("proof recipient mismatch".into());
             }
             if tail[5 + n] != req.cm_change {
@@ -2240,32 +2303,55 @@ pub fn apply_unshield<S: LedgerState>(
     let additional_notes = usize::from(req.cm_change != ZERO) + 1;
     state.ensure_note_capacity(additional_notes)?;
 
-    let next_balance = state
-        .balance(&req.recipient)?
-        .checked_add(req.v_pub)
-        .ok_or_else(|| "public balance overflow".to_string())?;
+    Ok(PreparedUnshield {
+        change_note: if req.cm_change != ZERO {
+            Some((
+                req.cm_change,
+                req.enc_change
+                    .as_ref()
+                    .ok_or("change cm without encrypted note")?
+                    .clone(),
+            ))
+        } else {
+            None
+        },
+        producer_note: (req.cm_fee, req.enc_fee.clone()),
+        nullifiers: req.nullifiers.clone(),
+        recipient,
+        amount: req.v_pub,
+    })
+}
 
-    let change_index = if req.cm_change != ZERO {
-        let enc = req
-            .enc_change
-            .as_ref()
-            .ok_or("change cm without encrypted note")?;
-        Some(state.append_note(req.cm_change, enc.clone())?)
+pub fn commit_prepared_unshield<S: LedgerState>(
+    state: &mut S,
+    prepared: PreparedUnshield,
+) -> Result<UnshieldResp, String> {
+    state.enqueue_withdrawal(&prepared.recipient, prepared.amount)?;
+
+    let change_index = if let Some((cm, enc)) = prepared.change_note {
+        Some(state.append_note(cm, enc)?)
     } else {
         None
     };
 
-    for nf in &req.nullifiers {
+    for nf in &prepared.nullifiers {
         state.insert_nullifier(*nf)?;
     }
-    let producer_index = state.append_note(req.cm_fee, req.enc_fee.clone())?;
-    state.set_balance(&req.recipient, next_balance)?;
+    let producer_index = state.append_note(prepared.producer_note.0, prepared.producer_note.1)?;
     state.snapshot_root()?;
     state.note_private_tx_applied();
     Ok(UnshieldResp {
         change_index,
         producer_index,
     })
+}
+
+pub fn apply_unshield<S: LedgerState>(
+    state: &mut S,
+    req: &UnshieldReq,
+) -> Result<UnshieldResp, String> {
+    let prepared = prepare_unshield(state, req)?;
+    commit_prepared_unshield(state, prepared)
 }
 
 pub fn apply_withdraw<S: LedgerState>(
@@ -2295,6 +2381,8 @@ mod tests {
     use proptest::prelude::*;
     use serde::{Deserialize, Serialize};
     use std::sync::OnceLock;
+
+    const TEST_L1_RECIPIENT: &str = "tz1KqTpEZ7Yob7QbPE4Hy4Wo8fHG8LhKxZSx";
 
     fn truncate_felt(mut f: F) -> F {
         f[31] &= 0x07;
@@ -2566,6 +2654,64 @@ mod tests {
 
         fn enqueue_withdrawal(&mut self, recipient: &str, amount: u64) -> Result<usize, String> {
             self.inner.enqueue_withdrawal(recipient, amount)
+        }
+
+        fn note_private_tx_applied(&mut self) {}
+    }
+
+    struct FailingWithdrawalQueueLedgerState {
+        inner: Ledger,
+    }
+
+    impl FailingWithdrawalQueueLedgerState {
+        fn new(inner: Ledger) -> Self {
+            Self { inner }
+        }
+    }
+
+    impl LedgerState for FailingWithdrawalQueueLedgerState {
+        fn auth_domain(&self) -> Result<F, String> {
+            self.inner.auth_domain()
+        }
+
+        fn balance(&self, addr: &str) -> Result<u64, String> {
+            self.inner.balance(addr)
+        }
+
+        fn set_balance(&mut self, addr: &str, amount: u64) -> Result<(), String> {
+            self.inner.set_balance(addr, amount)
+        }
+
+        fn required_tx_fee(&self) -> Result<u64, String> {
+            self.inner.required_tx_fee()
+        }
+
+        fn has_valid_root(&self, root: &F) -> Result<bool, String> {
+            self.inner.has_valid_root(root)
+        }
+
+        fn has_nullifier(&self, nf: &F) -> Result<bool, String> {
+            self.inner.has_nullifier(nf)
+        }
+
+        fn insert_nullifier(&mut self, nf: F) -> Result<(), String> {
+            self.inner.insert_nullifier(nf)
+        }
+
+        fn ensure_note_capacity(&self, additional: usize) -> Result<(), String> {
+            self.inner.ensure_note_capacity(additional)
+        }
+
+        fn append_note(&mut self, cm: F, enc: EncryptedNote) -> Result<usize, String> {
+            self.inner.append_note(cm, enc)
+        }
+
+        fn snapshot_root(&mut self) -> Result<(), String> {
+            self.inner.snapshot_root()
+        }
+
+        fn enqueue_withdrawal(&mut self, _recipient: &str, _amount: u64) -> Result<usize, String> {
+            Err("withdrawal queue unavailable".into())
         }
 
         fn note_private_tx_applied(&mut self) {}
@@ -2998,7 +3144,8 @@ mod tests {
 
     #[test]
     fn test_transition_public_outputs_rejects_wrapped_length_mismatch() {
-        let output_preimage = bootloader_wrapped_public_outputs(u(12345), vec![u(11), u(22), u(33)]);
+        let output_preimage =
+            bootloader_wrapped_public_outputs(u(12345), vec![u(11), u(22), u(33)]);
 
         let err = transition_public_outputs(&output_preimage, 2).unwrap_err();
 
@@ -3790,7 +3937,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_unshield_stark_path_with_change_updates_balance_and_note() {
+    fn test_apply_unshield_stark_path_with_change_enqueues_withdrawal_and_note() {
         let (mut ledger, addr, nk_spend, shield_resp) = shielded_note_setup(0x74, "alice", 180_000);
         let root = ledger.tree.root();
         let auth_domain = ledger.auth_domain;
@@ -3805,7 +3952,7 @@ mod tests {
                 nullifiers: vec![nf],
                 v_pub: 50,
                 fee: MIN_TX_FEE,
-                recipient: "bob".into(),
+                recipient: TEST_L1_RECIPIENT.into(),
                 cm_change,
                 enc_change: Some(enc_change.clone()),
                 cm_fee,
@@ -3816,7 +3963,7 @@ mod tests {
                     nf,
                     u(50),
                     u(MIN_TX_FEE),
-                    hash(b"bob"),
+                    hash(TEST_L1_RECIPIENT.as_bytes()),
                     cm_change,
                     memo_ct_hash(&enc_change),
                     cm_fee,
@@ -3828,7 +3975,13 @@ mod tests {
 
         assert_eq!(resp.change_index, Some(2));
         assert_eq!(resp.producer_index, 3);
-        assert_eq!(ledger.balance("bob").unwrap(), 50);
+        assert_eq!(
+            ledger.withdrawals,
+            vec![WithdrawalRecord {
+                recipient: TEST_L1_RECIPIENT.into(),
+                amount: 50,
+            }]
+        );
         assert!(ledger.nullifiers.contains(&nf));
         assert_eq!(ledger.memos.len(), 4);
         assert!(ledger.valid_roots.contains(&ledger.tree.root()));
@@ -3849,7 +4002,7 @@ mod tests {
             nf,
             u(50),
             u(MIN_TX_FEE),
-            hash(b"bob"),
+            hash(TEST_L1_RECIPIENT.as_bytes()),
             cm_change,
             memo_ct_hash(&enc_change),
             cm_fee,
@@ -3862,7 +4015,7 @@ mod tests {
                 nullifiers: vec![nf],
                 v_pub: 50,
                 fee: MIN_TX_FEE,
-                recipient: "bob".into(),
+                recipient: TEST_L1_RECIPIENT.into(),
                 cm_change,
                 enc_change: Some(enc_change),
                 cm_fee,
@@ -3874,7 +4027,13 @@ mod tests {
 
         assert_eq!(resp.change_index, Some(2));
         assert_eq!(resp.producer_index, 3);
-        assert_eq!(ledger.balance("bob").unwrap(), 50);
+        assert_eq!(
+            ledger.withdrawals,
+            vec![WithdrawalRecord {
+                recipient: TEST_L1_RECIPIENT.into(),
+                amount: 50,
+            }]
+        );
         assert!(ledger.nullifiers.contains(&nf));
     }
 
@@ -3896,7 +4055,7 @@ mod tests {
                 nullifiers: vec![nf],
                 v_pub: 50,
                 fee: MIN_TX_FEE,
-                recipient: "bob".into(),
+                recipient: TEST_L1_RECIPIENT.into(),
                 cm_change,
                 enc_change: Some(enc_change.clone()),
                 cm_fee,
@@ -3908,7 +4067,7 @@ mod tests {
                     nf,
                     u(50),
                     u(MIN_TX_FEE),
-                    hash(b"bob"),
+                    hash(TEST_L1_RECIPIENT.as_bytes()),
                     cm_change,
                     memo_ct_hash(&enc_change),
                     cm_fee,
@@ -3919,22 +4078,59 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("public output length mismatch"));
-        assert_eq!(ledger.balance("bob").unwrap(), 0);
+        assert!(ledger.withdrawals.is_empty());
         assert!(!ledger.nullifiers.contains(&nf));
         assert_eq!(ledger.tree.leaves, leaves_before);
         assert_eq!(ledger.memos.len(), memos_before);
     }
 
     #[test]
-    fn test_apply_unshield_rejects_balance_overflow_without_mutation() {
+    fn test_apply_unshield_does_not_touch_existing_public_balances() {
         let (mut ledger, _addr, nk_spend, shield_resp) = shielded_note_setup(0x75, "alice", 80);
-        ledger.set_balance("bob", u64::MAX).unwrap();
+        ledger.set_balance("bob", 17).unwrap();
         let root = ledger.tree.root();
         let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
-        let leaves_before = ledger.tree.leaves.clone();
-        let memos_before = ledger.memos.len();
         let (_acc, fee_addr, _dk_v, _dk_d, _nk_spend_unused) = sample_address_bundle(0x7B, 0);
         let (enc_fee, cm_fee) = deterministic_note(&fee_addr, 79, u(43), Some(b"dal"));
+        let resp = apply_unshield(
+            &mut ledger,
+            &UnshieldReq {
+                root,
+                nullifiers: vec![nf],
+                v_pub: 1,
+                fee: MIN_TX_FEE,
+                recipient: TEST_L1_RECIPIENT.into(),
+                cm_change: ZERO,
+                enc_change: None,
+                cm_fee,
+                enc_fee,
+                proof: Proof::TrustMeBro,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resp.change_index, None);
+        assert_eq!(resp.producer_index, 2);
+        assert_eq!(ledger.balance("bob").unwrap(), 17);
+        assert_eq!(
+            ledger.withdrawals,
+            vec![WithdrawalRecord {
+                recipient: TEST_L1_RECIPIENT.into(),
+                amount: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_apply_unshield_rejects_invalid_l1_recipient_without_mutation() {
+        let (mut ledger, _addr, nk_spend, shield_resp) = shielded_note_setup(0x95, "alice", 80);
+        let root = ledger.tree.root();
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (_acc, fee_addr, _dk_v, _dk_d, _nk_spend_unused) = sample_address_bundle(0x96, 0);
+        let (enc_fee, cm_fee) = deterministic_note(&fee_addr, 79, u(98), Some(b"dal"));
+        let leaves_before = ledger.tree.leaves.clone();
+        let memos_before = ledger.memos.len();
+        let roots_before = ledger.valid_roots.len();
 
         let err = apply_unshield(
             &mut ledger,
@@ -3953,11 +4149,48 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("public balance overflow"));
-        assert_eq!(ledger.balance("bob").unwrap(), u64::MAX);
+        assert!(err.contains("invalid L1 withdrawal recipient"));
+        assert!(ledger.withdrawals.is_empty());
         assert!(!ledger.nullifiers.contains(&nf));
         assert_eq!(ledger.tree.leaves, leaves_before);
         assert_eq!(ledger.memos.len(), memos_before);
+        assert_eq!(ledger.valid_roots.len(), roots_before);
+    }
+
+    #[test]
+    fn test_apply_unshield_normalizes_whitespace_padded_l1_recipient() {
+        let (mut ledger, _addr, nk_spend, shield_resp) = shielded_note_setup(0x97, "alice", 80);
+        let root = ledger.tree.root();
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (_acc, fee_addr, _dk_v, _dk_d, _nk_spend_unused) = sample_address_bundle(0x98, 0);
+        let (enc_fee, cm_fee) = deterministic_note(&fee_addr, 79, u(99), Some(b"dal"));
+
+        let resp = apply_unshield(
+            &mut ledger,
+            &UnshieldReq {
+                root,
+                nullifiers: vec![nf],
+                v_pub: 1,
+                fee: MIN_TX_FEE,
+                recipient: format!(" {} ", TEST_L1_RECIPIENT),
+                cm_change: ZERO,
+                enc_change: None,
+                cm_fee,
+                enc_fee,
+                proof: Proof::TrustMeBro,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resp.change_index, None);
+        assert_eq!(resp.producer_index, 2);
+        assert_eq!(
+            ledger.withdrawals,
+            vec![WithdrawalRecord {
+                recipient: TEST_L1_RECIPIENT.into(),
+                amount: 1,
+            }]
+        );
     }
 
     #[test]
@@ -4206,7 +4439,7 @@ mod tests {
                 nullifiers: vec![nf],
                 v_pub: 50_000,
                 fee: MIN_TX_FEE - 1,
-                recipient: "bob".into(),
+                recipient: TEST_L1_RECIPIENT.into(),
                 cm_change: ZERO,
                 enc_change: None,
                 cm_fee,
@@ -4217,7 +4450,7 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("fee below minimum"));
-        assert_eq!(ledger.balance("bob").unwrap(), 0);
+        assert!(ledger.withdrawals.is_empty());
         assert!(!ledger.nullifiers.contains(&nf));
     }
 
@@ -4240,7 +4473,7 @@ mod tests {
                 nullifiers: vec![nf, nf],
                 v_pub: 50_000,
                 fee: MIN_TX_FEE,
-                recipient: "bob".into(),
+                recipient: TEST_L1_RECIPIENT.into(),
                 cm_change: ZERO,
                 enc_change: None,
                 cm_fee,
@@ -4251,7 +4484,7 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, "duplicate nullifier");
-        assert_eq!(ledger.balance("bob").unwrap(), 0);
+        assert!(ledger.withdrawals.is_empty());
         assert!(!ledger.nullifiers.contains(&nf));
         assert_eq!(ledger.tree.leaves, leaves_before);
         assert_eq!(ledger.memos.len(), memos_before);
@@ -4278,7 +4511,7 @@ mod tests {
                 nullifiers: vec![nf],
                 v_pub: 20,
                 fee: MIN_TX_FEE,
-                recipient: "bob".into(),
+                recipient: TEST_L1_RECIPIENT.into(),
                 cm_change,
                 enc_change: Some(enc_change),
                 cm_fee,
@@ -4289,10 +4522,49 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("Merkle tree full"));
-        assert_eq!(state.inner.balance("bob").unwrap(), 0);
+        assert!(state.inner.withdrawals.is_empty());
         assert!(!state.inner.nullifiers.contains(&nf));
         assert_eq!(state.inner.tree.leaves, leaves_before);
         assert_eq!(state.inner.memos.len(), memos_before);
+    }
+
+    #[test]
+    fn test_apply_unshield_queue_failure_does_not_mutate_state() {
+        let (ledger, _addr, nk_spend, shield_resp) = shielded_note_setup(0x99, "alice", 150_000);
+        let root = ledger.tree.root();
+        let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
+        let (_acc, fee_addr, _dk_v, _dk_d, _nk_spend_unused) = sample_address_bundle(0x9A, 0);
+        let (enc_change, cm_change) = deterministic_note(&fee_addr, 30, u(100), Some(b"change"));
+        let (enc_fee, cm_fee) = deterministic_note(&fee_addr, 29_970, u(101), Some(b"dal"));
+        let mut state = FailingWithdrawalQueueLedgerState::new(ledger);
+
+        let leaves_before = state.inner.tree.leaves.clone();
+        let memos_before = state.inner.memos.len();
+        let roots_before = state.inner.valid_roots.len();
+
+        let err = apply_unshield(
+            &mut state,
+            &UnshieldReq {
+                root,
+                nullifiers: vec![nf],
+                v_pub: 20,
+                fee: MIN_TX_FEE,
+                recipient: TEST_L1_RECIPIENT.into(),
+                cm_change,
+                enc_change: Some(enc_change),
+                cm_fee,
+                enc_fee,
+                proof: Proof::TrustMeBro,
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.contains("withdrawal queue unavailable"));
+        assert!(state.inner.withdrawals.is_empty());
+        assert!(!state.inner.nullifiers.contains(&nf));
+        assert_eq!(state.inner.tree.leaves, leaves_before);
+        assert_eq!(state.inner.memos.len(), memos_before);
+        assert_eq!(state.inner.valid_roots.len(), roots_before);
     }
 
     #[test]
@@ -4371,6 +4643,22 @@ mod tests {
         assert!(is_deposit_balance_key(&key));
         assert!(!is_deposit_balance_key(&hex::encode(deposit_id)));
         assert!(!is_deposit_balance_key(&key.to_uppercase()));
+    }
+
+    #[test]
+    fn test_public_balance_key_round_trips_owner_and_label() {
+        let key = public_balance_key("tz1owner", "alice").unwrap();
+        assert_eq!(key, "public:tz1owner:alice");
+        assert_eq!(parse_public_balance_key(&key), Some(("tz1owner", "alice")));
+    }
+
+    #[test]
+    fn test_public_balance_key_rejects_missing_owner_or_label() {
+        assert!(public_balance_key("", "alice").is_err());
+        assert!(public_balance_key("tz1owner", "").is_err());
+        assert_eq!(parse_public_balance_key("public::alice"), None);
+        assert_eq!(parse_public_balance_key("public:tz1owner:"), None);
+        assert_eq!(parse_public_balance_key("alice"), None);
     }
 
     #[test]
