@@ -252,6 +252,10 @@ fn build_fixture() -> Result<VerifiedBridgeFixture, String> {
         bridge_ticketer: BRIDGE_TICKETER.into(),
         shield: ShieldReq {
             deposit_id: shield_intent_id,
+            // Slot 0 — by construction the only slot allocated in this fixture
+            // (kernel `apply_deposit` is the only path that mints slots, and
+            // the fixture issues a single deposit before the shield).
+            deposit_slot: 0,
             v: SHIELD_AMOUNT,
             fee: MIN_TX_FEE,
             producer_fee: DAL_PRODUCER_FEE,

@@ -3,13 +3,15 @@
 This tutorial covers a Shadownet `deposit -> shield -> send` flow against a
 deployed rollup using the operator box.
 
-> **Status note:** the protocol uses intent-bound shield deposit ids. The L1
-> deposit transaction commits to the entire shield (recipient, value, fees,
-> encrypted-note bytes) by addressing the rollup balance to
-> `deposit:<hex(intent)>`. The rollup wallet flow below is current:
-> `deposit` creates the pending intent-bound deposit, `shield --deposit-id ...`
-> drains it, `send` stays internal, and `unshield` withdraws directly to an L1
-> tz/KT1 recipient.
+> **Status note:** the protocol uses intent-bound shield deposit ids with
+> per-deposit slots. The L1 deposit transaction commits to the entire shield
+> (recipient, value, fees, encrypted-note bytes) by addressing the L1 ticket
+> to `deposit:<hex(intent)>`, and the kernel allocates a fresh slot per
+> ticket so dust deposits to the same intent cannot brick a legitimate one.
+> The rollup wallet flow below is current: `deposit` creates the pending
+> intent-bound deposit, `shield --deposit-id ...` drains the slot,
+> `send` stays internal, and `unshield` withdraws directly to an L1 tz/KT1
+> recipient.
 
 The current rollup policy burns at least `100000` mutez (`0.1 tez`) on every
 `shield`, `send`, and `unshield`. The first two accepted private transactions at
@@ -259,14 +261,14 @@ Create Shadownet profiles:
 Notes:
 
 - `dal_fee_address` is the shielded address that receives the DAL inclusion fee note
-- each `deposit` builds the entire shield (recipient note + producer-fee note) up front, computes the *intent-bound* deposit id (`shield_intent` over every shield public output), and credits the canonical `deposit:<hex(intent)>` rollup balance key for exactly the bound debit. The L1 deposit transaction is itself the shield authorization — there is no `deposit_secret`, and any modification of the witness (recipient, value, fees) yields a different deposit id whose balance is empty.
+- each `deposit` builds the entire shield (recipient note + producer-fee note) up front, computes the *intent-bound* deposit id (`shield_intent` over every shield public output), and addresses the L1 ticket to the canonical recipient string `deposit:<hex(intent)>`. Each L1 ticket allocates its own kernel-side **slot** keyed by a fresh kernel-controlled `slot_id` (depositors don't control the id), with content `(intent, amount)`. The L1 deposit transaction is itself the shield authorization — there is no `deposit_secret`, and any modification of the witness (recipient, value, fees) yields a different deposit id whose slots either don't exist or bind a different intent.
 - `public_account` in the profile is only used for non-shielded balance reporting; under the new design, unshield emits an L1 outbox directly to a tz/KT1 recipient.
 - keep Alice and Bob distinct
-- **Shield deposits are single-shot and exact-amount:** the wallet computes `v + fee + producer_fee` and instructs the bridge to deposit precisely that amount. There is no partial drain, no top-up, and no recovery of an accidentally over- or under-funded balance — the wallet UX must size the L1 deposit precisely.
+- **Shield deposits are single-shot and exact-amount:** the wallet computes `v + fee + producer_fee` and instructs the bridge to deposit precisely that amount. There is no partial drain and no top-up — both would require updating `intent`, which contradicts the L1 commitment. An over- or under-deposit leaves an orphan slot but does not affect any other slot. **Dust-resistance:** an attacker observing the public `deposit:<hex(intent)>` recipient string cannot brick a victim's shield by sending 1 mutez to the same recipient — that just allocates an unrelated orphan slot.
 
-## 6. Fund Alice On L1 And Wait For The Intent-Bound Deposit Balance
+## 6. Fund Alice On L1 And Wait For The Kernel To Allocate A Deposit Slot
 
-Deposit into the bridge for Alice's next shield. The wallet builds the recipient and producer-fee notes, computes `intent = shield_intent(auth_domain, v, fee, producer_fee, cm_recipient, cm_producer, mh, mh_producer)`, and asks the bridge to credit `deposit:<hex(intent)>` for exactly `v + fee + producer_fee` mutez:
+Deposit into the bridge for Alice's next shield. The wallet builds the recipient and producer-fee notes, computes `intent = shield_intent(auth_domain, v, fee, producer_fee, cm_recipient, cm_producer, mh, mh_producer)`, and asks the bridge to send an L1 ticket to `deposit:<hex(intent)>` for exactly `v + fee + producer_fee` mutez. The kernel allocates a fresh slot for the ticket — keyed by a kernel-controlled monotonic `slot_id`, with content `(intent, amount)`. The wallet picks up the slot id during sync.
 
 ```bash
 DEPOSIT_OUTPUT="$(
@@ -286,10 +288,10 @@ then poll:
 /usr/local/bin/tzel-wallet --wallet alice.wallet balance
 ```
 
-Do not continue until Alice shows a non-zero deposit-balance line like:
+Do not continue until `tzel-wallet sync` reports the slot has been picked up:
 
 ```text
-Secret-bound deposit balance: 400001 across 1 pending deposits
+Synced: ... 1 slots assigned, ..., pending_deposit_total=400001
 ```
 
 ## 7. Shield Alice’s Funds
@@ -328,7 +330,7 @@ Keep polling until the operator reports a final state. Then sync Alice:
 
 Acceptance:
 
-- The intent-bound deposit balance drains to zero (single-shot)
+- The deposit slot for `(intent, debit)` disappears (single-shot, tombstoned)
 - Alice's private available balance becomes non-zero by exactly the recipient note's value
 
 ## 8. Derive Bob’s Receive Address
@@ -405,8 +407,8 @@ For the first successful live run, save:
   - DAL node is up, but slot publication / commitment inclusion is not advancing
 - `unattested`:
   - the public DAL node is not reachable enough from the network
-- `Secret-bound deposit balance` never changes after deposit:
-  - bridge config is wrong or the rollup node is not following the right rollup
+- `0 slots assigned` even after the L1 deposit lands:
+  - bridge config is wrong, the kernel did not parse the ticket, or the rollup node is not following the right rollup
 - `sync` finds nothing after a successful operator state:
   - rollup node is stale, wrong `rollup_node_url`, or wrong wallet profile
 

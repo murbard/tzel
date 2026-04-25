@@ -85,14 +85,14 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
     deposit_id = shield_intent;
     memo_ct_hash = shield_mch; producer_memo_ct_hash = shield_prod_mch;
   } in
-  let deposit_key =
-    Printf.sprintf "deposit:%s" (Tzel.Felt.to_hex shield_intent)
-  in
   let exact_debit =
     Int64.add shield_v (Int64.add shield_fee shield_producer_fee)
   in
-  Tzel.Ledger.set_balance ledger deposit_key exact_debit;
+  let slot_id =
+    Tzel.Ledger.record_deposit ledger ~intent:shield_intent ~amount:exact_debit
+  in
   begin match Tzel.Ledger.apply_shield ledger ~pub:shield_pub
+                ~deposit_slot:slot_id
                 ~memo_ct_hash:shield_mch
                 ~producer_memo_ct_hash:shield_prod_mch with
   | Ok () -> ()

@@ -235,23 +235,36 @@ pub fn shield_intent(
     h
 }
 
-pub const DEPOSIT_BALANCE_KEY_PREFIX: &str = "deposit:";
+pub const DEPOSIT_RECIPIENT_PREFIX: &str = "deposit:";
 pub const PUBLIC_BALANCE_KEY_PREFIX: &str = "public:";
 
-pub fn deposit_balance_key(deposit_id: &F) -> String {
-    format!("{}{}", DEPOSIT_BALANCE_KEY_PREFIX, hex::encode(deposit_id))
+/// Build the canonical L1-bridge recipient string for an intent-bound deposit.
+/// The bridge contract emits an L1 Transfer with this string; the kernel parses
+/// the intent back out and records a fresh deposit slot. The string itself is
+/// NOT a ledger entry under the slot scheme — `record_deposit_slot` allocates a
+/// per-deposit id so dust deposits to the same intent cannot brick a legit one.
+pub fn deposit_recipient_string(deposit_id: &F) -> String {
+    format!("{}{}", DEPOSIT_RECIPIENT_PREFIX, hex::encode(deposit_id))
 }
 
-pub fn is_deposit_balance_key(value: &str) -> bool {
-    let Some(hex_id) = value.strip_prefix(DEPOSIT_BALANCE_KEY_PREFIX) else {
-        return false;
-    };
+pub fn is_deposit_recipient_string(value: &str) -> bool {
+    parse_deposit_recipient_intent(value).is_ok()
+}
+
+pub fn parse_deposit_recipient_intent(value: &str) -> Result<F, String> {
+    let hex_id = value
+        .strip_prefix(DEPOSIT_RECIPIENT_PREFIX)
+        .ok_or_else(|| "deposit recipient must start with 'deposit:'".to_string())?;
     if hex_id.len() != 64 {
-        return false;
+        return Err("deposit recipient must be deposit:<32-byte hex>".into());
     }
-    hex::decode(hex_id)
-        .map(|bytes| bytes.len() == 32 && hex::encode(bytes) == hex_id)
-        .unwrap_or(false)
+    let bytes = hex::decode(hex_id).map_err(|_| "deposit recipient hex is invalid".to_string())?;
+    if bytes.len() != 32 || hex::encode(&bytes) != hex_id {
+        return Err("deposit recipient hex must be canonical lowercase".into());
+    }
+    let mut intent: F = ZERO;
+    intent.copy_from_slice(&bytes);
+    Ok(intent)
 }
 
 pub fn public_balance_key(owner: &str, label: &str) -> Result<String, String> {
@@ -1580,14 +1593,19 @@ impl CircuitKind {
     }
 }
 
+/// Demo HTTP ledger / operator deposit request: a `deposit:<hex>` recipient
+/// string and the exact debit. The demo ledger allocates a fresh slot, just
+/// like the rollup kernel does on a real L1 ticket.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DepositReq {
-    #[serde(alias = "addr")]
     pub recipient: String,
     pub amount: u64,
 }
 
-pub type FundReq = DepositReq;
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DepositResp {
+    pub slot_id: u64,
+}
 
 /// Payment address — everything a sender needs to create a note for the recipient.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1608,18 +1626,22 @@ pub struct PaymentAddress {
 
 /// Shield request.
 ///
-/// The `deposit_id` identifies a previously-funded L1 deposit balance. Under
-/// the intent-bound scheme, `deposit_id == shield_intent(auth_domain, v, fee,
-/// producer_fee, client_cm, producer_cm, memo_ct_hash(client_enc),
-/// memo_ct_hash(producer_enc))` — the kernel recomputes that hash from the
-/// other request fields and rejects the request if it disagrees. Because every
-/// rewritable field is folded into `deposit_id`, a relayer or untrusted prover
-/// cannot redirect funds: any tampering yields a different deposit_id whose
-/// L1 balance is empty.
+/// `deposit_id == shield_intent(auth_domain, v, fee, producer_fee, client_cm,
+/// producer_cm, memo_ct_hash(client_enc), memo_ct_hash(producer_enc))` — the
+/// kernel recomputes that hash from the other request fields and rejects the
+/// request if it disagrees. Because every rewritable field is folded into
+/// `deposit_id`, a relayer or untrusted prover cannot redirect funds.
+///
+/// `deposit_slot` identifies the specific L1 bridge deposit being drained.
+/// Each successful bridge deposit allocates its own slot so that dust deposits
+/// to the same intent cannot brick a legitimate one. The kernel verifies that
+/// the slot exists, has not already been consumed, has the matching intent,
+/// and has the exact debit (`v + fee + producer_fee`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ShieldReq {
     #[serde(with = "hex_f")]
     pub deposit_id: F,
+    pub deposit_slot: u64,
     pub fee: u64,
     pub v: u64,
     pub producer_fee: u64,
@@ -1793,6 +1815,18 @@ pub fn required_tx_fee_for_private_tx_count(accepted_private_txs_in_level: u64) 
 // Ledger state
 // ═══════════════════════════════════════════════════════════════════════
 
+/// One pending L1-bridge deposit awaiting shield. Each successful
+/// `apply_deposit` allocates its own slot, keyed by a monotonic id, so dust
+/// deposits to the same intent cannot brick a legitimate one. Shield consumes
+/// a slot by id, verifying that `intent == req.deposit_id` and
+/// `amount == v + fee + producer_fee` exactly.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DepositSlot {
+    #[serde(with = "hex_f")]
+    pub intent: F,
+    pub amount: u64,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Ledger {
     pub auth_domain: F,
@@ -1804,6 +1838,19 @@ pub struct Ledger {
     pub root_history: VecDeque<F>,
     pub memos: Vec<(F, EncryptedNote)>,
     pub withdrawals: Vec<WithdrawalRecord>,
+    /// Open deposit slots awaiting shield consumption. A slot disappears
+    /// (`HashMap::remove`) the moment shield drains it. Dust deposits to the
+    /// same intent simply create their own slots and are ignored.
+    #[serde(default)]
+    pub deposit_slots: HashMap<u64, DepositSlot>,
+    /// Monotonic counter assigning the next slot id.
+    #[serde(default)]
+    pub next_deposit_slot_id: u64,
+    /// Per-intent index of slot ids (for wallet enumeration). Slots remain
+    /// listed here even after consumption; consumers must verify membership
+    /// in `deposit_slots` to determine if a slot is still drainable.
+    #[serde(default)]
+    pub deposits_by_intent: HashMap<F, Vec<u64>>,
 }
 
 /// Generic ledger interface used by `apply_shield`, `apply_transfer`, and
@@ -1831,6 +1878,19 @@ pub trait LedgerState {
     fn snapshot_root(&mut self) -> Result<(), String>;
     fn enqueue_withdrawal(&mut self, recipient: &str, amount: u64) -> Result<usize, String>;
     fn note_private_tx_applied(&mut self);
+    /// Allocate a fresh per-deposit slot recording (intent, amount). Returns
+    /// the slot id, which the wallet later passes back in `ShieldReq`.
+    fn record_deposit_slot(&mut self, intent: F, amount: u64) -> Result<u64, String>;
+    /// Look up a slot by id and consume it if (slot.intent == intent) and
+    /// (slot.amount == debit). On success the slot is removed and the call
+    /// returns Ok(()). On any mismatch / missing / already-consumed slot, the
+    /// state is left unchanged.
+    fn consume_deposit_slot(
+        &mut self,
+        slot_id: u64,
+        intent: &F,
+        debit: u64,
+    ) -> Result<(), String>;
 }
 
 impl Ledger {
@@ -1854,6 +1914,21 @@ impl Ledger {
             root_history,
             memos: vec![],
             withdrawals: vec![],
+            deposit_slots: HashMap::new(),
+            next_deposit_slot_id: 0,
+            deposits_by_intent: HashMap::new(),
+        }
+    }
+
+    /// Convenience: list all slots currently open for an intent. The wallet's
+    /// shield path picks the slot whose amount matches the bound debit.
+    pub fn open_deposit_slots_for_intent(&self, intent: &F) -> Vec<(u64, u64)> {
+        match self.deposits_by_intent.get(intent) {
+            None => vec![],
+            Some(ids) => ids
+                .iter()
+                .filter_map(|id| self.deposit_slots.get(id).map(|slot| (*id, slot.amount)))
+                .collect(),
         }
     }
 
@@ -1883,12 +1958,10 @@ impl Ledger {
         self.memos.push((cm, enc));
     }
 
-    pub fn deposit(&mut self, recipient: &str, amount: u64) -> Result<(), String> {
+    /// Apply a bridge deposit (recipient must be a `deposit:<hex>` string).
+    /// Returns the new slot id.
+    pub fn deposit(&mut self, recipient: &str, amount: u64) -> Result<u64, String> {
         apply_deposit(self, recipient, amount)
-    }
-
-    pub fn fund(&mut self, addr: &str, amount: u64) -> Result<(), String> {
-        self.deposit(addr, amount)
     }
 
     pub fn shield(&mut self, req: &ShieldReq) -> Result<ShieldResp, String> {
@@ -1973,22 +2046,55 @@ impl LedgerState for Ledger {
     }
 
     fn note_private_tx_applied(&mut self) {}
+
+    fn record_deposit_slot(&mut self, intent: F, amount: u64) -> Result<u64, String> {
+        let id = self.next_deposit_slot_id;
+        let next = id
+            .checked_add(1)
+            .ok_or_else(|| "deposit slot counter overflow".to_string())?;
+        self.deposit_slots.insert(id, DepositSlot { intent, amount });
+        self.deposits_by_intent.entry(intent).or_default().push(id);
+        self.next_deposit_slot_id = next;
+        Ok(id)
+    }
+
+    fn consume_deposit_slot(
+        &mut self,
+        slot_id: u64,
+        intent: &F,
+        debit: u64,
+    ) -> Result<(), String> {
+        let slot = self
+            .deposit_slots
+            .get(&slot_id)
+            .ok_or_else(|| format!("deposit slot {} not found or already consumed", slot_id))?;
+        if &slot.intent != intent {
+            return Err(format!(
+                "deposit slot {} intent mismatch: slot binds a different deposit",
+                slot_id
+            ));
+        }
+        if slot.amount != debit {
+            return Err(format!(
+                "deposit slot {} amount mismatch: have {}, expected exactly {}",
+                slot_id, slot.amount, debit
+            ));
+        }
+        self.deposit_slots.remove(&slot_id);
+        Ok(())
+    }
 }
 
+/// Apply an L1 bridge deposit. The recipient is parsed as `deposit:<hex>` and a
+/// fresh per-deposit slot is allocated for `(intent, amount)`. Returns the new
+/// slot id so the wallet can correlate its L1 op with the kernel-side record.
 pub fn apply_deposit<S: LedgerState>(
     state: &mut S,
     recipient: &str,
     amount: u64,
-) -> Result<(), String> {
-    let next = state
-        .balance(recipient)?
-        .checked_add(amount)
-        .ok_or_else(|| "public balance overflow".to_string())?;
-    state.set_balance(recipient, next)
-}
-
-pub fn apply_fund<S: LedgerState>(state: &mut S, addr: &str, amount: u64) -> Result<(), String> {
-    apply_deposit(state, addr, amount)
+) -> Result<u64, String> {
+    let intent = parse_deposit_recipient_intent(recipient)?;
+    state.record_deposit_slot(intent, amount)
 }
 
 pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<ShieldResp, String> {
@@ -2029,22 +2135,16 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
         return Err("shield intent mismatch — deposit_id does not match request fields".into());
     }
 
-    // The L1 deposit must equal the exact debit. Residuals are unrecoverable
-    // because no other intent collides with this deposit_id, so we reject any
-    // mismatch up-front rather than silently locking funds.
-    let balance_key = deposit_balance_key(&req.deposit_id);
-    let bal = state.balance(&balance_key)?;
+    // The L1 deposit slot must record this exact intent and the exact debit.
+    // We claim the slot up-front; mismatches leave state untouched. Slots make
+    // dust attacks against `deposit:<intent>` impossible: each L1 ticket
+    // allocates its own slot, so an attacker depositing 1 mutez to the same
+    // intent string just creates an orphan slot the wallet ignores.
     let debit = req
         .v
         .checked_add(req.fee)
         .and_then(|value| value.checked_add(req.producer_fee))
         .ok_or_else(|| "shield debit overflow".to_string())?;
-    if bal != debit {
-        return Err(format!(
-            "shield deposit balance mismatch: have {}, expected exactly {}",
-            bal, debit
-        ));
-    }
 
     if let Proof::Stark {
         proof_bytes: _,
@@ -2088,8 +2188,8 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
     }
 
     state.ensure_note_capacity(2)?;
-    // Drain to zero. The intent-bound deposit is single-shot.
-    state.set_balance(&balance_key, 0)?;
+    // Claim the slot. Single-shot — the slot is removed on success.
+    state.consume_deposit_slot(req.deposit_slot, &req.deposit_id, debit)?;
     let index = state.append_note(req.client_cm, req.client_enc.clone())?;
     let producer_index = state.append_note(req.producer_cm, req.producer_enc.clone())?;
     state.snapshot_root()?;
@@ -2673,6 +2773,19 @@ mod tests {
         }
 
         fn note_private_tx_applied(&mut self) {}
+
+        fn record_deposit_slot(&mut self, intent: F, amount: u64) -> Result<u64, String> {
+            self.inner.record_deposit_slot(intent, amount)
+        }
+
+        fn consume_deposit_slot(
+            &mut self,
+            slot_id: u64,
+            intent: &F,
+            debit: u64,
+        ) -> Result<(), String> {
+            self.inner.consume_deposit_slot(slot_id, intent, debit)
+        }
     }
 
     struct FailingWithdrawalQueueLedgerState {
@@ -2731,6 +2844,19 @@ mod tests {
         }
 
         fn note_private_tx_applied(&mut self) {}
+
+        fn record_deposit_slot(&mut self, intent: F, amount: u64) -> Result<u64, String> {
+            self.inner.record_deposit_slot(intent, amount)
+        }
+
+        fn consume_deposit_slot(
+            &mut self,
+            slot_id: u64,
+            intent: &F,
+            debit: u64,
+        ) -> Result<(), String> {
+            self.inner.consume_deposit_slot(slot_id, intent, debit)
+        }
     }
 
     fn fake_stark(output_preimage: Vec<F>) -> Proof {
@@ -2783,11 +2909,12 @@ mod tests {
         );
         let debit = amount + MIN_TX_FEE + producer_fee;
         ledger
-            .fund(&deposit_balance_key(&intent), debit)
+            .deposit(&deposit_recipient_string(&intent), debit)
             .unwrap();
         let resp = ledger
             .shield(&ShieldReq {
                 deposit_id: intent,
+                deposit_slot: 0,
                 fee: MIN_TX_FEE,
                 v: amount,
                 producer_fee,
@@ -3648,13 +3775,14 @@ mod tests {
             &enc,
             &producer_enc,
         );
-        ledger.fund(&deposit_balance_key(&intent), debit).unwrap();
+        ledger.deposit(&deposit_recipient_string(&intent), debit).unwrap();
         let root_before = ledger.tree.root();
 
         let resp = apply_shield(
             &mut ledger,
             &ShieldReq {
                 deposit_id: intent,
+                deposit_slot: 0,
                 fee,
                 v,
                 producer_fee,
@@ -3682,7 +3810,7 @@ mod tests {
         assert_eq!(resp.producer_cm, producer_cm);
         assert_eq!(resp.producer_index, 1);
         // Intent-bound deposits drain to zero on shield.
-        assert_eq!(ledger.balance(&deposit_balance_key(&intent)).unwrap(), 0);
+        assert_eq!(ledger.balance(&deposit_recipient_string(&intent)).unwrap(), 0);
         assert_eq!(ledger.memos.len(), 2);
         assert_ne!(ledger.tree.root(), root_before);
         assert!(ledger.valid_roots.contains(&ledger.tree.root()));
@@ -3711,7 +3839,7 @@ mod tests {
             &enc,
             &producer_enc,
         );
-        ledger.fund(&deposit_balance_key(&intent), debit).unwrap();
+        ledger.deposit(&deposit_recipient_string(&intent), debit).unwrap();
 
         // Lie about the deposit_id (caller-controlled). Must be rejected before
         // anything mutates state.
@@ -3722,6 +3850,7 @@ mod tests {
             &mut ledger,
             &ShieldReq {
                 deposit_id: bogus_intent,
+                deposit_slot: 0,
                 fee,
                 v,
                 producer_fee,
@@ -3735,8 +3864,8 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("shield intent mismatch"), "err = {}", err);
-        // Original intent balance is intact.
-        assert_eq!(ledger.balance(&deposit_balance_key(&intent)).unwrap(), debit);
+        // Original slot is intact.
+        assert_eq!(ledger.deposit_slots.get(&0).map(|s| s.amount), Some(debit));
         assert!(ledger.memos.is_empty());
     }
 
@@ -3765,13 +3894,14 @@ mod tests {
         );
         // Over-fund the deposit by 1; exact-amount rule must reject.
         ledger
-            .fund(&deposit_balance_key(&intent), debit + 1)
+            .deposit(&deposit_recipient_string(&intent), debit + 1)
             .unwrap();
 
         let err = apply_shield(
             &mut ledger,
             &ShieldReq {
                 deposit_id: intent,
+                deposit_slot: 0,
                 fee,
                 v,
                 producer_fee,
@@ -3784,11 +3914,9 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.contains("deposit balance mismatch"), "err = {}", err);
-        assert_eq!(
-            ledger.balance(&deposit_balance_key(&intent)).unwrap(),
-            debit + 1
-        );
+        assert!(err.contains("amount mismatch"), "err = {}", err);
+        // Slot still open (rejection left state untouched).
+        assert_eq!(ledger.deposit_slots.get(&0).map(|s| s.amount), Some(debit + 1));
         assert!(ledger.memos.is_empty());
     }
 
@@ -3815,12 +3943,13 @@ mod tests {
             &enc,
             &producer_enc,
         );
-        ledger.fund(&deposit_balance_key(&intent), debit).unwrap();
+        ledger.deposit(&deposit_recipient_string(&intent), debit).unwrap();
 
         let err = apply_shield(
             &mut ledger,
             &ShieldReq {
                 deposit_id: intent,
+                deposit_slot: 0,
                 fee,
                 v,
                 producer_fee,
@@ -3845,7 +3974,8 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("public output length mismatch"), "err = {}", err);
-        assert_eq!(ledger.balance(&deposit_balance_key(&intent)).unwrap(), debit);
+        // Slot still open (rejection left state untouched).
+        assert_eq!(ledger.deposit_slots.get(&0).map(|s| s.amount), Some(debit));
         assert!(ledger.memos.is_empty());
     }
 
@@ -3883,7 +4013,7 @@ mod tests {
             &producer_enc,
         );
         ledger
-            .fund(&deposit_balance_key(&honest_intent), debit)
+            .deposit(&deposit_recipient_string(&honest_intent), debit)
             .unwrap();
 
         // Attacker tries to drain by claiming an attacker-crafted intent.
@@ -3901,6 +4031,7 @@ mod tests {
             &mut ledger,
             &ShieldReq {
                 deposit_id: attacker_intent,
+                deposit_slot: 0,
                 fee,
                 v,
                 producer_fee,
@@ -3913,20 +4044,15 @@ mod tests {
         )
         .unwrap_err();
 
-        // The L1 balance check fails: bal_for(attacker_intent) == 0 != debit.
+        // The slot's intent is bound to honest, not attacker.
         assert!(
-            err.contains("deposit balance mismatch"),
+            err.contains("intent mismatch") || err.contains("amount mismatch"),
             "err = {}", err
         );
-        // Honest balance is intact.
+        // Honest slot is intact.
         assert_eq!(
-            ledger.balance(&deposit_balance_key(&honest_intent)).unwrap(),
-            debit
-        );
-        // Attacker balance was never funded.
-        assert_eq!(
-            ledger.balance(&deposit_balance_key(&attacker_intent)).unwrap(),
-            0
+            ledger.deposit_slots.get(&0),
+            Some(&DepositSlot { intent: honest_intent, amount: debit })
         );
         assert!(ledger.memos.is_empty());
     }
@@ -3959,16 +4085,17 @@ mod tests {
         );
         // Fund both deployments at the *same* deposit key (intent_a).
         ledger_a
-            .fund(&deposit_balance_key(&intent_a), debit)
+            .deposit(&deposit_recipient_string(&intent_a), debit)
             .unwrap();
         ledger_b
-            .fund(&deposit_balance_key(&intent_a), debit)
+            .deposit(&deposit_recipient_string(&intent_a), debit)
             .unwrap();
 
         // Drain ledger A succeeds.
         ledger_a
             .shield(&ShieldReq {
                 deposit_id: intent_a,
+                deposit_slot: 0,
                 fee,
                 v,
                 producer_fee,
@@ -3985,6 +4112,7 @@ mod tests {
         let err = ledger_b
             .shield(&ShieldReq {
                 deposit_id: intent_a,
+                deposit_slot: 0,
                 fee,
                 v,
                 producer_fee,
@@ -3997,10 +4125,8 @@ mod tests {
             .unwrap_err();
 
         assert!(err.contains("shield intent mismatch"), "err = {}", err);
-        assert_eq!(
-            ledger_b.balance(&deposit_balance_key(&intent_a)).unwrap(),
-            debit
-        );
+        // Slot in ledger B is still open.
+        assert_eq!(ledger_b.deposit_slots.get(&0).map(|s| s.amount), Some(debit));
     }
 
     #[test]
@@ -4465,13 +4591,14 @@ mod tests {
             &producer_enc,
         );
         ledger
-            .fund(&deposit_balance_key(&intent), 125 + (MIN_TX_FEE - 1) + 1)
+            .deposit(&deposit_recipient_string(&intent), 125 + (MIN_TX_FEE - 1) + 1)
             .unwrap();
 
         let err = apply_shield(
             &mut ledger,
             &ShieldReq {
                 deposit_id: intent,
+                deposit_slot: 0,
                 fee: MIN_TX_FEE - 1,
                 v: 125,
                 producer_fee: 1,
@@ -4519,13 +4646,14 @@ mod tests {
         );
         state
             .inner
-            .fund(&deposit_balance_key(&intent), 125 + MIN_TX_FEE + 1)
+            .deposit(&deposit_recipient_string(&intent), 125 + MIN_TX_FEE + 1)
             .unwrap();
 
         let err = apply_shield(
             &mut state,
             &ShieldReq {
                 deposit_id: intent,
+                deposit_slot: 0,
                 fee: MIN_TX_FEE,
                 v: 125,
                 producer_fee: 1,
@@ -4561,10 +4689,10 @@ mod tests {
         let debit = 125 + MIN_TX_FEE + 1;
         state
             .inner
-            .fund(&deposit_balance_key(&intent), debit)
+            .deposit(&deposit_recipient_string(&intent), debit)
             .unwrap();
 
-        let balance_before = state.inner.balance(&deposit_balance_key(&intent)).unwrap();
+        let balance_before = state.inner.balance(&deposit_recipient_string(&intent)).unwrap();
         let leaves_before = state.inner.tree.leaves.clone();
         let memos_before = state.inner.memos.len();
 
@@ -4572,6 +4700,7 @@ mod tests {
             &mut state,
             &ShieldReq {
                 deposit_id: intent,
+                deposit_slot: 0,
                 fee: MIN_TX_FEE,
                 v: 125,
                 producer_fee: 1,
@@ -4586,7 +4715,7 @@ mod tests {
 
         assert!(err.contains("Merkle tree full"));
         assert_eq!(
-            state.inner.balance(&deposit_balance_key(&intent)).unwrap(),
+            state.inner.balance(&deposit_recipient_string(&intent)).unwrap(),
             balance_before
         );
         assert_eq!(state.inner.tree.leaves, leaves_before);
@@ -4849,12 +4978,12 @@ mod tests {
     fn test_deposit_balance_key_is_namespaced_and_canonical() {
         let mut deposit_id = ZERO;
         deposit_id[..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
-        let key = deposit_balance_key(&deposit_id);
+        let key = deposit_recipient_string(&deposit_id);
 
-        assert!(key.starts_with(DEPOSIT_BALANCE_KEY_PREFIX));
-        assert!(is_deposit_balance_key(&key));
-        assert!(!is_deposit_balance_key(&hex::encode(deposit_id)));
-        assert!(!is_deposit_balance_key(&key.to_uppercase()));
+        assert!(key.starts_with(DEPOSIT_RECIPIENT_PREFIX));
+        assert!(is_deposit_recipient_string(&key));
+        assert!(!is_deposit_recipient_string(&hex::encode(deposit_id)));
+        assert!(!is_deposit_recipient_string(&key.to_uppercase()));
     }
 
     #[test]

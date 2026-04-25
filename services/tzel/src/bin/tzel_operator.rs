@@ -1582,6 +1582,7 @@ mod tests {
         encode_kernel_inbox_message(&KernelInboxMessage::Shield(
             tzel_core::kernel_wire::KernelShieldReq {
                 deposit_id,
+                deposit_slot: 0,
                 fee: 100_000,
                 v: 25,
                 producer_fee,

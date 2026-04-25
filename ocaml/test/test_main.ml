@@ -1536,17 +1536,17 @@ let test_shield_flow () =
     build_test_shield ~auth_domain ~recipient:bob ~producer
       ~v_pub:5000L ~fee:100L ~producer_fee:1L
   in
-  let deposit_key =
-    Printf.sprintf "deposit:%s" (Tzel.Felt.to_hex pub.deposit_id)
+  let slot_id =
+    Tzel.Ledger.record_deposit ledger
+      ~intent:pub.deposit_id ~amount:5101L
   in
-  Tzel.Ledger.set_balance ledger deposit_key 5101L;
   let result =
-    Tzel.Ledger.apply_shield ledger ~pub
+    Tzel.Ledger.apply_shield ledger ~pub ~deposit_slot:slot_id
       ~memo_ct_hash:mch ~producer_memo_ct_hash:prod_mch
   in
   Alcotest.(check bool) "shield ok" true (Result.is_ok result);
-  Alcotest.(check int64) "deposit drained" 0L
-    (Tzel.Ledger.get_balance ledger deposit_key);
+  Alcotest.(check bool) "slot consumed" true
+    (Option.is_none (Hashtbl.find_opt ledger.deposit_slots slot_id));
   Alcotest.(check int) "tree size (recipient + producer)" 2
     (Tzel.Ledger.tree_size ledger);
   let root = Tzel.Ledger.current_root ledger in
@@ -1563,12 +1563,12 @@ let test_shield_balance_underfund () =
     build_test_shield ~auth_domain ~recipient ~producer
       ~v_pub:500L ~fee:50L ~producer_fee:1L
   in
-  let deposit_key =
-    Printf.sprintf "deposit:%s" (Tzel.Felt.to_hex pub.deposit_id)
+  let slot_id =
+    Tzel.Ledger.record_deposit ledger
+      ~intent:pub.deposit_id ~amount:100L
   in
-  Tzel.Ledger.set_balance ledger deposit_key 100L;
   let result =
-    Tzel.Ledger.apply_shield ledger ~pub
+    Tzel.Ledger.apply_shield ledger ~pub ~deposit_slot:slot_id
       ~memo_ct_hash:mch ~producer_memo_ct_hash:prod_mch
   in
   Alcotest.(check bool) "underfund rejected" true (Result.is_error result)
@@ -1584,13 +1584,12 @@ let test_shield_balance_overfund () =
     build_test_shield ~auth_domain ~recipient ~producer
       ~v_pub:500L ~fee:50L ~producer_fee:1L
   in
-  let deposit_key =
-    Printf.sprintf "deposit:%s" (Tzel.Felt.to_hex pub.deposit_id)
+  (* Exact debit is 551; overfund the slot to 552. Exact-match rule rejects. *)
+  let slot_id =
+    Tzel.Ledger.record_deposit ledger ~intent:pub.deposit_id ~amount:552L
   in
-  (* Exact debit is 551; overfund by 1. Exact-match rule rejects. *)
-  Tzel.Ledger.set_balance ledger deposit_key 552L;
   let result =
-    Tzel.Ledger.apply_shield ledger ~pub
+    Tzel.Ledger.apply_shield ledger ~pub ~deposit_slot:slot_id
       ~memo_ct_hash:mch ~producer_memo_ct_hash:prod_mch
   in
   Alcotest.(check bool) "overfund rejected" true (Result.is_error result)
@@ -1608,12 +1607,12 @@ let test_shield_intent_mismatch () =
   in
   (* Mutate one detail (memo_ct_hash) so deposit_id no longer binds. *)
   let pub = { pub with memo_ct_hash = Tzel.Hash.hash_tag "different-mch" } in
-  let deposit_key =
-    Printf.sprintf "deposit:%s" (Tzel.Felt.to_hex pub.deposit_id)
+  let slot_id =
+    Tzel.Ledger.record_deposit ledger
+      ~intent:pub.deposit_id ~amount:551L
   in
-  Tzel.Ledger.set_balance ledger deposit_key 551L;
   let result =
-    Tzel.Ledger.apply_shield ledger ~pub
+    Tzel.Ledger.apply_shield ledger ~pub ~deposit_slot:slot_id
       ~memo_ct_hash:(Tzel.Hash.hash_tag "different-mch")
       ~producer_memo_ct_hash:prod_mch
   in
@@ -1631,13 +1630,13 @@ let test_shield_memo_mismatch () =
     build_test_shield ~auth_domain ~recipient ~producer
       ~v_pub:500L ~fee:50L ~producer_fee:1L
   in
-  let deposit_key =
-    Printf.sprintf "deposit:%s" (Tzel.Felt.to_hex pub.deposit_id)
+  let slot_id =
+    Tzel.Ledger.record_deposit ledger
+      ~intent:pub.deposit_id ~amount:551L
   in
-  Tzel.Ledger.set_balance ledger deposit_key 551L;
   let wrong_mch = Tzel.Felt.of_u64 999 in
   let result =
-    Tzel.Ledger.apply_shield ledger ~pub
+    Tzel.Ledger.apply_shield ledger ~pub ~deposit_slot:slot_id
       ~memo_ct_hash:wrong_mch ~producer_memo_ct_hash:prod_mch
   in
   Alcotest.(check bool) "memo mismatch" true (Result.is_error result)
@@ -2184,20 +2183,21 @@ let test_multi_shield_transfer_unshield () =
       ~producer_rseed:(Tzel.Felt.of_u64 (2000 + rseed_offset))
       ~producer_memo_ct_hash:mch_p
     in
-    let key = Printf.sprintf "deposit:%s" (Tzel.Felt.to_hex pub.deposit_id) in
-    Tzel.Ledger.set_balance ledger key
-      (Int64.add v_pub (Int64.add fee producer_fee));
-    (pub, mch_r, mch_p)
+    let amount = Int64.add v_pub (Int64.add fee producer_fee) in
+    let slot_id =
+      Tzel.Ledger.record_deposit ledger ~intent:pub.deposit_id ~amount
+    in
+    (pub, mch_r, mch_p, slot_id)
   in
-  let (pub1, mch1, prod_mch1) =
+  let (pub1, mch1, prod_mch1, slot1) =
     prep_shield ~v_pub:3000L ~fee:100L ~producer_fee:1L ~rseed_offset:1
   in
-  ignore (Tzel.Ledger.apply_shield ledger ~pub:pub1
+  ignore (Tzel.Ledger.apply_shield ledger ~pub:pub1 ~deposit_slot:slot1
             ~memo_ct_hash:mch1 ~producer_memo_ct_hash:prod_mch1);
-  let (pub2, mch2, prod_mch2) =
+  let (pub2, mch2, prod_mch2, slot2) =
     prep_shield ~v_pub:2000L ~fee:100L ~producer_fee:1L ~rseed_offset:2
   in
-  ignore (Tzel.Ledger.apply_shield ledger ~pub:pub2
+  ignore (Tzel.Ledger.apply_shield ledger ~pub:pub2 ~deposit_slot:slot2
             ~memo_ct_hash:mch2 ~producer_memo_ct_hash:prod_mch2);
   Alcotest.(check int) "tree after shields (2 recipient + 2 producer)" 4
     (Tzel.Ledger.tree_size ledger);

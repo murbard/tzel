@@ -442,11 +442,28 @@ intent = \Hash_{intent}(auth\_domain,\, v_{pub},\, fee,\, producer\_fee,\,
 \(\Hash_{intent}\) is the sequential left-fold using the \texttt{sighSP\_\_}
 personalization with leading type tag \(0x03\) (the same primitive as the
 spend-authorization sighash but with a distinct type tag for domain
-separation). The L1 deposit transaction credits the public rollup balance
-key \texttt{deposit:<hex(intent)>} for exactly \(v_{pub} + fee + producer\_fee\)
-mutez, no more, no less. There is no separate \(deposit\_secret\): the L1
-deposit's own L1 signature is the spend authorization, and the
-deposit-id binding propagates to every detail of the shield.
+separation). The L1 deposit transaction is addressed to the canonical
+recipient string \texttt{deposit:<hex(intent)>}, and the kernel allocates a
+fresh per-deposit \emph{slot} for that L1 ticket. The slot's \emph{key}
+is a \(slot\_id\) drawn from a kernel-controlled monotonic counter
+(depositors cannot influence, predict, or collide slot ids); the slot's
+\emph{content} is \((intent, amount)\). There is no separate
+\(deposit\_secret\): the L1 deposit's own L1 signature is the spend
+authorization, and the deposit-id binding propagates to every detail of the
+shield.
+
+\paragraph{Per-deposit slots and dust resistance.} Two different L1
+tickets addressed to the same \texttt{deposit:<hex(intent)>} recipient
+string each allocate their own slot rather than accumulating into a
+shared balance, and even tickets with identical \((intent, amount)\)
+content still get distinct slot ids. This matters because the
+\texttt{deposit:<hex(intent)>} string is public on L1: an attacker could
+observe a victim's deposit, send a 1-mutez ticket to the same recipient
+string, and (under a single shared balance scheme) push the balance
+above the bound debit, permanently bricking the legitimate shield
+(which requires the balance to equal the debit exactly). With
+per-deposit slots, the dust ticket creates an orphan slot and the
+legitimate slot's content is unchanged.
 
 The public outputs of shield are
 
@@ -457,11 +474,14 @@ The public outputs of shield are
 
 The circuit proves the user commitment, the producer-fee commitment, the
 condition \(producer\_fee > 0\), and that \(deposit\_id\) equals the
-recomputed \(intent\). The rollup additionally recomputes \(intent\) from the
-request fields and rejects any mismatch, then verifies note-data hashes and
-the required burned fee. The deposit balance MUST equal exactly the consumed
-debit \(v_{pub} + fee + producer\_fee\); on success the kernel drains it to
-zero in a single shot. There is no partial drain and no top-up.
+recomputed \(intent\). The shield request additionally carries a
+\(deposit\_slot\) field selecting which kernel-side slot to drain. The
+rollup recomputes \(intent\) from the request fields and rejects any
+mismatch, verifies note-data hashes, and looks up the slot. It accepts only
+if the slot's \(intent\) equals \(deposit\_id\) and its \(amount\) equals
+\(v_{pub} + fee + producer\_fee\) exactly. On success the slot is
+tombstoned in a single shot. There is no partial drain and no top-up; an
+over- or under-deposit leaves an orphan slot but cannot affect any other.
 
 \paragraph{Untrusted-prover safety.} The witness exposes the recipient's
 address fields, value, randomness, and the encrypted-note bytes. None of these

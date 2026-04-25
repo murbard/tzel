@@ -43,7 +43,7 @@ fn ocaml_scenario() -> InteropScenario {
     serde_json::from_slice(&out.stdout).expect("valid interop scenario JSON")
 }
 
-fn shield_req(step: &InteropShieldStep, auth_domain: &F) -> (F, ShieldReq) {
+fn shield_req(step: &InteropShieldStep, auth_domain: &F, deposit_slot: u64) -> (F, ShieldReq) {
     // Intent-bound shield: deposit_id is the sighash_fold over every public
     // output. Both implementations recompute it the same way.
     let deposit_id = shield_intent(
@@ -58,6 +58,7 @@ fn shield_req(step: &InteropShieldStep, auth_domain: &F) -> (F, ShieldReq) {
     );
     let req = ShieldReq {
         deposit_id,
+        deposit_slot,
         v: step.v,
         fee: step.fee,
         producer_fee: step.producer_fee,
@@ -141,11 +142,24 @@ fn unshield_req(step: &InteropUnshieldStep, auth_domain: &F) -> UnshieldReq {
 fn test_ocaml_wallet_scenario_applies_on_rust_ledger() {
     let scenario = ocaml_scenario();
     let mut ledger = Ledger::with_auth_domain(scenario.auth_domain);
-    let (deposit_id, shield_req) = shield_req(&scenario.shield, &scenario.auth_domain);
+    // Allocate a deposit slot for the shield intent.
     let exact_debit = scenario.shield.v + scenario.shield.fee + scenario.shield.producer_fee;
-    ledger
-        .fund(&deposit_balance_key(&deposit_id), exact_debit)
-        .expect("fund deposit");
+    let intent_for_funding = shield_intent(
+        &scenario.auth_domain,
+        scenario.shield.v,
+        scenario.shield.fee,
+        scenario.shield.producer_fee,
+        &scenario.shield.cm,
+        &scenario.shield.producer_cm,
+        &scenario.shield.memo_ct_hash,
+        &scenario.shield.producer_memo_ct_hash,
+    );
+    let slot_id = ledger
+        .deposit(&deposit_recipient_string(&intent_for_funding), exact_debit)
+        .expect("deposit slot");
+
+    let (deposit_id, shield_req) = shield_req(&scenario.shield, &scenario.auth_domain, slot_id);
+    assert_eq!(deposit_id, intent_for_funding);
 
     let shield_resp = ledger.shield(&shield_req).expect("shield");
     assert_eq!(shield_resp.cm, scenario.shield.cm);
@@ -166,10 +180,8 @@ fn test_ocaml_wallet_scenario_applies_on_rust_ledger() {
     assert_eq!(unshield_resp.change_index, None);
     assert_eq!(unshield_resp.producer_index, 5);
 
-    assert_eq!(
-        ledger.balances.get(&deposit_balance_key(&deposit_id)).copied().unwrap_or(0),
-        0
-    );
+    // Slot was consumed by shield.
+    assert!(ledger.deposit_slots.get(&slot_id).is_none());
     assert_eq!(ledger.withdrawals, scenario.expected.withdrawals.clone());
     assert_eq!(ledger.tree.leaves.len(), scenario.expected.tree_size);
     assert_eq!(ledger.nullifiers.len(), scenario.expected.nullifier_count);

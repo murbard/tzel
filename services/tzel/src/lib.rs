@@ -296,7 +296,7 @@ mod tests {
     }
 
     fn test_deposit_key(label: &str) -> String {
-        deposit_balance_key(&test_deposit_id(label))
+        deposit_recipient_string(&test_deposit_id(label))
     }
 
     fn random_payment_address() -> PaymentAddress {
@@ -557,10 +557,13 @@ mod tests {
             &memo_ct_hash(&producer_enc),
         );
         let debit = v + TEST_FEE + 1;
-        ledger.fund(&deposit_balance_key(&intent), debit).unwrap();
+        let slot_id = ledger
+            .deposit(&deposit_recipient_string(&intent), debit)
+            .unwrap();
         ledger
             .shield(&ShieldReq {
                 deposit_id: intent,
+                deposit_slot: slot_id,
                 v,
                 fee: TEST_FEE,
                 producer_fee: 1,
@@ -1675,7 +1678,7 @@ mod tests {
     #[test]
     fn test_ledger_shield_rejects_malformed_client_note_lengths() {
         let mut ledger = Ledger::new();
-        let _ = ledger.fund(&test_deposit_key("alice"), 200_000);
+        let _ = ledger.deposit(&test_deposit_key("alice"), 200_000);
 
         let mut master_sk = ZERO;
         master_sk[0] = 0x44;
@@ -1714,6 +1717,7 @@ mod tests {
         let err = ledger
             .shield(&ShieldReq {
                 deposit_id: test_deposit_id("alice"),
+                deposit_slot: 0,
                 v: 100,
                 fee: TEST_FEE,
                 producer_fee: 1,
@@ -2595,19 +2599,6 @@ exit 2
         assert!(err.contains("length mismatch"), "unexpected error: {}", err);
     }
 
-    #[test]
-    fn test_fund_rejects_public_balance_overflow() {
-        let mut ledger = Ledger::new();
-        ledger.balances.insert("alice".into(), u64::MAX);
-
-        let err = ledger.fund("alice", 1).unwrap_err();
-        assert!(
-            err.contains("public balance overflow"),
-            "unexpected error: {}",
-            err
-        );
-        assert_eq!(ledger.balances.get("alice"), Some(&u64::MAX));
-    }
 
     #[test]
     fn test_unshield_queues_withdrawal_without_touching_existing_public_balance() {

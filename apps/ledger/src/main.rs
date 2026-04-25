@@ -18,7 +18,8 @@ type AppState = Arc<LedgerState>;
 
 #[derive(Parser)]
 struct Cli {
-    /// Interface to bind sp-ledger to. Defaults to loopback because /fund is demo-only.
+    /// Interface to bind sp-ledger to. Defaults to loopback because /deposit
+    /// is demo-only.
     #[arg(long, default_value = "127.0.0.1")]
     listen: String,
 
@@ -70,14 +71,58 @@ fn parse_felt_be_hex(s: &str) -> Result<F, String> {
     Ok(le)
 }
 
-async fn fund_handler(
+async fn deposit_handler(
     State(st): State<AppState>,
-    Json(req): Json<FundReq>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    Json(req): Json<DepositReq>,
+) -> Result<Json<DepositResp>, (StatusCode, String)> {
     let mut ledger = st.ledger.lock().unwrap();
-    ledger.fund(&req.recipient, req.amount).map_err(err)?;
-    eprintln!("[fund] {} += {}", req.recipient, req.amount);
-    Ok(Json(serde_json::json!({"ok": true})))
+    let slot_id = ledger.deposit(&req.recipient, req.amount).map_err(err)?;
+    eprintln!(
+        "[deposit] {} += {} (slot {})",
+        req.recipient, req.amount, slot_id
+    );
+    Ok(Json(DepositResp { slot_id }))
+}
+
+async fn slots_handler(
+    State(st): State<AppState>,
+    Query(params): Query<SlotsByIntentParam>,
+) -> Result<Json<DepositSlotsResp>, (StatusCode, String)> {
+    let intent = parse_intent_hex(&params.intent).map_err(err)?;
+    let ledger = st.ledger.lock().unwrap();
+    let slots = ledger
+        .open_deposit_slots_for_intent(&intent)
+        .into_iter()
+        .map(|(id, amount)| DepositSlotInfo { id, amount })
+        .collect();
+    Ok(Json(DepositSlotsResp { slots }))
+}
+
+#[derive(serde::Deserialize)]
+struct SlotsByIntentParam {
+    intent: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct DepositSlotInfo {
+    pub id: u64,
+    pub amount: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct DepositSlotsResp {
+    pub slots: Vec<DepositSlotInfo>,
+}
+
+fn parse_intent_hex(s: &str) -> Result<F, String> {
+    let hex = s.strip_prefix("0x").unwrap_or(s);
+    if hex.len() != 64 {
+        return Err("intent must be 32-byte hex".into());
+    }
+    let raw = hex::decode(hex).map_err(|_| "intent must be hex".to_string())?;
+    let mut intent = ZERO;
+    intent.copy_from_slice(&raw);
+    Ok(intent)
 }
 
 async fn shield_handler(
@@ -91,7 +136,7 @@ async fn shield_handler(
     let resp = ledger.shield(&req).map_err(err)?;
     eprintln!(
         "[shield] deposit {} shielded {} -> cm={} idx={}",
-        deposit_balance_key(&req.deposit_id),
+        deposit_recipient_string(&req.deposit_id),
         req.v,
         short(&resp.cm),
         resp.index
@@ -263,7 +308,8 @@ async fn main() {
 
     let app = Router::new()
         .route("/config", get(config_handler))
-        .route("/fund", post(fund_handler))
+        .route("/deposit", post(deposit_handler))
+        .route("/deposits/by-intent", get(slots_handler))
         .route("/shield", post(shield_handler))
         .route("/transfer", post(transfer_handler))
         .route("/unshield", post(unshield_handler))
@@ -278,7 +324,7 @@ async fn main() {
     if !matches!(cli.listen.as_str(), "127.0.0.1" | "::1" | "localhost") {
         eprintln!(
             "WARNING: sp-ledger is binding to a non-loopback interface ({}). \
-             The /fund endpoint is demo-only and unauthenticated.",
+             The /deposit endpoint is demo-only and unauthenticated.",
             cli.listen
         );
     }
@@ -364,39 +410,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fund_handler_updates_balances() {
+    async fn test_deposit_handler_allocates_slots_and_dust_does_not_brick() {
         let st = test_state(default_auth_domain());
-        let _ = fund_handler(
+        let intent = u64_to_felt(0xAB);
+        let recipient = deposit_recipient_string(&intent);
+        let debit = 5101u64;
+
+        let Json(legit) = deposit_handler(
             State(st.clone()),
-            Json(FundReq {
+            Json(DepositReq {
+                recipient: recipient.clone(),
+                amount: debit,
+            }),
+        )
+        .await
+        .expect("legit deposit allocates a slot");
+
+        // Attacker dusts the same intent.
+        let Json(dust) = deposit_handler(
+            State(st.clone()),
+            Json(DepositReq {
+                recipient: recipient.clone(),
+                amount: 1,
+            }),
+        )
+        .await
+        .expect("dust deposit allocates its own (orphan) slot");
+
+        assert_ne!(legit.slot_id, dust.slot_id);
+
+        let Json(slots) = slots_handler(
+            State(st.clone()),
+            Query(SlotsByIntentParam {
+                intent: hex::encode(intent),
+            }),
+        )
+        .await
+        .expect("slots query");
+        // Both visible; the wallet picks the slot with the right amount.
+        assert_eq!(slots.slots.len(), 2);
+        assert!(slots.slots.iter().any(|s| s.amount == debit));
+        assert!(slots.slots.iter().any(|s| s.amount == 1));
+    }
+
+    #[tokio::test]
+    async fn test_deposit_handler_rejects_non_deposit_recipient() {
+        let st = test_state(default_auth_domain());
+        let err = deposit_handler(
+            State(st.clone()),
+            Json(DepositReq {
                 recipient: "alice".into(),
                 amount: 55,
             }),
         )
         .await
-        .expect("fund should succeed");
-
-        let Json(resp) = balances_handler(State(st)).await;
-        assert_eq!(resp.balances.get("alice"), Some(&55));
-    }
-
-    #[tokio::test]
-    async fn test_fund_handler_accepts_secret_bound_deposit_balances_for_local_shield_flow() {
-        let st = test_state(default_auth_domain());
-        let deposit_key = deposit_balance_key(&u64_to_felt(0xAB));
-
-        let _ = fund_handler(
-            State(st.clone()),
-            Json(FundReq {
-                recipient: deposit_key.clone(),
-                amount: 55,
-            }),
-        )
-        .await
-        .expect("deposit funding should remain available for local shield tests");
-
-        let Json(resp) = balances_handler(State(st)).await;
-        assert_eq!(resp.balances.get(&deposit_key), Some(&55));
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("deposit recipient"));
     }
 
     #[test]
@@ -532,6 +602,7 @@ mod tests {
             State(st),
             Json(ShieldReq {
                 deposit_id: hash(b"alice"),
+                deposit_slot: 0,
                 v: 5,
                 fee: MIN_TX_FEE,
                 producer_fee: 1,

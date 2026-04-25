@@ -690,14 +690,10 @@ fn test_ledger_rejects_tmb_by_default() {
     let mut ledger = start_verified_ledger(port);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Fund works (no proof needed)
-        let (ok, _) = client_tmb(
-            &alice,
-            &["fund", "-l", &l, "--addr", "alice", "--amount", "300002"],
-        );
-        assert!(ok, "fund should work without proof");
-
-        // Shield with TrustMeBro should be REJECTED
+        // Shield with TrustMeBro should be REJECTED on the verified ledger.
+        // (Demo /deposit + /shield is what cmd_shield does internally; the
+        // verified ledger rejects the TMB shield before the deposit step is
+        // even reached. We don't need a separate fund step.)
         let (ok, out) = client_tmb(
             &alice,
             &[
@@ -778,7 +774,7 @@ fn test_shield_proof_roundtrip() {
         let alice_id = hash_two(&felt_tag(b"deposit"), &hash(b"alice"));
         let fund_resp = post_json_allow_status(
             &format!("{}/fund", l),
-            &serde_json::json!({ "addr": deposit_balance_key(&alice_id), "amount": 300001 }),
+            &serde_json::json!({ "addr": deposit_recipient_string(&alice_id), "amount": 300001 }),
         );
         assert_eq!(fund_resp.status(), 200);
 
@@ -789,6 +785,7 @@ fn test_shield_proof_roundtrip() {
             generate_shield_proof("alice", 200_000, MIN_TX_FEE, &address);
         let req = ShieldReq {
             deposit_id: alice_id,
+            deposit_slot: 0,
             v: 200_000,
             fee: MIN_TX_FEE,
             producer_fee: 1,

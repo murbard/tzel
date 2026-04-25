@@ -79,6 +79,7 @@ mod with_verifier {
     fn kernel_shield_req_from_fixture(req: &ShieldReq) -> KernelShieldReq {
         KernelShieldReq {
             deposit_id: req.deposit_id,
+            deposit_slot: req.deposit_slot,
             v: req.v,
             fee: req.fee,
             producer_fee: req.producer_fee,
@@ -132,7 +133,7 @@ mod with_verifier {
             transfer_program_hash: felt_hex(&fixture.program_hashes.transfer),
             unshield_program_hash: felt_hex(&fixture.program_hashes.unshield),
             bridge_ticketer: &fixture.bridge_ticketer,
-            shield_deposit_id: tzel_core::deposit_balance_key(&fixture.shield.deposit_id),
+            shield_deposit_id: tzel_core::deposit_recipient_string(&fixture.shield.deposit_id),
             shield_amount: fixture.shield.v,
             shield_total_debit: fixture.shield.v + fixture.shield.fee + fixture.shield.producer_fee,
             shield_tree_size_after: 2,

@@ -8,6 +8,7 @@
   "bridge_ticketer": "KT1BuEZtb68c1Q4yjtckcNjGELqWt56Xyesc",
   "shield": {
     "deposit_id": "3f50d86f7ec57cde391aecf5c9c973d53c17d374bbfa66659aa3347087ff9f07",
+    "deposit_slot": 0,
     "fee": 100000,
     "v": 400000,
     "producer_fee": 1,

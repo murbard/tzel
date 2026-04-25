@@ -19,6 +19,16 @@
 let tree_depth = 48
 let max_valid_roots = 4096
 
+(* One pending L1-bridge deposit slot. Open slots live in `deposit_slots`
+   keyed by id; consumed slots are removed. The `deposits_by_intent` index
+   lets the wallet enumerate all slots for a given intent (multiple slots
+   can share an intent under a dust attack — the consumer picks the one
+   whose amount matches the bound debit). *)
+type deposit_slot = {
+  slot_intent : Felt.t;
+  slot_amount : int64;
+}
+
 type t = {
   tree : Merkle.tree_with_leaves;
   nullifier_set : (string, unit) Hashtbl.t;
@@ -27,6 +37,9 @@ type t = {
   balances : (string, int64) Hashtbl.t;
   withdrawals : (string * int64) Queue.t;
   auth_domain : Felt.t;
+  mutable next_deposit_slot_id : int64;
+  deposit_slots : (int64, deposit_slot) Hashtbl.t;
+  deposits_by_intent : (string, int64 list ref) Hashtbl.t;
 }
 
 let record_root_with_limit ledger ~max_roots root_hex =
@@ -48,11 +61,48 @@ let create ~auth_domain =
   let root_history = Queue.create () in
   let balances = Hashtbl.create 64 in
   let withdrawals = Queue.create () in
+  let deposit_slots = Hashtbl.create 64 in
+  let deposits_by_intent = Hashtbl.create 64 in
   let initial_root = Merkle.root_with_leaves tree in
   let initial_root_hex = Felt.to_hex initial_root in
   Hashtbl.replace root_set initial_root_hex ();
   Queue.push initial_root_hex root_history;
-  { tree; nullifier_set; root_set; root_history; balances; withdrawals; auth_domain }
+  {
+    tree; nullifier_set; root_set; root_history;
+    balances; withdrawals; auth_domain;
+    next_deposit_slot_id = 0L;
+    deposit_slots; deposits_by_intent;
+  }
+
+(* Record an L1 bridge deposit. Returns the new slot id. Each call allocates
+   its own slot, so dust attackers depositing 1 mutez to the same intent
+   simply create their own orphan slot (no brick). *)
+let record_deposit ledger ~intent ~amount =
+  let id = ledger.next_deposit_slot_id in
+  ledger.next_deposit_slot_id <- Int64.add id 1L;
+  Hashtbl.replace ledger.deposit_slots id
+    { slot_intent = intent; slot_amount = amount };
+  let key = Felt.to_hex intent in
+  (match Hashtbl.find_opt ledger.deposits_by_intent key with
+   | None -> Hashtbl.replace ledger.deposits_by_intent key (ref [id])
+   | Some r -> r := id :: !r);
+  id
+
+let consume_deposit_slot ledger ~slot_id ~intent ~debit =
+  match Hashtbl.find_opt ledger.deposit_slots slot_id with
+  | None ->
+      Error (Printf.sprintf "deposit slot %Ld not found or already consumed" slot_id)
+  | Some slot ->
+      if not (Felt.equal slot.slot_intent intent) then
+        Error (Printf.sprintf "deposit slot %Ld intent mismatch" slot_id)
+      else if Int64.compare slot.slot_amount debit <> 0 then
+        Error (Printf.sprintf
+                 "deposit slot %Ld amount mismatch: have %Ld, expected exactly %Ld"
+                 slot_id slot.slot_amount debit)
+      else begin
+        Hashtbl.remove ledger.deposit_slots slot_id;
+        Ok ()
+      end
 
 let get_balance ledger account =
   match Hashtbl.find_opt ledger.balances account with
@@ -218,12 +268,13 @@ let check_and_insert_nullifiers ledger nullifiers =
     Ok ()
 
 (* Intent-bound shield. The deposit_id MUST equal shield_intent over every
-   public output; the kernel recomputes it and rejects mismatch. The L1
-   deposit balance for `deposit:<hex(deposit_id)>` MUST equal exactly
-   v_pub + fee + producer_fee. On success the balance is drained to zero
-   and both notes are appended to the commitment tree. *)
+   public output; the kernel recomputes it and rejects mismatch. Shield
+   consumes a specific kernel-side slot (allocated when the L1 ticket
+   landed) whose `(intent, amount)` must match `(deposit_id, v + fee +
+   producer_fee)` exactly. On success the slot is removed and both notes
+   are appended to the commitment tree. *)
 let apply_shield ledger ~(pub : Transaction.shield_public)
-    ~memo_ct_hash ~producer_memo_ct_hash =
+    ~deposit_slot ~memo_ct_hash ~producer_memo_ct_hash =
   if not (Felt.equal pub.auth_domain ledger.auth_domain) then
     Error "auth_domain mismatch"
   else if not (Felt.equal memo_ct_hash pub.memo_ct_hash) then
@@ -244,23 +295,18 @@ let apply_shield ledger ~(pub : Transaction.shield_public)
     else if Int64.compare pub.producer_fee 0L <= 0 then
       Error "producer_fee must be positive"
     else
-      let deposit_key =
-        Printf.sprintf "deposit:%s" (Felt.to_hex pub.deposit_id)
-      in
-      let bal = get_balance ledger deposit_key in
       let debit =
         Int64.add pub.v_pub (Int64.add pub.fee pub.producer_fee)
       in
-      if Int64.compare bal debit <> 0 then
-        Error (Printf.sprintf
-                 "shield deposit balance mismatch: have %Ld, expected exactly %Ld"
-                 bal debit)
-      else begin
-        set_balance ledger deposit_key 0L;
+      match
+        consume_deposit_slot ledger ~slot_id:deposit_slot
+          ~intent:pub.deposit_id ~debit
+      with
+      | Error e -> Error e
+      | Ok () ->
         append_commitment ledger pub.cm_new;
         append_commitment ledger pub.cm_producer;
         Ok ()
-      end
   end
 
 let apply_transfer ledger (pub : Transaction.transfer_public)

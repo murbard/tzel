@@ -42,7 +42,8 @@ use tzel_core::{
         KERNEL_VERIFIER_CONFIG_KEY_INDEX,
     },
     prepare_unshield, required_tx_fee_for_private_tx_count, verify_wots_signature_against_leaf,
-    EncryptedNote, Ledger, LedgerState, UnshieldResp, WithdrawalRecord, DEPTH, F, ZERO,
+    DepositSlot, EncryptedNote, Ledger, LedgerState, UnshieldResp, WithdrawalRecord, DEPTH, F,
+    ZERO,
 };
 #[cfg(any(test, debug_assertions))]
 use tzel_core::{auth_leaf_hash, derive_auth_pub_seed};
@@ -102,6 +103,13 @@ const PATH_VALID_ROOT_INDEX_PREFIX: &[u8] = b"/tzel/v1/state/roots/index/";
 const PATH_BALANCE_PREFIX: &[u8] = b"/tzel/v1/state/balances/by-key/";
 const PATH_BALANCE_INDEX_PREFIX: &[u8] = b"/tzel/v1/state/balances/index/";
 const PATH_WITHDRAWAL_PREFIX: &[u8] = b"/tzel/v1/state/withdrawals/index/";
+/// Bridge-deposit slots. Each successful `apply_deposit` allocates one,
+/// indexed by a monotonic counter. A slot stores `(intent, amount)` and
+/// disappears the moment shield consumes it. Dust deposits to the same intent
+/// simply allocate their own slots.
+const PATH_DEPOSIT_SLOT_COUNT: &[u8] = b"/tzel/v1/state/deposits/count";
+const PATH_DEPOSIT_SLOT_PREFIX: &[u8] = b"/tzel/v1/state/deposits/by-id/";
+const PATH_DEPOSIT_BY_INTENT_PREFIX: &[u8] = b"/tzel/v1/state/deposits/by-intent/";
 const MAX_STORE_STRING_BYTES: usize = 256;
 const MAX_STORE_BINARY_BYTES: usize = 1024;
 const MAX_STORED_INPUT_PAYLOAD_BYTES: usize = 2048;
@@ -205,6 +213,9 @@ impl<'a, H: Host> DurableLedgerState<'a, H> {
         if self.host.read_store(PATH_WITHDRAWAL_COUNT, 8).is_none() {
             self.write_u64(PATH_WITHDRAWAL_COUNT, 0);
         }
+        if self.host.read_store(PATH_DEPOSIT_SLOT_COUNT, 8).is_none() {
+            self.write_u64(PATH_DEPOSIT_SLOT_COUNT, 0);
+        }
         if self.host.read_store(PATH_VALID_ROOT_COUNT, 8).is_none() {
             let root = self
                 .read_felt(PATH_TREE_ROOT)?
@@ -219,7 +230,8 @@ impl<'a, H: Host> DurableLedgerState<'a, H> {
     fn is_pristine(&self) -> Result<bool, String> {
         Ok(self.read_u64(PATH_TREE_SIZE)?.unwrap_or(0) == 0
             && self.read_u64(PATH_NULLIFIER_COUNT)?.unwrap_or(0) == 0
-            && self.read_u64(PATH_BALANCE_ACCOUNT_COUNT)?.unwrap_or(0) == 0)
+            && self.read_u64(PATH_BALANCE_ACCOUNT_COUNT)?.unwrap_or(0) == 0
+            && self.read_u64(PATH_DEPOSIT_SLOT_COUNT)?.unwrap_or(0) == 0)
     }
 
     fn read_u64(&self, path: &[u8]) -> Result<Option<u64>, String> {
@@ -436,6 +448,74 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
         self.host
             .write_store(PATH_PRIVATE_TX_COUNT_IN_LEVEL, &next.to_le_bytes());
     }
+
+    fn record_deposit_slot(&mut self, intent: F, amount: u64) -> Result<u64, String> {
+        let id = self.read_u64(PATH_DEPOSIT_SLOT_COUNT)?.unwrap_or(0);
+        let next_id = id
+            .checked_add(1)
+            .ok_or_else(|| "deposit slot counter overflow".to_string())?;
+        self.host
+            .write_store(&deposit_slot_path(id), &encode_deposit_slot_open(&intent, amount));
+        // Append to the by-intent index. Each intent has its own (count,
+        // index/i -> slot_id) pair so wallets can enumerate every slot funded
+        // for a given intent and pick the one whose amount matches.
+        let by_intent_count_path = deposits_by_intent_count_path(&intent);
+        let position = match self.host.read_store(&by_intent_count_path, 8) {
+            None => 0u64,
+            Some(bytes) => {
+                if bytes.len() != 8 {
+                    return Err(format!(
+                        "bad u64 at {}",
+                        String::from_utf8_lossy(&by_intent_count_path)
+                    ));
+                }
+                u64::from_le_bytes(bytes.try_into().unwrap())
+            }
+        };
+        self.host.write_store(
+            &deposits_by_intent_index_path(&intent, position),
+            &id.to_le_bytes(),
+        );
+        let next_position = position
+            .checked_add(1)
+            .ok_or_else(|| "by-intent deposit counter overflow".to_string())?;
+        self.host
+            .write_store(&by_intent_count_path, &next_position.to_le_bytes());
+        self.write_u64(PATH_DEPOSIT_SLOT_COUNT, next_id);
+        Ok(id)
+    }
+
+    fn consume_deposit_slot(
+        &mut self,
+        slot_id: u64,
+        intent: &F,
+        debit: u64,
+    ) -> Result<(), String> {
+        let path = deposit_slot_path(slot_id);
+        let bytes = self
+            .host
+            .read_store(&path, MAX_STORE_BINARY_BYTES)
+            .ok_or_else(|| format!("deposit slot {} does not exist", slot_id))?;
+        let slot = decode_deposit_slot_open(&bytes)?
+            .ok_or_else(|| format!("deposit slot {} already consumed", slot_id))?;
+        if slot.intent != *intent {
+            return Err(format!(
+                "deposit slot {} intent mismatch: slot binds a different deposit",
+                slot_id
+            ));
+        }
+        if slot.amount != debit {
+            return Err(format!(
+                "deposit slot {} amount mismatch: have {}, expected exactly {}",
+                slot_id, slot.amount, debit
+            ));
+        }
+        // Tombstone the slot. Intentionally a single-byte rewrite so the
+        // by-id path remains readable (returns Some([0x01])) and the by-intent
+        // index can still be enumerated for audit.
+        self.host.write_store(&path, &encode_deposit_slot_consumed());
+        Ok(())
+    }
 }
 
 fn indexed_path(prefix: &[u8], index: u64) -> Vec<u8> {
@@ -504,6 +584,74 @@ fn balance_path(addr: &str) -> Vec<u8> {
     path.extend_from_slice(hex::encode(addr.as_bytes()).as_bytes());
     path
 }
+
+fn deposit_slot_path(id: u64) -> Vec<u8> {
+    indexed_path(PATH_DEPOSIT_SLOT_PREFIX, id)
+}
+
+fn deposits_by_intent_count_path(intent: &F) -> Vec<u8> {
+    let mut path = Vec::with_capacity(PATH_DEPOSIT_BY_INTENT_PREFIX.len() + 64 + 6);
+    path.extend_from_slice(PATH_DEPOSIT_BY_INTENT_PREFIX);
+    path.extend_from_slice(hex::encode(intent).as_bytes());
+    path.extend_from_slice(b"/count");
+    path
+}
+
+fn deposits_by_intent_index_path(intent: &F, position: u64) -> Vec<u8> {
+    let mut path = Vec::with_capacity(PATH_DEPOSIT_BY_INTENT_PREFIX.len() + 64 + 32);
+    path.extend_from_slice(PATH_DEPOSIT_BY_INTENT_PREFIX);
+    path.extend_from_slice(hex::encode(intent).as_bytes());
+    path.extend_from_slice(b"/index/");
+    path.extend_from_slice(format!("{:016x}", position).as_bytes());
+    path
+}
+
+/// Deposit slot encoding. The first byte is a status tag:
+///   0x00 — OPEN: followed by 32 intent bytes and 8 amount LE bytes (41 total).
+///   0x01 — CONSUMED: a single-byte tombstone indicating shield drained the
+///          slot. The tombstone is what makes consumption-once enforceable
+///          without a `store_delete` host call.
+const DEPOSIT_SLOT_STATUS_OPEN: u8 = 0x00;
+const DEPOSIT_SLOT_STATUS_CONSUMED: u8 = 0x01;
+
+fn encode_deposit_slot_open(intent: &F, amount: u64) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(1 + 32 + 8);
+    bytes.push(DEPOSIT_SLOT_STATUS_OPEN);
+    bytes.extend_from_slice(intent);
+    bytes.extend_from_slice(&amount.to_le_bytes());
+    bytes
+}
+
+fn encode_deposit_slot_consumed() -> Vec<u8> {
+    vec![DEPOSIT_SLOT_STATUS_CONSUMED]
+}
+
+/// Decode an OPEN slot. Returns `None` for tombstones (CONSUMED) and `Err` for
+/// malformed bytes — this distinction matters in `read_ledger` which silently
+/// skips consumed slots but errors on corruption.
+fn decode_deposit_slot_open(bytes: &[u8]) -> Result<Option<DepositSlot>, String> {
+    let Some((status, body)) = bytes.split_first() else {
+        return Err("deposit slot is empty".into());
+    };
+    match *status {
+        DEPOSIT_SLOT_STATUS_OPEN => {
+            if body.len() != 32 + 8 {
+                return Err(format!(
+                    "deposit slot body length {} != {}",
+                    body.len(),
+                    32 + 8
+                ));
+            }
+            let mut intent = ZERO;
+            intent.copy_from_slice(&body[..32]);
+            let amount = u64::from_le_bytes(body[32..].try_into().unwrap());
+            Ok(Some(DepositSlot { intent, amount }))
+        }
+        DEPOSIT_SLOT_STATUS_CONSUMED => Ok(None),
+        other => Err(format!("unknown deposit slot status byte: 0x{:02x}", other)),
+    }
+}
+
 
 fn encode_withdrawal_record(record: &WithdrawalRecord) -> Vec<u8> {
     let recipient = record.recipient.as_bytes();
@@ -639,7 +787,7 @@ fn validate_bridge_deposit<H: Host>(
     if configured != deposit.ticketer {
         return Err("deposit sent from unexpected ticketer".into());
     }
-    if !tzel_core::is_deposit_balance_key(&deposit.recipient) {
+    if !tzel_core::is_deposit_recipient_string(&deposit.recipient) {
         return Err(
             "deposit receiver must be a canonical deposit balance key: deposit:<32-byte lowercase hex of intent>"
                 .into(),
@@ -736,6 +884,7 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
     let valid_root_count = read_u64(host, PATH_VALID_ROOT_COUNT).unwrap_or(0);
     let balance_count = read_u64(host, PATH_BALANCE_ACCOUNT_COUNT).unwrap_or(0);
     let withdrawal_count = read_u64(host, PATH_WITHDRAWAL_COUNT).unwrap_or(0);
+    let deposit_slot_count = read_u64(host, PATH_DEPOSIT_SLOT_COUNT).unwrap_or(0);
 
     let mut ledger = Ledger::with_auth_domain(auth_domain);
     ledger.tree.leaves.clear();
@@ -744,6 +893,9 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
     ledger.balances.clear();
     ledger.memos.clear();
     ledger.withdrawals.clear();
+    ledger.deposit_slots.clear();
+    ledger.deposits_by_intent.clear();
+    ledger.next_deposit_slot_id = deposit_slot_count;
 
     for i in 0..tree_size {
         let note_bytes =
@@ -796,6 +948,23 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
             .read_store(&path, MAX_STORE_BINARY_BYTES)
             .ok_or_else(|| format!("missing persisted withdrawal {}", i))?;
         ledger.withdrawals.push(decode_withdrawal_record(&bytes)?);
+    }
+
+    for id in 0..deposit_slot_count {
+        let path = deposit_slot_path(id);
+        let Some(bytes) = host.read_store(&path, MAX_STORE_BINARY_BYTES) else {
+            return Err(format!("missing persisted deposit slot {}", id));
+        };
+        let Some(slot) = decode_deposit_slot_open(&bytes)? else {
+            // Consumed (tombstone). Skip — slot is no longer drainable.
+            continue;
+        };
+        ledger
+            .deposits_by_intent
+            .entry(slot.intent)
+            .or_default()
+            .push(id);
+        ledger.deposit_slots.insert(id, slot);
     }
 
     Ok(ledger)
@@ -1743,7 +1912,7 @@ mod tests {
     };
     use tzel_core::kernel_wire::KernelDalChunkPointer;
     use tzel_core::{
-        commit, default_auth_domain, deposit_balance_key, derive_account, derive_address,
+        commit, default_auth_domain, deposit_recipient_string, derive_account, derive_address,
         derive_ask, derive_auth_pub_seed, derive_kem_keys, derive_nk_spend, derive_nk_tag,
         derive_rcm, encrypt_note_deterministic, felt_tag, hash, hash_two,
         kernel_wire::{
@@ -2013,7 +2182,7 @@ mod tests {
             level: 1,
             id: 0,
             payload: encode_ticket_deposit_message(
-                &deposit_balance_key(&deposit_id_from_label("alice")),
+                &deposit_recipient_string(&deposit_id_from_label("alice")),
                 75,
             ),
         });
@@ -2023,10 +2192,8 @@ mod tests {
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(ledger.auth_domain, default_auth_domain());
         assert_eq!(
-            ledger
-                .balances
-                .get(&deposit_balance_key(&deposit_id_from_label("alice"))),
-            Some(&75)
+            ledger.deposit_slots.values().filter(|s| s.amount == 75).count(),
+            1
         );
         match read_last_result(&host).unwrap() {
             KernelResult::Deposit => {}
@@ -2070,13 +2237,14 @@ mod tests {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
             apply_deposit(
                 &mut state,
-                &deposit_balance_key(&intent),
+                &deposit_recipient_string(&intent),
                 v + producer_fee + MIN_TX_FEE,
             )
             .unwrap();
         }
         let shield_req = KernelShieldReq {
             deposit_id: intent,
+            deposit_slot: 0,
             fee: MIN_TX_FEE,
             producer_fee,
             v,
@@ -2096,7 +2264,8 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get(&deposit_balance_key(&intent)), Some(&0));
+        // Slot 0 was consumed by shield (now a tombstone, not in deposit_slots).
+        assert!(ledger.deposit_slots.is_empty());
         assert_eq!(ledger.tree.leaves.len(), 2);
         match read_last_result(&host).unwrap() {
             KernelResult::Shield(ShieldResp {
@@ -2213,6 +2382,7 @@ mod tests {
         let client_cm = sample_commitment(&address, 50, client_rseed);
         let payload = encode_kernel_inbox_message(&KernelInboxMessage::Shield(KernelShieldReq {
             deposit_id: deposit_id_from_label("alice"),
+            deposit_slot: 0,
             fee: MIN_TX_FEE,
             producer_fee,
             v: 50,
@@ -2975,7 +3145,7 @@ mod tests {
         run_with_host(&mut host);
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 1).unwrap();
+            apply_deposit(&mut state, &deposit_recipient_string(&deposit_id_from_label("alice")), 1).unwrap();
         }
 
         let new_domain = sample_felt(0x44);
@@ -3031,7 +3201,7 @@ mod tests {
     fn rejects_bridge_deposit_before_verifier_configuration() {
         let mut host = MockHost::default();
         install_test_bridge(&mut host);
-        let deposit_key = deposit_balance_key(&deposit_id_from_label("alice"));
+        let deposit_key = deposit_recipient_string(&deposit_id_from_label("alice"));
 
         host.inputs.push_back(InputMessage {
             level: 8,
@@ -3057,7 +3227,7 @@ mod tests {
     fn accepts_bridge_deposit_after_verifier_configuration() {
         let mut host = MockHost::default();
         install_test_bridge(&mut host);
-        let deposit_key = deposit_balance_key(&deposit_id_from_label("alice"));
+        let deposit_key = deposit_recipient_string(&deposit_id_from_label("alice"));
         let config = KernelVerifierConfig {
             auth_domain: sample_felt(0x57),
             verified_program_hashes: sample_program_hashes(),
@@ -3078,7 +3248,10 @@ mod tests {
 
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(ledger.auth_domain, config.auth_domain);
-        assert_eq!(ledger.balances.get(&deposit_key), Some(&12));
+        assert_eq!(
+            ledger.deposit_slots.values().filter(|s| s.amount == 12).count(),
+            1
+        );
         assert!(matches!(
             read_last_result(&host).unwrap(),
             KernelResult::Deposit
@@ -3132,7 +3305,7 @@ mod tests {
         run_with_host(&mut host);
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 1).unwrap();
+            apply_deposit(&mut state, &deposit_recipient_string(&deposit_id_from_label("alice")), 1).unwrap();
         }
         let mut changed_hashes = original.verified_program_hashes;
         changed_hashes.transfer = sample_felt(0x99);
@@ -3150,7 +3323,8 @@ mod tests {
 
         let ledger = read_ledger(&host).unwrap();
         assert_eq!(ledger.auth_domain, original.auth_domain);
-        assert_eq!(ledger.balances.get("alice"), Some(&1));
+        // Pre-existing slot remains; reconfiguration was rejected.
+        assert_eq!(ledger.deposit_slots.len(), 1);
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("cannot change verifier configuration"))
@@ -3202,6 +3376,7 @@ mod tests {
         let client_cm = sample_commitment(&address, 50, client_rseed);
         let shield_req = KernelShieldReq {
             deposit_id: deposit_id_from_label("alice"),
+            deposit_slot: 0,
             fee: MIN_TX_FEE,
             producer_fee,
             v: 50,
@@ -3270,6 +3445,7 @@ mod tests {
                 payload: encode_kernel_inbox_message(&KernelInboxMessage::Shield(
                     KernelShieldReq {
                         deposit_id: deposit_id_from_label("alice"),
+            deposit_slot: 0,
                         v: 50,
                         fee: MIN_TX_FEE,
                         producer_fee: 1,
@@ -3522,7 +3698,7 @@ mod tests {
         install_test_bridge(&mut host);
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 3).unwrap();
+            apply_deposit(&mut state, &deposit_recipient_string(&deposit_id_from_label("alice")), 3).unwrap();
         }
 
         let message = encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
@@ -3555,7 +3731,7 @@ mod tests {
         install_test_bridge(&mut host);
         {
             let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, "alice", 3).unwrap();
+            apply_deposit(&mut state, &deposit_recipient_string(&deposit_id_from_label("alice")), 3).unwrap();
         }
 
         let message = encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
@@ -3574,7 +3750,8 @@ mod tests {
             .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
             .expect("bridge ticketer persists");
         assert_eq!(String::from_utf8(persisted).unwrap(), sample_ticketer());
-        assert_eq!(read_ledger(&host).unwrap().balances.get("alice"), Some(&3));
+        // Pre-existing slot remained through the bridge reconfiguration.
+        assert_eq!(read_ledger(&host).unwrap().deposit_slots.len(), 1);
         assert!(matches!(
             read_last_result(&host).unwrap(),
             KernelResult::Configured
@@ -3582,43 +3759,39 @@ mod tests {
     }
 
     #[test]
-    fn rejects_ticket_deposit_that_overflows_public_balance() {
+    fn dust_deposit_to_same_intent_does_not_brick_legitimate_one() {
+        // Two L1 ticket deposits arrive for the same `deposit:<intent>` recipient
+        // (legit + 1-mutez attacker dust). Each must allocate its own slot so the
+        // legit shield can later drain its slot independently.
         let mut host = MockHost::default();
         install_test_bridge(&mut host);
         install_test_verifier(&mut host);
-        {
-            let mut state = DurableLedgerState::new(&mut host).unwrap();
-            state
-                .set_balance(
-                    &deposit_balance_key(&deposit_id_from_label("alice")),
-                    u64::MAX,
-                )
-                .unwrap();
-        }
+        let intent = deposit_id_from_label("alice");
+        let recipient = deposit_recipient_string(&intent);
         host.inputs.push_back(InputMessage {
             level: 13,
             id: 0,
-            payload: encode_ticket_deposit_message(
-                &deposit_balance_key(&deposit_id_from_label("alice")),
-                1,
-            ),
+            payload: encode_ticket_deposit_message(&recipient, 100_000),
+        });
+        host.inputs.push_back(InputMessage {
+            level: 13,
+            id: 1,
+            payload: encode_ticket_deposit_message(&recipient, 1),
         });
 
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
+        // Two distinct slots, neither bricks the other.
+        assert_eq!(ledger.deposit_slots.len(), 2);
+        let amounts: std::collections::HashSet<u64> =
+            ledger.deposit_slots.values().map(|s| s.amount).collect();
+        assert!(amounts.contains(&100_000));
+        assert!(amounts.contains(&1));
         assert_eq!(
-            ledger
-                .balances
-                .get(&deposit_balance_key(&deposit_id_from_label("alice"))),
-            Some(&u64::MAX)
+            ledger.deposits_by_intent.get(&intent).map(|v| v.len()),
+            Some(2)
         );
-        match read_last_result(&host).unwrap() {
-            KernelResult::Error { message } => {
-                assert!(message.contains("public balance overflow"))
-            }
-            other => panic!("unexpected rollup result: {:?}", other),
-        }
     }
 
     #[test]

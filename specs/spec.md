@@ -252,11 +252,18 @@ separate resource price from the burned rollup fee above.
 `H(ct_d || tag || ct_v || nonce || encrypted_data || outgoing_ct)` —
 covering ALL on-chain note data — and passed into the circuit as public inputs.
 
-There is no `deposit_secret` in the witness. The L1 deposit transaction (signed by the depositor's L1 key) is itself the spend authorization: by addressing the rollup balance to `deposit:<hex(intent)>`, it commits to every detail of the shield. Anything an untrusted prover could rewrite (recipient address, value, fee, producer fee, encrypted-note bytes, even auth_domain) is folded into `intent` — modifying any field changes the deposit_id, and the kernel's lookup against `bal_for(deposit_id')` returns 0. **This makes shield safe to delegate to an untrusted prover**, unlike the legacy secret-bound deposit which leaked spend authority to the prover.
+There is no `deposit_secret` in the witness. The L1 deposit transaction (signed by the depositor's L1 key) is itself the spend authorization: by addressing the rollup recipient string to `deposit:<hex(intent)>`, it commits to every detail of the shield. Anything an untrusted prover could rewrite (recipient address, value, fee, producer fee, encrypted-note bytes, even auth_domain) is folded into `intent` — modifying any field changes the deposit_id, so the kernel's slot lookup either returns no slot at all or a slot whose intent disagrees with the request's `deposit_id`. **This makes shield safe to delegate to an untrusted prover**, unlike the legacy secret-bound deposit which leaked spend authority to the prover.
 
 **Contract / ledger checks:** proof valid, deposit binding per [Shield deposit binding](#shield-deposit-binding), `H(posted_client_note_calldata) == memo_ct_hash`, `H(posted_producer_note_calldata) == producer_memo_ct_hash`, `fee >= required_tx_fee`, and (consensus-level) the request's `deposit_id` MUST equal the recomputed `intent` from the request fields.
 
-**State changes:** the L1 deposit balance keyed by `deposit_key = "deposit:" || lowercase_hex_32(deposit_id)` MUST equal exactly `v_pub + fee + producer_fee`; it is then drained to zero and `cm_new` and `cm_producer` are appended to T. The intent-bound deposit is single-shot: any residual is unrecoverable because no other intent collides with the same deposit_id. Wallets MUST size the L1 deposit precisely; bridge implementations MAY refuse to credit a non-zero balance on top of an existing non-zero `deposit:<hex>` balance to prevent accidental top-up locking.
+**Per-deposit slots.** Every L1 ticket the kernel observes for a `deposit:<hex(intent)>` recipient allocates a fresh **deposit slot**. The slot's *key* is a `slot_id` drawn from a kernel-controlled monotonic counter — depositors cannot influence, predict, or collide slot ids. The slot's *content* is `(intent, amount)`. Two L1 tickets can have identical content (same intent, same amount) and still get distinct slot ids; nothing about the key is depositor-controlled. The kernel's per-intent index lets the wallet enumerate every slot funded for a given intent — important because an attacker can dust-deposit any victim's `deposit:<hex(intent)>` recipient string. Each dust deposit allocates its own orphan slot rather than corrupting any other slot's amount.
+
+**Shield consumes a specific slot.** `ShieldReq` carries a `deposit_slot: u64` field. The kernel verifies that:
+1. The slot exists and is open (not previously consumed).
+2. `slot.intent == req.deposit_id`.
+3. `slot.amount == v_pub + fee + producer_fee` (exactly).
+
+On success the slot is tombstoned (single-shot consumption), and `cm_new` / `cm_producer` are appended to T. Mismatches leave state untouched. Wallets MUST size the L1 deposit precisely; sender-side mistakes (over/under-deposit) leave the slot orphaned but do not affect any other slot.
 
 ### Transfer (N->recipient + change + producer fee, where 1 <= N <= 7)
 
@@ -345,9 +352,11 @@ For each output note, the contract MUST verify `H(posted_note_calldata) == memo_
 
 ### Shield deposit binding
 
-Bridge deposits for shielding MUST credit a public rollup balance keyed by the intent-bound deposit balance key for `deposit_id`. The shield proof MUST recompute `intent = H_intent(auth_domain, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash)` in-circuit and emit it as a public output equal to `deposit_id`; the kernel additionally MUST recompute the same intent from the request fields and reject any request whose `deposit_id` disagrees. The kernel MUST also require that the L1-funded balance equals the exact debit `v_pub + fee + producer_fee` (no residual; no top-up). On success, the kernel drains the deposit balance to zero in a single shot.
+Bridge deposits for shielding MUST be addressed to the canonical recipient string `deposit:<hex(intent)>`. Each accepted L1 ticket allocates its own kernel-side **slot**. The slot's *key* is a fresh `slot_id` drawn from a kernel-controlled monotonic counter (depositors have no influence over the id). The slot's *content* is `(intent, amount)`. Slots are NOT a single mutable bucket per intent: dust deposits to the same intent allocate their own orphan slots and cannot corrupt any other slot.
 
-The ledger MUST reject direct withdraws from intent-bound deposit balances (the `is_deposit_balance_key` check). The L1-bound `deposit_id` is the depositor's signed authorization for the *one* shield it commits to; any other operation on the same balance has no authorization.
+The shield proof MUST recompute `intent = H_intent(auth_domain, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash)` in-circuit and emit it as a public output equal to `deposit_id`; the kernel additionally MUST recompute the same intent from the request fields and reject any request whose `deposit_id` disagrees.
+
+`ShieldReq` carries a `deposit_slot: u64` selecting which slot to drain. The kernel MUST verify that the slot exists, is open, has matching intent, and has `amount == v_pub + fee + producer_fee` exactly. On success the slot is tombstoned in a single shot.
 
 ### Spend authorization (all spending transactions)
 
@@ -654,29 +663,38 @@ This JSON mapping is a convenience API, not the normative interoperability forma
 
 ### Intent-Bound Deposit Identifiers
 
-The bridge receiver for a shield deposit is a namespaced intent-bound deposit balance key:
+The bridge receiver for a shield deposit is a namespaced intent-bound recipient string:
 
 ```text
-intent      = H_intent(auth_domain, v_pub, fee, producer_fee,
-                       cm_new, cm_producer,
-                       memo_ct_hash, producer_memo_ct_hash)
-deposit_id  = intent
-deposit_key = "deposit:" || lowercase_hex_32(deposit_id)
+intent              = H_intent(auth_domain, v_pub, fee, producer_fee,
+                               cm_new, cm_producer,
+                               memo_ct_hash, producer_memo_ct_hash)
+deposit_id          = intent
+deposit_recipient   = "deposit:" || lowercase_hex_32(deposit_id)
 ```
 
 `H_intent` is the sequential left-fold using BLAKE2s with the `sighSP__` personalization (the same primitive as `sighash_fold`) over a leading type-tag felt `0x03` followed by the eight intent fields above. The 0x03 tag distinguishes shield intents from transfer (0x01) and unshield (0x02) sighashes; collisions across constructions are infeasible by domain separation.
 
-The `deposit:` namespace is part of the canonical public balance key. It prevents a raw 64-character hex deposit id from being confused with hex-encoded durable bytes by rollup RPC clients. The bridge MUST reject non-canonical deposit keys, including missing prefixes, mixed-case hex, and malformed lengths.
+The `deposit:` namespace is the canonical L1-bridge recipient string. It prevents a raw 64-character hex deposit id from being confused with hex-encoded durable bytes by rollup RPC clients. The bridge MUST reject non-canonical deposit recipients, including missing prefixes, mixed-case hex, and malformed lengths.
 
-The wallet builds the recipient and producer-fee notes client-side at L1-deposit time, computes `intent` over those notes plus the fee schedule, and instructs the L1 bridge to credit `deposit:<hex(intent)>` for exactly `v_pub + fee + producer_fee` mutez. Persisting the full witness (note plaintexts, encrypted bytes, fees, auth_domain) is now part of wallet correctness, since later shield proving needs to reconstruct the same fields. The ledger only checks the public balance for that deposit key.
+#### Per-Deposit Slots (anti-dust)
+
+Each accepted L1 ticket allocates its own kernel-side **deposit slot**. The *key* is a `slot_id` drawn from a kernel-controlled monotonic counter — depositors have no way to influence, predict, or collide slot ids. The *content* is `(intent, amount)`. The kernel maintains:
+
+- `deposit_slots: HashMap<u64, (intent, amount)>` — open slots, keyed by `slot_id`
+- `deposits_by_intent: HashMap<intent, [slot_id]>` — wallet-visible index of every slot funded for a given intent
+
+Slots are NOT a single mutable bucket per intent, and two L1 tickets with identical `(intent, amount)` content still get distinct ids. If an attacker observes a victim's `deposit:<hex(intent)>` recipient string on L1 and dust-deposits the same recipient string, the kernel allocates a fresh slot for the dust ticket — the victim's slot's `(intent, amount)` is unchanged, and the wallet's shield can still drain it by referring to its `slot_id`. Without the per-deposit slot scheme, summing all credits into one balance bucket would let a 1-mutez dust deposit permanently brick a victim's shield (the bucket would hold `debit + 1`, which is not the exact debit, so shield would always reject).
+
+The wallet observes its slot id by polling the rollup state for the by-intent index after the L1 deposit settles, then matches the slot whose amount equals the bound debit.
 
 The intent commits to *every* prover-rewritable field. As a consequence:
 
-- A malicious untrusted prover cannot redirect funds: any change of recipient, value, fee, producer fee, encrypted-note bytes, or auth_domain produces a different deposit_id whose L1 balance is zero.
+- A malicious untrusted prover cannot redirect funds: any change of recipient, value, fee, producer fee, encrypted-note bytes, or auth_domain produces a different deposit_id, so the kernel's slot lookup either returns no slot or a slot whose intent disagrees with the request's `deposit_id`.
 - The shield proof needs no signature inside the circuit; the L1 deposit transaction's own L1 signature is the spend authorization.
-- Each L1 deposit corresponds to exactly one shield. There is no partial drain and no top-up — both would require updating `intent`, which contradicts the L1 commitment. Wallets MUST size deposits exactly. Sender-side mistakes (over- or under-deposit) are unrecoverable footguns; bridge implementations are encouraged to refuse credits to a non-zero `deposit:<hex>` balance.
+- Each L1 deposit corresponds to exactly one shield. There is no partial drain and no top-up — both would require updating `intent`, which contradicts the L1 commitment. Wallets MUST size deposits exactly. Sender-side mistakes (over- or under-deposit) leave an orphan slot but cannot brick any other slot.
 
-A `deposit_key` balance is shield-only. The L1 deposit binds *one* shield's worth of authority and nothing else.
+A slot is shield-only. The L1 deposit binds *one* shield's worth of authority and nothing else.
 
 ### L1 Withdrawal Recipient Encoding
 

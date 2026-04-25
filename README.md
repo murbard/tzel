@@ -41,9 +41,9 @@ cd cairo && scarb build && cd ..
 target/release/sp-ledger --port 8080 --reprove-bin apps/prover/target/release/reprove &
 
 # Run the developer/test wallet harness. The `shield` command builds the
-# recipient + producer-fee notes, computes the intent-bound deposit_id, funds
-# the local ledger's `deposit:<intent>` balance for exactly the bound debit,
-# then proves and submits.
+# recipient + producer-fee notes, computes the intent-bound deposit_id, calls
+# the local ledger's `/deposit` endpoint to allocate a slot for the exact
+# debit, then proves and submits with that slot id.
 target/release/sp-client -w alice.json keygen
 target/release/sp-client -w producer.json keygen
 target/release/sp-client -w producer.json address | sed -n '2,$p' > producer-address.json
@@ -66,7 +66,7 @@ For deployment-oriented installs with standard paths instead of a workspace chec
 
 > **WARNING:** The ledger refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `cairo/target/dev`). `--trust-me-bro` is never appropriate for real value.
 >
-> **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, intent-binding, and memo-hash checks. For local shield testing, `sp-client shield` builds both the recipient and producer-fee notes client-side, computes the shield intent over them, and funds `deposit:<hex(intent)>` for exactly the bound amount before submitting. The public-balance layer is not a network-authenticated account service and should not be exposed as a real public endpoint.
+> **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, intent-binding, slot allocation, and memo-hash checks. For local shield testing, `sp-client shield` builds both the recipient and producer-fee notes client-side, computes the shield intent over them, and POSTs `/deposit` to allocate a slot for the exact `(intent, debit)` before submitting `/shield`. `/deposit` is demo-only and unauthenticated; it should not be exposed as a real public endpoint.
 >
 > **DEVELOPER WALLET NOTE:** `sp-client` is a developer/reference CLI used for local testing, demos, and integration flows. It persists plaintext secrets and wallet state in local JSON files and is not intended to be a hardened end-user wallet.
 
@@ -106,7 +106,7 @@ For local testing and fast integration loops, `--trust-me-bro` is useful: `sp-cl
 |  * Check nullifiers not in global NF_set                |
 |  * Check root in historical anchor set                  |
 |  * Append new commitments to Merkle tree T              |
-|  * Credit intent-bound deposit balances                 |
+|  * Allocate per-deposit slots for L1 bridge tickets     |
 |  * Queue / emit L1 withdrawals                          |
 +---------------------------------------------------------+
 ```

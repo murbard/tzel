@@ -13,7 +13,7 @@ use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const KERNEL_WIRE_VERSION: u16 = 14;
+pub const KERNEL_WIRE_VERSION: u16 = 15;
 pub const KERNEL_VERIFIER_CONFIG_KEY_INDEX: u32 = 0;
 pub const KERNEL_BRIDGE_CONFIG_KEY_INDEX: u32 = 1;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
@@ -67,9 +67,13 @@ pub struct KernelStarkProof {
 /// Shield message: an L1 user has previously deposited to `deposit_id` (which
 /// is `shield_intent(...)` over the fields below). Both notes are fully
 /// constructed client-side and the server has no role in fabricating them.
+/// `deposit_slot` selects the specific bridge-deposit record being drained;
+/// each L1 ticket allocates its own slot, so dust deposits to the same intent
+/// cannot brick a legitimate one.
 #[derive(Debug, Clone)]
 pub struct KernelShieldReq {
     pub deposit_id: F,
+    pub deposit_slot: u64,
     pub fee: u64,
     pub v: u64,
     pub producer_fee: u64,
@@ -221,6 +225,7 @@ struct WireSignedKernelBridgeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
 struct WireKernelShieldReq {
     deposit_id: WireFelt,
+    deposit_slot: WireU64Le,
     fee: WireU64Le,
     v: WireU64Le,
     producer_fee: WireU64Le,
@@ -548,6 +553,7 @@ pub fn kernel_proof_to_host(proof: &KernelStarkProof) -> Proof {
 pub fn kernel_shield_req_to_host(req: &KernelShieldReq) -> ShieldReq {
     ShieldReq {
         deposit_id: req.deposit_id,
+        deposit_slot: req.deposit_slot,
         fee: req.fee,
         v: req.v,
         producer_fee: req.producer_fee,
@@ -891,6 +897,7 @@ fn encoded_felt_list_from_wire(wire: WireEncodedFeltList) -> Result<Vec<F>, Stri
 fn kernel_shield_req_to_wire(req: &KernelShieldReq) -> Result<WireKernelShieldReq, String> {
     Ok(WireKernelShieldReq {
         deposit_id: felt_to_wire(&req.deposit_id),
+        deposit_slot: u64_to_wire(req.deposit_slot),
         fee: u64_to_wire(req.fee),
         v: u64_to_wire(req.v),
         producer_fee: u64_to_wire(req.producer_fee),
@@ -905,6 +912,7 @@ fn kernel_shield_req_to_wire(req: &KernelShieldReq) -> Result<WireKernelShieldRe
 fn kernel_shield_req_from_wire(wire: WireKernelShieldReq) -> Result<KernelShieldReq, String> {
     Ok(KernelShieldReq {
         deposit_id: wire_to_felt(wire.deposit_id)?,
+        deposit_slot: wire_to_u64(wire.deposit_slot)?,
         fee: wire_to_u64(wire.fee)?,
         v: wire_to_u64(wire.v)?,
         producer_fee: wire_to_u64(wire.producer_fee)?,
@@ -1206,6 +1214,7 @@ mod tests {
         let client_cm = [0x55; 32];
         let message = KernelInboxMessage::Shield(KernelShieldReq {
             deposit_id,
+            deposit_slot: 0,
             fee: 3,
             v: 42,
             producer_fee: 5,
@@ -1299,6 +1308,7 @@ mod tests {
         };
         let message = KernelInboxMessage::Shield(KernelShieldReq {
             deposit_id: [0x42; 32],
+            deposit_slot: 0,
             fee: 2,
             v: 7,
             producer_fee: 4,
@@ -1624,6 +1634,7 @@ mod tests {
         ) {
             let message = KernelInboxMessage::Shield(KernelShieldReq {
                 deposit_id,
+                deposit_slot: 0,
                 fee,
                 v,
                 producer_fee,
@@ -1640,6 +1651,7 @@ mod tests {
                 panic!("decoded wrong kernel message variant");
             };
             prop_assert_eq!(req.deposit_id, deposit_id);
+            prop_assert_eq!(req.deposit_slot, 0);
             prop_assert_eq!(req.fee, fee);
             prop_assert_eq!(req.v, v);
             prop_assert_eq!(req.producer_fee, producer_fee);
@@ -1889,6 +1901,7 @@ mod tests {
         ) {
             let shield = KernelShieldReq {
                 deposit_id,
+                deposit_slot: 0,
                 fee,
                 v: value,
                 producer_fee,

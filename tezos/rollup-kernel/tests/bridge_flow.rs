@@ -29,7 +29,7 @@ use tzel_core::kernel_wire::{
 use tzel_core::kernel_wire::{
     KernelShieldReq, KernelStarkProof, KernelTransferReq, KernelUnshieldReq,
 };
-use tzel_core::{default_auth_domain, deposit_balance_key, hash, ProgramHashes, F};
+use tzel_core::{default_auth_domain, deposit_recipient_string, hash, ProgramHashes, F};
 
 /// Test-only deterministic deposit_id derived from a label. See note in
 /// tezos/rollup-kernel/src/lib.rs tests for context.
@@ -232,7 +232,7 @@ fn bridge_deposit_requires_configuration_and_recovers_after_external_configurati
     // Synthetic deposit_id stand-in. A real deposit_id under the intent-bound
     // scheme is shield_intent(...) over the entire shield's witness; this
     // test only exercises the bridge balance-keying check, not shield.
-    let deposit_key = deposit_balance_key(&deposit_id_from_label("alice"));
+    let deposit_key = deposit_recipient_string(&deposit_id_from_label("alice"));
     let deposit = encode_ticket_deposit_message(&deposit_key, 12);
     host.push_input(0, 0, deposit.clone());
 
@@ -266,10 +266,13 @@ fn bridge_deposit_requires_configuration_and_recovers_after_external_configurati
 
     let stats = read_stats(&host);
     assert_eq!(stats.raw_input_count, 4);
+    let ledger = read_ledger(&host).unwrap();
+    assert_eq!(ledger.deposit_slots.len(), 1);
     assert_eq!(
-        read_ledger(&host).unwrap().balances.get(&deposit_key),
-        Some(&12)
+        ledger.deposit_slots.values().next().map(|s| s.amount),
+        Some(12)
     );
+    let _ = deposit_key;
     assert!(matches!(
         read_last_result(&host).unwrap(),
         KernelResult::Deposit
@@ -310,7 +313,7 @@ fn bridge_deposit_rejects_non_deposit_id_receiver() {
 #[test]
 fn bridge_deposit_rejects_non_canonical_deposit_id_receiver() {
     let mut host = TestHost::default();
-    let deposit_key = deposit_balance_key(&deposit_id_from_label("alice"));
+    let deposit_key = deposit_recipient_string(&deposit_id_from_label("alice"));
     let (_, hex_id) = deposit_key.split_once(':').unwrap();
     let non_canonical_key = format!("deposit:{}", hex_id.to_uppercase());
     assert_ne!(deposit_key, non_canonical_key);
@@ -484,6 +487,7 @@ fn kernel_proof_from_fixture(proof: &Proof) -> KernelStarkProof {
 fn kernel_shield_req_from_fixture(req: &ShieldReq) -> KernelShieldReq {
     KernelShieldReq {
         deposit_id: req.deposit_id,
+            deposit_slot: 0,
         v: req.v,
         fee: req.fee,
         producer_fee: req.producer_fee,
@@ -614,7 +618,7 @@ fn apply_fixture_deposit(host: &mut TestHost, fixture: &VerifiedBridgeFixture, l
         level,
         0,
         encode_custom_ticket_deposit_message(
-            deposit_balance_key(&fixture.shield.deposit_id).into_bytes(),
+            deposit_recipient_string(&fixture.shield.deposit_id).into_bytes(),
             fixture.shield.v + fixture.shield.fee + fixture.shield.producer_fee,
             &fixture.bridge_ticketer,
             &fixture.bridge_ticketer,
