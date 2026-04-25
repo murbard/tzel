@@ -217,27 +217,54 @@ let check_and_insert_nullifiers ledger nullifiers =
     insert_nullifiers ledger nullifiers;
     Ok ()
 
-let apply_shield ledger ~sender_string ~(pub : Transaction.shield_public)
-    ~memo_ct_hash =
-  let expected_sender_id = Hash.account_id sender_string in
-  if not (Felt.equal expected_sender_id pub.sender_id) then
-    Error "sender_id mismatch"
+(* Intent-bound shield. The deposit_id MUST equal shield_intent over every
+   public output; the kernel recomputes it and rejects mismatch. The L1
+   deposit balance for `deposit:<hex(deposit_id)>` MUST equal exactly
+   v_pub + fee + producer_fee. On success the balance is drained to zero
+   and both notes are appended to the commitment tree. *)
+let apply_shield ledger ~(pub : Transaction.shield_public)
+    ~memo_ct_hash ~producer_memo_ct_hash =
+  if not (Felt.equal pub.auth_domain ledger.auth_domain) then
+    Error "auth_domain mismatch"
   else if not (Felt.equal memo_ct_hash pub.memo_ct_hash) then
     Error "memo_ct_hash mismatch"
+  else if not (Felt.equal producer_memo_ct_hash pub.producer_memo_ct_hash) then
+    Error "producer_memo_ct_hash mismatch"
   else begin
-    let v = pub.v_pub in
-    let bal = get_balance ledger sender_string in
-    if Int64.compare bal v < 0 then
-      Error "insufficient balance"
-    else begin
-      set_balance ledger sender_string (Int64.sub bal v);
-      append_commitment ledger pub.cm_new;
-      Ok ()
-    end
+    let recomputed =
+      Transaction.shield_intent
+        ~auth_domain:pub.auth_domain
+        ~v_pub:pub.v_pub ~fee:pub.fee ~producer_fee:pub.producer_fee
+        ~cm_new:pub.cm_new ~cm_producer:pub.cm_producer
+        ~memo_ct_hash:pub.memo_ct_hash
+        ~producer_memo_ct_hash:pub.producer_memo_ct_hash
+    in
+    if not (Felt.equal recomputed pub.deposit_id) then
+      Error "shield intent mismatch"
+    else if Int64.compare pub.producer_fee 0L <= 0 then
+      Error "producer_fee must be positive"
+    else
+      let deposit_key =
+        Printf.sprintf "deposit:%s" (Felt.to_hex pub.deposit_id)
+      in
+      let bal = get_balance ledger deposit_key in
+      let debit =
+        Int64.add pub.v_pub (Int64.add pub.fee pub.producer_fee)
+      in
+      if Int64.compare bal debit <> 0 then
+        Error (Printf.sprintf
+                 "shield deposit balance mismatch: have %Ld, expected exactly %Ld"
+                 bal debit)
+      else begin
+        set_balance ledger deposit_key 0L;
+        append_commitment ledger pub.cm_new;
+        append_commitment ledger pub.cm_producer;
+        Ok ()
+      end
   end
 
 let apply_transfer ledger (pub : Transaction.transfer_public)
-    ~memo_ct_hash_1 ~memo_ct_hash_2 =
+    ~memo_ct_hash_1 ~memo_ct_hash_2 ~memo_ct_hash_3 =
   if not (Felt.equal pub.auth_domain ledger.auth_domain) then
     Error "auth_domain mismatch"
   else if not (is_valid_root ledger pub.root) then
@@ -246,16 +273,19 @@ let apply_transfer ledger (pub : Transaction.transfer_public)
     Error "memo_ct_hash_1 mismatch"
   else if not (Felt.equal memo_ct_hash_2 pub.memo_ct_hash_2) then
     Error "memo_ct_hash_2 mismatch"
+  else if not (Felt.equal memo_ct_hash_3 pub.memo_ct_hash_3) then
+    Error "memo_ct_hash_3 mismatch"
   else
     match check_and_insert_nullifiers ledger pub.nullifiers with
     | Error e -> Error e
     | Ok () ->
       append_commitment ledger pub.cm_1;
       append_commitment ledger pub.cm_2;
+      append_commitment ledger pub.cm_3;
       Ok ()
 
 let apply_unshield ledger ~recipient_string (pub : Transaction.unshield_public)
-    ~memo_ct_hash_change =
+    ~memo_ct_hash_change ~memo_ct_hash_fee =
   match normalize_l1_withdrawal_recipient recipient_string with
   | Error e -> Error e
   | Ok recipient_string ->
@@ -263,6 +293,8 @@ let apply_unshield ledger ~recipient_string (pub : Transaction.unshield_public)
     Error "auth_domain mismatch"
   else if not (is_valid_root ledger pub.root) then
     Error "unknown root"
+  else if not (Felt.equal memo_ct_hash_fee pub.memo_ct_hash_fee) then
+    Error "memo_ct_hash_fee mismatch"
   else
     let expected_recipient_id = Hash.account_id recipient_string in
     if not (Felt.equal expected_recipient_id pub.recipient_id) then
@@ -277,11 +309,13 @@ let apply_unshield ledger ~recipient_string (pub : Transaction.unshield_public)
           else begin
             insert_nullifiers ledger pub.nullifiers;
             append_commitment ledger pub.cm_change;
+            append_commitment ledger pub.cm_fee;
             Queue.push (recipient_string, pub.v_pub) ledger.withdrawals;
             Ok ()
           end
         end else begin
           insert_nullifiers ledger pub.nullifiers;
+          append_commitment ledger pub.cm_fee;
           Queue.push (recipient_string, pub.v_pub) ledger.withdrawals;
           Ok ()
         end

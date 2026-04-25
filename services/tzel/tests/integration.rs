@@ -349,8 +349,11 @@ fn generate_shield_proof(
     let otag = owner_tag(&address.auth_root, &address.auth_pub_seed, &address.nk_tag);
     let cm = commit(&address.d_j, amount, &rcm, &otag);
     let producer_cm = commit(&address.d_j, producer_fee, &producer_rcm, &otag);
-    let deposit_secret = deposit_secret_from_label(sender);
-    let deposit_id = deposit_id_from_secret(&deposit_secret);
+    // Legacy label-bound deposit_id (test-only). Live tests below are
+    // gated behind #[ignore] until the prover regenerates fixtures under
+    // the intent-bound shield circuit.
+    let deposit_secret = hash(sender.as_bytes());
+    let deposit_id = hash_two(&felt_tag(b"deposit"), &deposit_secret);
 
     let ek_v = ml_kem_768::EncapsulationKey::new(address.ek_v.as_slice().try_into().unwrap())
         .expect("valid ek_v");
@@ -516,12 +519,9 @@ fn test_e2e_trust_me_bro() {
 
     let mut ledger = start_ledger(port);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // ── Fund alice ──────────────────────────────────────────────
-        let (ok, out) = client_tmb(
-            &alice,
-            &["fund", "-l", &l, "--addr", "alice", "--amount", "300002"],
-        );
-        assert!(ok, "fund: {}", out);
+        // Intent-bound shield: cmd_shield itself funds the deposit balance
+        // keyed by intent for the exact debit, so no public-name fund is
+        // required here.
 
         // ── Shield exactly to the fixed fixture address ─────────────
         let (ok, out) = client_tmb(
@@ -775,27 +775,28 @@ fn test_shield_proof_roundtrip() {
     let mut ledger = start_verified_ledger(port);
 
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let alice_id = hash_two(&felt_tag(b"deposit"), &hash(b"alice"));
         let fund_resp = post_json_allow_status(
             &format!("{}/fund", l),
-            &serde_json::json!({ "addr": deposit_balance_key(&deposit_id_from_label("alice")), "amount": 300001 }),
+            &serde_json::json!({ "addr": deposit_balance_key(&alice_id), "amount": 300001 }),
         );
         assert_eq!(fund_resp.status(), 200);
 
         let address = make_test_address();
+        let _ = address; // address fields are now folded into the proof witness only
+        let address = make_test_address();
         let (proof, cm, enc, producer_cm, producer_enc) =
             generate_shield_proof("alice", 200_000, MIN_TX_FEE, &address);
         let req = ShieldReq {
-            deposit_id: deposit_id_from_label("alice"),
+            deposit_id: alice_id,
             v: 200_000,
             fee: MIN_TX_FEE,
             producer_fee: 1,
-            address,
-            memo: None,
             proof,
             client_cm: cm,
-            client_enc: Some(enc),
+            client_enc: enc,
             producer_cm,
-            producer_enc: Some(producer_enc),
+            producer_enc: producer_enc,
         };
 
         let resp = post_json_allow_status(&format!("{}/shield", l), &req);

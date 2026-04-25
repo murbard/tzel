@@ -496,12 +496,49 @@ struct PendingSpend {
     operation_hash: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+/// Per-note witness needed to drive `apply_shield` at shield time. The
+/// recipient (or change-receiver) chose all of these values at deposit time;
+/// the sender (L1 depositor) builds a `cm = H_commit(d_j, v, derive_rcm(rseed),
+/// owner_tag(auth_root, auth_pub_seed, nk_tag))` from them and folds the
+/// result into the shield intent. Persist alongside the encrypted ciphertext
+/// so a later re-encryption (with fresh ML-KEM ephemerals) doesn't change the
+/// memo_ct_hash and break intent binding.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ShieldNoteWitness {
+    #[serde(with = "hex_f")]
+    d_j: F,
+    #[serde(with = "hex_f")]
+    rseed: F,
+    #[serde(with = "hex_f")]
+    auth_root: F,
+    #[serde(with = "hex_f")]
+    auth_pub_seed: F,
+    #[serde(with = "hex_f")]
+    nk_tag: F,
+    #[serde(with = "hex_f")]
+    cm: F,
+    /// Encrypted note bytes, persisted at deposit time so the resulting
+    /// memo_ct_hash exactly matches what was folded into the deposit intent.
+    enc: EncryptedNote,
+}
+
+/// A pending L1 bridge deposit awaiting shield. The deposit balance keyed by
+/// `deposit_id` (= shield_intent over the witness below) is unconditionally
+/// drained by the next successful shield against this `deposit_id`. Cannot
+/// be partially drained, cannot be redirected to a different recipient: the
+/// L1 transaction binds every detail.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct PendingDeposit {
     #[serde(with = "hex_f")]
     deposit_id: F,
     #[serde(with = "hex_f")]
-    secret: F,
+    auth_domain: F,
+    v: u64,
+    fee: u64,
+    producer_fee: u64,
+    recipient: ShieldNoteWitness,
+    producer: ShieldNoteWitness,
+    /// Total mutez deposited on L1; equals `v + fee + producer_fee`.
     amount: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     operation_hash: Option<String>,
@@ -2647,8 +2684,6 @@ fn shield_req_to_kernel(req: &ShieldReq) -> Result<KernelShieldReq, String> {
         fee: req.fee,
         producer_fee: req.producer_fee,
         v: req.v,
-        address: req.address.clone(),
-        memo: req.memo.clone(),
         proof: host_stark_proof_to_kernel(&req.proof)?,
         client_cm: req.client_cm,
         client_enc: req.client_enc.clone(),
@@ -2975,25 +3010,31 @@ enum UserCmd {
     Balance,
     /// Check whether the wallet profile, operator, and rollup node are usable.
     Check,
-    /// Deposit tez on L1 into the configured bridge ticketer for a secret-bound shield.
+    /// Deposit tez on L1 into the configured bridge ticketer for an
+    /// intent-bound shield. The wallet builds the recipient + producer-fee
+    /// notes, computes the deposit's intent, and instructs the bridge to
+    /// credit `deposit:<hex(intent)>` for exactly `amount + fee + dal_fee`.
+    /// The recipient (`--to`) is bound at deposit time.
     Deposit {
+        /// Amount of tez (in mutez) that will end up in the recipient note.
         #[arg(long)]
         amount: u64,
-    },
-    /// Shield public bridge balance into a private note.
-    Shield {
-        #[arg(long)]
-        amount: u64,
+        /// Burned rollup fee. Omit to use the rollup's quoted required fee.
         #[arg(long)]
         fee: Option<u64>,
-        /// Select a pending secret-bound deposit by its deposit id.
-        #[arg(long)]
-        deposit_id: Option<String>,
-        /// Path to recipient address JSON. Defaults to a newly generated self-address.
+        /// Path to recipient address JSON. Defaults to a fresh self-address.
         #[arg(long)]
         to: Option<String>,
         #[arg(long)]
         memo: Option<String>,
+    },
+    /// Drain a previously-deposited intent-bound balance into its bound
+    /// shielded note. The recipient and amount were locked in at `Deposit`
+    /// time; this command only proves and submits.
+    Shield {
+        /// Hex deposit_id of a tracked pending deposit.
+        #[arg(long)]
+        deposit_id: String,
     },
     /// Send shielded funds to another payment address.
     Send {
@@ -3255,28 +3296,18 @@ fn run_user(cli: UserCli) -> Result<(), String> {
             let profile = load_required_network_profile(&cli.wallet)?;
             cmd_wallet_check(&cli.wallet, &profile)
         }
-        UserCmd::Deposit { amount } => {
-            let profile = load_required_network_profile(&cli.wallet)?;
-            cmd_bridge_deposit(&cli.wallet, &profile, amount)
-        }
-        UserCmd::Shield {
+        UserCmd::Deposit {
             amount,
             fee,
-            deposit_id,
             to,
             memo,
         } => {
             let profile = load_required_network_profile(&cli.wallet)?;
-            cmd_shield_rollup(
-                &cli.wallet,
-                &profile,
-                deposit_id.as_deref(),
-                amount,
-                fee,
-                to,
-                memo,
-                &pc,
-            )
+            cmd_bridge_deposit(&cli.wallet, &profile, amount, fee, to, memo)
+        }
+        UserCmd::Shield { deposit_id } => {
+            let profile = load_required_network_profile(&cli.wallet)?;
+            cmd_shield_rollup(&cli.wallet, &profile, &deposit_id, &pc)
         }
         UserCmd::Send {
             to,
@@ -3749,6 +3780,7 @@ struct ScanSummary {
     found: usize,
     spent: usize,
     confirmed_pending: usize,
+    settled_deposits: usize,
 }
 
 fn apply_scan_feed(
@@ -3781,11 +3813,23 @@ fn apply_scan_feed(
     let before_pending = w.pending_spends.len();
     w.pending_spends
         .retain(|pending| !pending.nullifiers.iter().all(|nf| nf_set.contains(nf)));
+
+    // Retire pending_deposits whose recipient commitment now exists in the
+    // visible tree (i.e., the shield landed). The recipient note must have
+    // been recovered into `w.notes` for this to fire — sufficient evidence
+    // that the deposit was drained into a private note we can spend.
+    let live_cms: std::collections::HashSet<F> = w.notes.iter().map(|n| n.cm).collect();
+    let before_deposits = w.pending_deposits.len();
+    w.pending_deposits
+        .retain(|d| !live_cms.contains(&d.recipient.cm));
+    let settled_deposits = before_deposits - w.pending_deposits.len();
+
     w.scanned = feed.next_cursor;
     ScanSummary {
         found,
         spent,
         confirmed_pending: before_pending - w.pending_spends.len(),
+        settled_deposits,
     }
 }
 
@@ -5462,6 +5506,99 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_scan_feed_retires_pending_deposit_when_recipient_note_lands() {
+        let mut w = test_wallet(1);
+        let rseed = felt_tag(b"wallet-scan-pending-deposit");
+        let nm = note_memo_for_wallet_address(&w, 0, 77, rseed, None);
+        let addr = &w.addresses[0];
+        let producer_addr = addr.clone();
+        let intent = hash(b"unique-intent-stand-in");
+        w.pending_deposits.push(PendingDeposit {
+            deposit_id: intent,
+            auth_domain: hash(b"auth-domain"),
+            v: 77,
+            fee: 0,
+            producer_fee: 1,
+            recipient: ShieldNoteWitness {
+                d_j: addr.d_j,
+                rseed,
+                auth_root: addr.auth_root,
+                auth_pub_seed: addr.auth_pub_seed,
+                nk_tag: addr.nk_tag,
+                cm: nm.cm,
+                enc: nm.enc.clone(),
+            },
+            producer: ShieldNoteWitness {
+                d_j: producer_addr.d_j,
+                rseed: felt_tag(b"producer-rseed"),
+                auth_root: producer_addr.auth_root,
+                auth_pub_seed: producer_addr.auth_pub_seed,
+                nk_tag: producer_addr.nk_tag,
+                cm: hash(b"producer-cm"),
+                enc: nm.enc.clone(),
+            },
+            amount: 78,
+            operation_hash: Some("opHash".into()),
+        });
+
+        let feed = NotesFeedResp {
+            notes: vec![nm],
+            next_cursor: 7,
+        };
+        let summary = apply_scan_feed(&mut w, &feed, vec![]);
+        assert_eq!(summary.found, 1);
+        assert_eq!(summary.settled_deposits, 1);
+        assert!(w.pending_deposits.is_empty());
+        assert_eq!(w.notes.len(), 1);
+    }
+
+    #[test]
+    fn test_apply_scan_feed_keeps_pending_deposit_until_recipient_note_lands() {
+        let mut w = test_wallet(1);
+        let rseed = felt_tag(b"wallet-scan-deposit-not-yet");
+        let intent = hash(b"unique-intent-stand-in-2");
+        let addr = &w.addresses[0];
+        let producer_addr = addr.clone();
+        let nm = note_memo_for_wallet_address(&w, 0, 77, rseed, None);
+        w.pending_deposits.push(PendingDeposit {
+            deposit_id: intent,
+            auth_domain: hash(b"auth-domain"),
+            v: 77,
+            fee: 0,
+            producer_fee: 1,
+            recipient: ShieldNoteWitness {
+                d_j: addr.d_j,
+                rseed,
+                auth_root: addr.auth_root,
+                auth_pub_seed: addr.auth_pub_seed,
+                nk_tag: addr.nk_tag,
+                cm: nm.cm,
+                enc: nm.enc.clone(),
+            },
+            producer: ShieldNoteWitness {
+                d_j: producer_addr.d_j,
+                rseed: felt_tag(b"producer-rseed-2"),
+                auth_root: producer_addr.auth_root,
+                auth_pub_seed: producer_addr.auth_pub_seed,
+                nk_tag: producer_addr.nk_tag,
+                cm: hash(b"producer-cm-2"),
+                enc: nm.enc.clone(),
+            },
+            amount: 78,
+            operation_hash: Some("opHash".into()),
+        });
+
+        // Empty feed: shield has not landed yet.
+        let feed = NotesFeedResp {
+            notes: vec![],
+            next_cursor: 1,
+        };
+        let summary = apply_scan_feed(&mut w, &feed, vec![]);
+        assert_eq!(summary.settled_deposits, 0);
+        assert_eq!(w.pending_deposits.len(), 1);
+    }
+
+    #[test]
     fn test_apply_scan_feed_clears_confirmed_pending_spends() {
         let mut w = test_wallet(1);
         let existing = wallet_note_for_address(&w, 0, 40, felt_tag(b"wallet-scan-pending"), 5);
@@ -6055,10 +6192,11 @@ fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), Str
         })
         .sum::<u64>();
     println!(
-        "Synced: {} new notes, {} spent removed, {} pending confirmed, private_available={}, public_balance={}, secret_deposit_balance={}",
+        "Synced: {} new notes, {} spent removed, {} pending confirmed, {} deposits settled, private_available={}, public_balance={}, secret_deposit_balance={}",
         summary.found,
         summary.spent,
         summary.confirmed_pending,
+        summary.settled_deposits,
         w.available_balance(),
         public_balance,
         pending_deposit_balance
@@ -6082,68 +6220,122 @@ fn cmd_rollup_sync_watch(
     }
 }
 
-fn select_pending_deposit<'a>(
+fn select_pending_deposit_by_id<'a>(
     wallet: &'a WalletFile,
-    balances: &std::collections::HashMap<String, u64>,
-    requested_deposit_id: Option<F>,
-    total_debit: u64,
-) -> Result<(&'a PendingDeposit, u64), String> {
-    let mut saw_requested = false;
-    for deposit in &wallet.pending_deposits {
-        if let Some(requested) = requested_deposit_id {
-            if deposit.deposit_id != requested {
-                continue;
-            }
-            saw_requested = true;
-        }
-        let balance = balances
-            .get(&deposit_balance_key(&deposit.deposit_id))
-            .copied()
-            .unwrap_or(0);
-        if balance >= total_debit {
-            return Ok((deposit, balance));
-        }
-    }
-
-    if requested_deposit_id.is_some() && !saw_requested {
-        return Err("requested deposit id is not tracked by this wallet".into());
-    }
-    Err(format!(
-        "no tracked secret-bound deposit has enough rollup balance: need {}",
-        total_debit
-    ))
+    deposit_id: &F,
+) -> Result<&'a PendingDeposit, String> {
+    wallet
+        .pending_deposits
+        .iter()
+        .find(|p| &p.deposit_id == deposit_id)
+        .ok_or_else(|| format!("deposit {} is not tracked by this wallet", hex::encode(deposit_id)))
 }
 
+/// Bridge deposit: builds the recipient + producer-fee notes up front,
+/// computes the shield intent, and L1-deposits exactly the bound amount to
+/// `deposit:<intent>`. Persists the full witness (including the encrypted
+/// notes) so the later shield can re-prove without storing a long-lived
+/// secret.
 fn cmd_bridge_deposit(
     path: &str,
     profile: &WalletNetworkProfile,
     amount: u64,
+    fee_arg: Option<u64>,
+    to: Option<String>,
+    memo: Option<String>,
 ) -> Result<(), String> {
-    let mut wallet = load_wallet(path)?;
-    let secret = random_felt();
-    let deposit_id = deposit_id_from_secret(&secret);
-    wallet.pending_deposits.push(PendingDeposit {
-        deposit_id,
-        secret,
-        amount,
-        operation_hash: None,
-    });
-    save_wallet(path, &wallet)?;
-
+    ensure_positive_dal_fee(profile.dal_fee)?;
     let rollup = RollupRpc::new(profile);
-    let submission = rollup.deposit_to_bridge(&deposit_id, amount)?;
-    if let Some(pending) = wallet
-        .pending_deposits
-        .iter_mut()
-        .find(|pending| pending.deposit_id == deposit_id && pending.secret == secret)
-    {
-        pending.operation_hash = submission.operation_hash.clone();
+    let head_hash = rollup.head_hash()?;
+    let auth_domain = rollup.read_felt_at_block(&head_hash, DURABLE_AUTH_DOMAIN)?;
+    let required_fee = rollup.current_required_tx_fee_at_block(&head_hash)?;
+    let fee = resolve_requested_tx_fee(fee_arg, required_fee)?;
+
+    let mut wallet = load_wallet(path)?;
+    let outgoing_seed = wallet.account().outgoing_seed;
+
+    let (recipient_address, generated_self_address) = if let Some(addr_path) = to {
+        (load_address(&addr_path)?, false)
+    } else {
+        let (_state, addr) = wallet.next_address()?;
+        (addr, true)
+    };
+    if generated_self_address {
+        // Persist the new self-address before we commit to a deposit_id that
+        // depends on it.
+        save_wallet(path, &wallet)?;
     }
+
+    let recipient_note = build_output_note_with_outgoing(
+        &recipient_address,
+        amount,
+        memo.as_deref().map(str::as_bytes),
+        &outgoing_seed,
+        OutgoingNoteRole::ShieldOutput,
+    )?;
+    let producer_note = build_output_note_with_outgoing(
+        &profile.dal_fee_address,
+        profile.dal_fee,
+        Some(b"dal"),
+        &outgoing_seed,
+        OutgoingNoteRole::ProducerFee,
+    )?;
+
+    let intent = shield_intent(
+        &auth_domain,
+        amount,
+        fee,
+        profile.dal_fee,
+        &recipient_note.cm,
+        &producer_note.cm,
+        &recipient_note.mh,
+        &producer_note.mh,
+    );
+    let debit = amount
+        .checked_add(fee)
+        .and_then(|v| v.checked_add(profile.dal_fee))
+        .ok_or_else(|| "deposit total overflows u64".to_string())?;
+
+    // Submit the L1 deposit FIRST. If it fails, we don't track a phantom
+    // PendingDeposit. On success, the witness is then persisted with the
+    // operation_hash already filled in.
+    let submission = rollup.deposit_to_bridge(&intent, debit)?;
+    let pending = PendingDeposit {
+        deposit_id: intent,
+        auth_domain,
+        v: amount,
+        fee,
+        producer_fee: profile.dal_fee,
+        recipient: ShieldNoteWitness {
+            d_j: recipient_address.d_j,
+            rseed: recipient_note.rseed,
+            auth_root: recipient_address.auth_root,
+            auth_pub_seed: recipient_address.auth_pub_seed,
+            nk_tag: recipient_address.nk_tag,
+            cm: recipient_note.cm,
+            enc: recipient_note.enc.clone(),
+        },
+        producer: ShieldNoteWitness {
+            d_j: profile.dal_fee_address.d_j,
+            rseed: producer_note.rseed,
+            auth_root: profile.dal_fee_address.auth_root,
+            auth_pub_seed: profile.dal_fee_address.auth_pub_seed,
+            nk_tag: profile.dal_fee_address.nk_tag,
+            cm: producer_note.cm,
+            enc: producer_note.enc.clone(),
+        },
+        amount: debit,
+        operation_hash: submission.operation_hash.clone(),
+    };
+    wallet.pending_deposits.push(pending);
     save_wallet(path, &wallet)?;
     println!(
-        "Submitted L1 bridge deposit of {} mutez for deposit {}",
+        "Submitted L1 bridge deposit of {} mutez (note value {}, fee {}, dal fee {}) for intent {}",
+        debit,
         amount,
-        deposit_id_hex(&deposit_id)
+        fee,
+        profile.dal_fee,
+        deposit_id_hex(&intent)
     );
     if let Some(op_hash) = submission.operation_hash {
         println!("Operation hash: {}", op_hash);
@@ -6151,7 +6343,10 @@ fn cmd_bridge_deposit(
     if !submission.output.is_empty() {
         println!("{}", submission.output);
     }
-    println!("Run `tzel-wallet shield --amount ...` after the deposit is processed by the rollup.");
+    println!(
+        "Run `tzel-wallet shield --deposit-id {}` once the deposit settles on the rollup.",
+        deposit_id_hex(&intent)
+    );
     Ok(())
 }
 
@@ -6191,10 +6386,16 @@ fn print_rollup_sync_hint(submission: &RollupSubmissionReceipt) {
     }
 }
 
+/// Demo HTTP shield path. Builds the recipient + producer notes, computes
+/// the intent, funds the local ledger's deposit balance keyed by intent for
+/// exactly the bound amount, then submits an intent-bound shield. The
+/// `sender` label is no longer cryptographically meaningful — under the
+/// intent-bound scheme, the L1 transaction commits to the *full* shield by
+/// virtue of being addressed to `deposit:<intent>`.
 fn cmd_shield(
     path: &str,
     ledger: &str,
-    sender: &str,
+    _sender: &str,
     amount: u64,
     fee: Option<u64>,
     dal_fee: u64,
@@ -6206,6 +6407,7 @@ fn cmd_shield(
     let cfg: ConfigResp = get_json(&format!("{}/config", ledger))?;
     let fee = resolve_requested_tx_fee(fee, cfg.required_tx_fee)?;
     ensure_positive_dal_fee(dal_fee)?;
+    let auth_domain = cfg.auth_domain;
     let mut w = load_wallet(path)?;
     let outgoing_seed = w.account().outgoing_seed;
     let producer_address = load_address(dal_fee_address_path)?;
@@ -6231,20 +6433,35 @@ fn cmd_shield(
         &outgoing_seed,
         OutgoingNoteRole::ProducerFee,
     )?;
+
+    // Intent: H_intent over every prover-rewritable shield field.
+    let intent = shield_intent(
+        &auth_domain,
+        amount,
+        fee,
+        dal_fee,
+        &client_note.cm,
+        &producer_note.cm,
+        &client_note.mh,
+        &producer_note.mh,
+    );
+    let debit = amount
+        .checked_add(fee)
+        .and_then(|v| v.checked_add(dal_fee))
+        .ok_or_else(|| "shield debit overflow".to_string())?;
+
     let proof = if !pc.skip_proof {
-        let deposit_secret = deposit_secret_from_label(sender);
-        let deposit_id = deposit_id_from_secret(&deposit_secret);
         let args: Vec<String> = vec![
             felt_u64_to_hex(19),
+            felt_to_hex(&auth_domain),
             felt_u64_to_hex(amount),
             felt_u64_to_hex(fee),
             felt_u64_to_hex(dal_fee),
             felt_to_hex(&client_note.cm),
             felt_to_hex(&producer_note.cm),
-            felt_to_hex(&deposit_id),
+            felt_to_hex(&intent),
             felt_to_hex(&client_note.mh),
             felt_to_hex(&producer_note.mh),
-            felt_to_hex(&deposit_secret),
             felt_to_hex(&address.auth_root),
             felt_to_hex(&address.auth_pub_seed),
             felt_to_hex(&address.nk_tag),
@@ -6262,32 +6479,41 @@ fn cmd_shield(
     };
 
     let req = ShieldReq {
-        deposit_id: deposit_id_from_label(sender),
+        deposit_id: intent,
         fee,
         producer_fee: dal_fee,
         v: amount,
-        address,
-        memo,
         proof,
         client_cm: client_note.cm,
-        client_enc: Some(client_note.enc),
+        client_enc: client_note.enc,
         producer_cm: producer_note.cm,
-        producer_enc: Some(producer_note.enc),
+        producer_enc: producer_note.enc,
     };
     if generated_self_address {
         // Persist generated self-addresses before submission so a crash after a
         // successful shield does not hide the note from future scans.
         save_wallet(path, &w)?;
     }
+    // Demo flow: fund the local ledger's deposit balance keyed by intent for
+    // the exact debit (mirrors what an L1 deposit would produce on the
+    // rollup-bridge path).
+    post_json::<FundReq, serde_json::Value>(
+        &format!("{}/fund", ledger),
+        &FundReq {
+            recipient: deposit_balance_key(&intent),
+            amount: debit,
+        },
+    )?;
     let resp: ShieldResp = post_json(&format!("{}/shield", ledger), &req)?;
     save_wallet(path, &w)?;
     println!(
-        "Shielded {} (fee {}, dal fee {}) -> cm={} index={}",
+        "Shielded {} (fee {}, dal fee {}) -> cm={} index={} intent={}",
         amount,
         fee,
         dal_fee,
         short(&resp.cm),
-        resp.index
+        resp.index,
+        hex::encode(&intent[..4])
     );
     println!("Run 'scan' to pick up the note.");
     Ok(())
@@ -6819,105 +7045,88 @@ fn cmd_unshield(
     Ok(())
 }
 
+/// Drain an intent-bound pending deposit. Loads the witness persisted at
+/// `Deposit` time, reconstructs the prover args (the recipient and producer
+/// notes are NOT re-encrypted — the persisted ciphertext bytes are reused
+/// verbatim, otherwise the freshly-randomized memo_ct_hash would diverge
+/// from the intent), proves, and submits.
 fn cmd_shield_rollup(
     path: &str,
     profile: &WalletNetworkProfile,
-    deposit_id_arg: Option<&str>,
-    amount: u64,
-    fee: Option<u64>,
-    to: Option<String>,
-    memo: Option<String>,
+    deposit_id_arg: &str,
     pc: &ProveConfig,
 ) -> Result<(), String> {
-    let rollup = RollupRpc::new(profile);
-    let head_hash = rollup.head_hash()?;
-    let fee = resolve_requested_tx_fee(fee, rollup.current_required_tx_fee_at_block(&head_hash)?)?;
-    ensure_positive_dal_fee(profile.dal_fee)?;
-    let balances = rollup.load_balances_at_block(&head_hash)?;
-    let producer_address = &profile.dal_fee_address;
-    let total_debit = amount
-        .checked_add(fee)
-        .and_then(|value| value.checked_add(profile.dal_fee))
-        .ok_or_else(|| "shield total spend overflow".to_string())?;
+    let deposit_id = parse_deposit_id_hex(deposit_id_arg)?;
+    let wallet = load_wallet(path)?;
+    let pending = select_pending_deposit_by_id(&wallet, &deposit_id)?.clone();
 
-    let mut w = load_wallet(path)?;
-    let outgoing_seed = w.account().outgoing_seed;
-    let requested_deposit_id = deposit_id_arg.map(parse_deposit_id_hex).transpose()?;
-    let (selected_deposit, public_balance) =
-        select_pending_deposit(&w, &balances, requested_deposit_id, total_debit)?;
-    let deposit_id = selected_deposit.deposit_id;
-    let deposit_secret = selected_deposit.secret;
-    let (address, generated_self_address) = if let Some(addr_path) = to {
-        (load_address(&addr_path)?, false)
-    } else {
-        let (_state, addr) = w.next_address()?;
-        (addr, true)
-    };
-
-    let client_note = build_output_note_with_outgoing(
-        &address,
-        amount,
-        memo.as_deref().map(str::as_bytes),
-        &outgoing_seed,
-        OutgoingNoteRole::ShieldOutput,
-    )?;
-    let producer_note = build_output_note_with_outgoing(
-        producer_address,
-        profile.dal_fee,
-        Some(b"dal"),
-        &outgoing_seed,
-        OutgoingNoteRole::ProducerFee,
-    )?;
-    let args: Vec<String> = vec![
-        felt_u64_to_hex(19),
-        felt_u64_to_hex(amount),
-        felt_u64_to_hex(fee),
-        felt_u64_to_hex(profile.dal_fee),
-        felt_to_hex(&client_note.cm),
-        felt_to_hex(&producer_note.cm),
-        felt_to_hex(&deposit_id),
-        felt_to_hex(&client_note.mh),
-        felt_to_hex(&producer_note.mh),
-        felt_to_hex(&deposit_secret),
-        felt_to_hex(&address.auth_root),
-        felt_to_hex(&address.auth_pub_seed),
-        felt_to_hex(&address.nk_tag),
-        felt_to_hex(&address.d_j),
-        felt_to_hex(&client_note.rseed),
-        felt_to_hex(&producer_address.auth_root),
-        felt_to_hex(&producer_address.auth_pub_seed),
-        felt_to_hex(&producer_address.nk_tag),
-        felt_to_hex(&producer_address.d_j),
-        felt_to_hex(&producer_note.rseed),
-    ];
-    let proof = pc.make_proof("run_shield", &args)?;
-    let req = ShieldReq {
-        deposit_id,
-        fee,
-        producer_fee: profile.dal_fee,
-        v: amount,
-        address,
-        memo,
-        proof,
-        client_cm: client_note.cm,
-        client_enc: Some(client_note.enc),
-        producer_cm: producer_note.cm,
-        producer_enc: Some(producer_note.enc),
-    };
-
-    if generated_self_address {
-        save_wallet(path, &w)?;
+    // Sanity-recompute the intent locally; refuse to submit if the persisted
+    // witness no longer matches deposit_id (e.g. wallet file corruption).
+    let recomputed = shield_intent(
+        &pending.auth_domain,
+        pending.v,
+        pending.fee,
+        pending.producer_fee,
+        &pending.recipient.cm,
+        &pending.producer.cm,
+        &memo_ct_hash(&pending.recipient.enc),
+        &memo_ct_hash(&pending.producer.enc),
+    );
+    if recomputed != deposit_id {
+        return Err(format!(
+            "wallet's pending-deposit witness for {} no longer reproduces the deposit_id; \
+             refusing to submit a stale shield. Recomputed intent {} does not match {}.",
+            deposit_id_hex(&deposit_id),
+            deposit_id_hex(&recomputed),
+            deposit_id_hex(&deposit_id),
+        ));
     }
 
+    // Build prover witness for the new intent-bound run_shield circuit.
+    let args: Vec<String> = vec![
+        felt_to_hex(&pending.auth_domain),
+        felt_u64_to_hex(pending.v),
+        felt_u64_to_hex(pending.fee),
+        felt_u64_to_hex(pending.producer_fee),
+        felt_to_hex(&pending.recipient.cm),
+        felt_to_hex(&pending.producer.cm),
+        felt_to_hex(&deposit_id),
+        felt_to_hex(&memo_ct_hash(&pending.recipient.enc)),
+        felt_to_hex(&memo_ct_hash(&pending.producer.enc)),
+        felt_to_hex(&pending.recipient.auth_root),
+        felt_to_hex(&pending.recipient.auth_pub_seed),
+        felt_to_hex(&pending.recipient.nk_tag),
+        felt_to_hex(&pending.recipient.d_j),
+        felt_to_hex(&pending.recipient.rseed),
+        felt_to_hex(&pending.producer.auth_root),
+        felt_to_hex(&pending.producer.auth_pub_seed),
+        felt_to_hex(&pending.producer.nk_tag),
+        felt_to_hex(&pending.producer.d_j),
+        felt_to_hex(&pending.producer.rseed),
+    ];
+    let proof = pc.make_proof("run_shield", &args)?;
+
+    let req = ShieldReq {
+        deposit_id,
+        v: pending.v,
+        fee: pending.fee,
+        producer_fee: pending.producer_fee,
+        proof,
+        client_cm: pending.recipient.cm,
+        client_enc: pending.recipient.enc.clone(),
+        producer_cm: pending.producer.cm,
+        producer_enc: pending.producer.enc.clone(),
+    };
     let kernel_req = shield_req_to_kernel(&req)?;
+    let rollup = RollupRpc::new(profile);
     let submission = rollup.submit_kernel_message(&KernelInboxMessage::Shield(kernel_req))?;
     println!(
-        "Submitted shield of {} from deposit {} into note {} (fee {}, deposit balance before {})",
-        amount,
+        "Submitted shield draining deposit {} into note {} (v={}, fee={}, dal_fee={})",
         deposit_id_hex(&deposit_id),
-        short(&req.client_cm),
-        fee,
-        public_balance
+        short(&pending.recipient.cm),
+        pending.v,
+        pending.fee,
+        pending.producer_fee
     );
     print_rollup_submission(&submission);
     print_rollup_sync_hint(&submission);
@@ -7523,15 +7732,18 @@ fn finalize_successful_spend(
 }
 
 fn cmd_fund(ledger: &str, addr: &str, amount: u64) -> Result<(), String> {
-    let deposit_id = deposit_id_from_label(addr);
+    // The HTTP demo accepts any string as a balance key. For the intent-bound
+    // shield to find a balance later, the wallet's `cmd_shield` itself does
+    // the funding step against `deposit:<intent>`. Direct `cmd_fund` is now
+    // a generic balance bump (e.g. for `public:` keys) and accepts the
+    // caller-provided string as-is.
     let req = FundReq {
-        recipient: deposit_balance_key(&deposit_id),
+        recipient: addr.to_string(),
         amount,
     };
     let _: serde_json::Value = post_json(&format!("{}/fund", ledger), &req)?;
     println!(
-        "Funded deposit {} ({}) with {}",
-        felt_to_hex(&deposit_id),
+        "Funded balance key {} with {}",
         addr,
         amount
     );
@@ -7660,7 +7872,9 @@ mod network_profile_tests {
 
     #[test]
     fn rollup_rpc_load_balances_preserves_raw_json_deposit_balance_key() {
-        let deposit_key = deposit_balance_key(&deposit_id_from_label("alice"));
+        // Test-only synthetic deposit id; the production key is computed via
+        // shield_intent at deposit time.
+        let deposit_key = deposit_balance_key(&hash(b"alice"));
         let amount = 123u64;
         let base_url = super::tests::spawn_mock_http_server(HashMap::from([
             (
@@ -7692,43 +7906,11 @@ mod network_profile_tests {
         assert_eq!(balances.get(&deposit_key), Some(&amount));
     }
 
-    #[test]
-    fn bridge_deposit_persists_secret_before_l1_submission() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let wallet_path = dir.path().join("wallet.json");
-        let wallet_path_str = wallet_path.to_str().unwrap();
-        save_wallet(wallet_path_str, &super::tests::test_wallet(1)).expect("save wallet");
-
-        let octez_client = dir.path().join("fake-octez-client.sh");
-        let wallet_path_quoted = wallet_path_str.replace('\'', "'\\''");
-        std::fs::write(
-            &octez_client,
-            format!(
-                "#!/bin/sh\nif ! grep -q '\"deposit_id\"' '{}'; then\n  echo missing deposit secret >&2\n  exit 42\nfi\necho 'Operation hash is ooPersistedDepositSecret'\n",
-                wallet_path_quoted
-            ),
-        )
-        .expect("write fake octez-client");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&octez_client, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod fake octez-client");
-        }
-
-        let mut profile = super::tests::rollup_profile_for_url("http://127.0.0.1:9");
-        profile.octez_client_bin = octez_client.to_str().unwrap().into();
-
-        cmd_bridge_deposit(wallet_path_str, &profile, 123).expect("deposit command");
-
-        let wallet = load_wallet(wallet_path_str).expect("load wallet");
-        assert_eq!(wallet.pending_deposits.len(), 1);
-        assert_eq!(wallet.pending_deposits[0].amount, 123);
-        assert_eq!(
-            wallet.pending_deposits[0].operation_hash.as_deref(),
-            Some("ooPersistedDepositSecret")
-        );
-    }
+    // bridge_deposit_persists_secret_before_l1_submission was removed when the
+    // legacy `deposit_secret` field was excised. The intent-bound flow requires
+    // a fully mocked rollup HTTP backend (for auth_domain + required_tx_fee
+    // reads) plus a recipient-address fixture and is best covered by a
+    // dedicated integration harness rather than an inline unit test.
 
     #[cfg(unix)]
     #[test]
@@ -8449,134 +8631,6 @@ mod network_profile_tests {
         assert_eq!(rollup.current_required_tx_fee().unwrap(), MIN_TX_FEE);
     }
 
-    #[test]
-    fn cmd_shield_rollup_pins_fee_and_balance_reads_to_same_head() {
-        let dir = tempfile::tempdir().unwrap();
-        let wallet_path = dir.path().join("wallet.json");
-        let wallet_path_str = wallet_path.to_str().unwrap();
-        let mut wallet = super::tests::test_wallet(1);
-        let sender = "alice";
-        let deposit_secret = deposit_secret_from_label(sender);
-        let deposit_id = deposit_id_from_secret(&deposit_secret);
-        let deposit_key = deposit_balance_key(&deposit_id);
-        wallet.pending_deposits.push(PendingDeposit {
-            deposit_id,
-            secret: deposit_secret,
-            amount: 0,
-            operation_hash: None,
-        });
-        save_wallet(wallet_path_str, &wallet).expect("save wallet");
-        let recipient_path = dir.path().join("recipient.json");
-        let recipient = super::tests::payment_address_for_wallet_address(&wallet, 0);
-        std::fs::write(
-            &recipient_path,
-            serde_json::to_vec(&recipient).expect("serialize recipient"),
-        )
-        .expect("write recipient");
-
-        let amount = 10u64;
-        let old_head_balance = amount + MIN_TX_FEE;
-        let new_head_balance = old_head_balance + 1;
-
-        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
-            (
-                "/global/block/head/hash".into(),
-                (200, "\"BLoldhead\"".into()),
-            ),
-            ("/global/block/BLoldhead/level".into(), (200, "10".into())),
-            (
-                format!(
-                    "/global/block/BLoldhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_LAST_INPUT_LEVEL
-                ),
-                (200, "null".into()),
-            ),
-            (
-                format!(
-                    "/global/block/BLoldhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_FEE_LEVEL
-                ),
-                (200, "null".into()),
-            ),
-            (
-                format!(
-                    "/global/block/BLoldhead/durable/wasm_2_0_0/length?key={}",
-                    DURABLE_PRIVATE_TX_COUNT_IN_LEVEL
-                ),
-                (200, "null".into()),
-            ),
-            (
-                format!(
-                    "/global/block/BLoldhead/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_BALANCE_COUNT
-                ),
-                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
-            ),
-            (
-                format!(
-                    "/global/block/BLoldhead/durable/wasm_2_0_0/value?key={}",
-                    indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, 0)
-                ),
-                (200, format!("\"{}\"", hex::encode(deposit_key.as_bytes()))),
-            ),
-            (
-                format!(
-                    "/global/block/BLoldhead/durable/wasm_2_0_0/value?key={}",
-                    balance_durable_key(&deposit_key)
-                ),
-                (
-                    200,
-                    format!("\"{}\"", hex::encode(old_head_balance.to_le_bytes())),
-                ),
-            ),
-            (
-                format!(
-                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_BALANCE_COUNT
-                ),
-                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
-            ),
-            (
-                format!(
-                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
-                    indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, 0)
-                ),
-                (200, format!("\"{}\"", hex::encode(deposit_key.as_bytes()))),
-            ),
-            (
-                format!(
-                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
-                    balance_durable_key(&deposit_key)
-                ),
-                (
-                    200,
-                    format!("\"{}\"", hex::encode(new_head_balance.to_le_bytes())),
-                ),
-            ),
-        ]));
-        let profile = super::tests::rollup_profile_for_url(&base_url);
-        let pc = ProveConfig {
-            skip_proof: false,
-            reprove_bin: "/definitely/missing/reprove".into(),
-            executables_dir: "cairo/target/dev".into(),
-        };
-
-        let err = cmd_shield_rollup(
-            wallet_path_str,
-            &profile,
-            None,
-            amount,
-            None,
-            Some(recipient_path.to_str().unwrap().into()),
-            None,
-            &pc,
-        )
-        .expect_err("shield should reject a mixed-head fee/balance snapshot");
-        assert!(
-            err.contains("no tracked secret-bound deposit has enough rollup balance"),
-            "expected insufficient deposit balance from pinned reads, got: {err}"
-        );
-    }
 
     #[test]
     fn cmd_wallet_check_fails_when_full_snapshot_is_incomplete() {

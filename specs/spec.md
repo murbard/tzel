@@ -233,27 +233,30 @@ separate resource price from the burned rollup fee above.
 
 ### Shield (public -> private)
 
-**Public outputs:** `[v_pub, fee, producer_fee, cm_new, cm_producer, deposit_id, memo_ct_hash, producer_memo_ct_hash]`
+**Public outputs:** `[auth_domain, v_pub, fee, producer_fee, cm_new, cm_producer, deposit_id, memo_ct_hash, producer_memo_ct_hash]`
 
-`deposit_id` is defined in [Secret-Bound Deposit Identifiers](#secret-bound-deposit-identifiers). `auth_root` does NOT appear in the public outputs; it is a private input used only to compute `owner_tag`.
+`deposit_id` is defined in [Intent-Bound Deposit Identifiers](#intent-bound-deposit-identifiers); it is the hash of every other public output and so commits to the *exact* shield being authorized. `auth_root` does NOT appear in the public outputs; it is a private input used only to compute `owner_tag`.
 
 **Circuit constraints:**
-1. `deposit_id = H(TAG_DEPOSIT, deposit_secret)`
-2. `rcm = H(H(TAG_RCM), rseed)`
-3. `owner_tag = H_owner(auth_root, pub_seed, nk_tag)` where `auth_root`, `pub_seed`, and `nk_tag` are private inputs from the recipient's payment address
-4. `cm_new = H_commit(d_j, v_pub, rcm, owner_tag)`
-5. `producer_rcm = H(H(TAG_RCM), producer_rseed)`
-6. `producer_owner_tag = H_owner(producer_auth_root, producer_pub_seed, producer_nk_tag)` where those values are private inputs from the DAL producer's payment address
-7. `cm_producer = H_commit(producer_d_j, producer_fee, producer_rcm, producer_owner_tag)`
-8. `producer_fee > 0`
+1. `rcm = H(H(TAG_RCM), rseed)`
+2. `owner_tag = H_owner(auth_root, pub_seed, nk_tag)` where `auth_root`, `pub_seed`, and `nk_tag` are private inputs from the recipient's payment address
+3. `cm_new = H_commit(d_j, v_pub, rcm, owner_tag)`
+4. `producer_rcm = H(H(TAG_RCM), producer_rseed)`
+5. `producer_owner_tag = H_owner(producer_auth_root, producer_pub_seed, producer_nk_tag)` where those values are private inputs from the DAL producer's payment address
+6. `cm_producer = H_commit(producer_d_j, producer_fee, producer_rcm, producer_owner_tag)`
+7. `producer_fee > 0`
+8. `intent = H_intent(auth_domain, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash)` (left-fold using the `sighSP__` personalization with leading type tag `0x03`)
+9. `deposit_id == intent`
 
 `memo_ct_hash` and `producer_memo_ct_hash` are computed client-side as
 `H(ct_d || tag || ct_v || nonce || encrypted_data || outgoing_ct)` —
 covering ALL on-chain note data — and passed into the circuit as public inputs.
 
-**Contract / ledger checks:** proof valid, deposit binding per [Shield deposit binding](#shield-deposit-binding), `H(posted_client_note_calldata) == memo_ct_hash`, `H(posted_producer_note_calldata) == producer_memo_ct_hash`, `fee >= required_tx_fee`.
+There is no `deposit_secret` in the witness. The L1 deposit transaction (signed by the depositor's L1 key) is itself the spend authorization: by addressing the rollup balance to `deposit:<hex(intent)>`, it commits to every detail of the shield. Anything an untrusted prover could rewrite (recipient address, value, fee, producer fee, encrypted-note bytes, even auth_domain) is folded into `intent` — modifying any field changes the deposit_id, and the kernel's lookup against `bal_for(deposit_id')` returns 0. **This makes shield safe to delegate to an untrusted prover**, unlike the legacy secret-bound deposit which leaked spend authority to the prover.
 
-**State changes:** deduct `v_pub + fee + producer_fee` from the public rollup balance keyed by `deposit_key = "deposit:" || lowercase_hex_32(deposit_id)`, append `cm_new` and `cm_producer` to T. A secret-bound deposit balance is not directly withdrawable; it must first be consumed by a shield proof proving knowledge of `deposit_secret`.
+**Contract / ledger checks:** proof valid, deposit binding per [Shield deposit binding](#shield-deposit-binding), `H(posted_client_note_calldata) == memo_ct_hash`, `H(posted_producer_note_calldata) == producer_memo_ct_hash`, `fee >= required_tx_fee`, and (consensus-level) the request's `deposit_id` MUST equal the recomputed `intent` from the request fields.
+
+**State changes:** the L1 deposit balance keyed by `deposit_key = "deposit:" || lowercase_hex_32(deposit_id)` MUST equal exactly `v_pub + fee + producer_fee`; it is then drained to zero and `cm_new` and `cm_producer` are appended to T. The intent-bound deposit is single-shot: any residual is unrecoverable because no other intent collides with the same deposit_id. Wallets MUST size the L1 deposit precisely; bridge implementations MAY refuse to credit a non-zero balance on top of an existing non-zero `deposit:<hex>` balance to prevent accidental top-up locking.
 
 ### Transfer (N->recipient + change + producer fee, where 1 <= N <= 7)
 
@@ -341,9 +344,9 @@ For each output note, the contract MUST verify `H(posted_note_calldata) == memo_
 
 ### Shield deposit binding
 
-Bridge deposits for shielding MUST credit a public rollup balance keyed by the secret-bound deposit balance key for `deposit_id`. The shield proof MUST prove knowledge of `deposit_secret` such that `deposit_id = H(TAG_DEPOSIT, deposit_secret)`, and the ledger MUST debit the balance associated with that exact deposit key.
+Bridge deposits for shielding MUST credit a public rollup balance keyed by the intent-bound deposit balance key for `deposit_id`. The shield proof MUST recompute `intent = H_intent(auth_domain, v_pub, fee, producer_fee, cm_new, cm_producer, memo_ct_hash, producer_memo_ct_hash)` in-circuit and emit it as a public output equal to `deposit_id`; the kernel additionally MUST recompute the same intent from the request fields and reject any request whose `deposit_id` disagrees. The kernel MUST also require that the L1-funded balance equals the exact debit `v_pub + fee + producer_fee` (no residual; no top-up). On success, the kernel drains the deposit balance to zero in a single shot.
 
-The ledger MUST reject direct withdraws from secret-bound deposit balances. Otherwise the public `deposit_id` would be enough to withdraw deposited funds before shielding, defeating the ownership binding.
+The ledger MUST reject direct withdraws from intent-bound deposit balances (the `is_deposit_balance_key` check). The L1-bound `deposit_id` is the depositor's signed authorization for the *one* shield it commits to; any other operation on the same balance has no authorization.
 
 ### Spend authorization (all spending transactions)
 
@@ -648,23 +651,31 @@ The reference CLI currently exposes JSON over HTTP. That JSON must map losslessl
 
 This JSON mapping is a convenience API, not the normative interoperability format.
 
-### Secret-Bound Deposit Identifiers
+### Intent-Bound Deposit Identifiers
 
-The bridge receiver for a shield deposit is a namespaced secret-bound deposit balance key:
+The bridge receiver for a shield deposit is a namespaced intent-bound deposit balance key:
 
 ```text
-deposit_id = H(TAG_DEPOSIT, deposit_secret)
-TAG_DEPOSIT = felt_tag("deposit")
+intent      = H_intent(auth_domain, v_pub, fee, producer_fee,
+                       cm_new, cm_producer,
+                       memo_ct_hash, producer_memo_ct_hash)
+deposit_id  = intent
 deposit_key = "deposit:" || lowercase_hex_32(deposit_id)
 ```
 
-`felt_tag("deposit")` is the same tag construction used by the Rust reference implementation: interpret the ASCII bytes as a big-endian integer and encode that felt in canonical little-endian field form. In Cairo notation this tag is `0x6465706f736974`.
+`H_intent` is the sequential left-fold using BLAKE2s with the `sighSP__` personalization (the same primitive as `sighash_fold`) over a leading type-tag felt `0x03` followed by the eight intent fields above. The 0x03 tag distinguishes shield intents from transfer (0x01) and unshield (0x02) sighashes; collisions across constructions are infeasible by domain separation.
 
 The `deposit:` namespace is part of the canonical public balance key. It prevents a raw 64-character hex deposit id from being confused with hex-encoded durable bytes by rollup RPC clients. The bridge MUST reject non-canonical deposit keys, including missing prefixes, mixed-case hex, and malformed lengths.
 
-The wallet generates a fresh random `deposit_secret` for each L1 bridge deposit, stores it locally, and asks the bridge to credit the rollup balance key `deposit:<hex(deposit_id)>`. The later shield proof uses `deposit_secret` as private witness and publishes `deposit_id`. The ledger only checks the public balance for that deposit key; it never learns `deposit_secret`.
+The wallet builds the recipient and producer-fee notes client-side at L1-deposit time, computes `intent` over those notes plus the fee schedule, and instructs the L1 bridge to credit `deposit:<hex(intent)>` for exactly `v_pub + fee + producer_fee` mutez. Persisting the full witness (note plaintexts, encrypted bytes, fees, auth_domain) is now part of wallet correctness, since later shield proving needs to reconstruct the same fields. The ledger only checks the public balance for that deposit key.
 
-This replaces any public-account-string ownership assumption for shield. A bridge deposit to `deposit_key` can only be shielded by someone who knows the preimage for the embedded `deposit_id`, and direct withdraw from a `deposit_key` balance is rejected.
+The intent commits to *every* prover-rewritable field. As a consequence:
+
+- A malicious untrusted prover cannot redirect funds: any change of recipient, value, fee, producer fee, encrypted-note bytes, or auth_domain produces a different deposit_id whose L1 balance is zero.
+- The shield proof needs no signature inside the circuit; the L1 deposit transaction's own L1 signature is the spend authorization.
+- Each L1 deposit corresponds to exactly one shield. There is no partial drain and no top-up — both would require updating `intent`, which contradicts the L1 commitment. Wallets MUST size deposits exactly. Sender-side mistakes (over- or under-deposit) are unrecoverable footguns; bridge implementations are encouraged to refuse credits to a non-zero `deposit:<hex>` balance.
+
+A direct withdraw from a `deposit_key` balance is rejected. The L1 deposit binds *one* shield's worth of authority and nothing else.
 
 ### Public Account Identifier Encoding
 

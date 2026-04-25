@@ -3,6 +3,14 @@
 This tutorial covers a Shadownet `deposit -> shield -> send` flow against a
 deployed rollup using the operator box.
 
+> **Status note (intent-bound shield migration):** the protocol now uses
+> intent-bound shield deposit ids. The L1 deposit transaction commits to the
+> entire shield (recipient, value, fees, encrypted-note bytes) by addressing
+> the rollup balance to `deposit:<hex(intent)>`. The wallet's rollup-side
+> `bridge-deposit` and `shield` commands are being rewritten to support this
+> flow — see `new_findings.md`. The localhost demo flow in the top-level
+> `README.md` already runs end-to-end against this design.
+
 The current rollup policy burns at least `100000` mutez (`0.1 tez`) on every
 `shield`, `send`, and `unshield`. The first two accepted private transactions at
 a given inbox level pay that floor; each additional private transaction at the
@@ -251,13 +259,14 @@ Create Shadownet profiles:
 Notes:
 
 - `dal_fee_address` is the shielded address that receives the DAL inclusion fee note
-- each `deposit` creates a fresh secret-bound rollup deposit id in the wallet and credits the canonical `deposit:<hex(deposit_id)>` rollup balance key; `shield` later proves knowledge of that deposit secret
-- `public_account` in the profile is only used for transparent balances produced by `unshield` and later `withdraw`
+- each `deposit` builds the entire shield (recipient note + producer-fee note) up front, computes the *intent-bound* deposit id (`shield_intent` over every shield public output), and credits the canonical `deposit:<hex(intent)>` rollup balance key for exactly the bound debit. The L1 deposit transaction is itself the shield authorization — there is no `deposit_secret`, and any modification of the witness (recipient, value, fees) yields a different deposit id whose balance is empty.
+- `public_account` in the profile is only used for non-shielded balance reporting; under the new design, unshield emits an L1 outbox directly to a tz/KT1 recipient.
 - keep Alice and Bob distinct
+- **Shield deposits are single-shot and exact-amount:** the wallet computes `v + fee + producer_fee` and instructs the bridge to deposit precisely that amount. There is no partial drain, no top-up, and no recovery of an accidentally over- or under-funded balance — the wallet UX must size the L1 deposit precisely.
 
-## 6. Fund Alice On L1 And Wait For The Secret-Bound Deposit Balance
+## 6. Fund Alice On L1 And Wait For The Intent-Bound Deposit Balance
 
-Deposit into the bridge for Alice’s next shield. The wallet generates and stores a fresh deposit secret, then asks the bridge to credit the canonical `deposit:<hex(deposit_id)>` balance key for `deposit_id = H("deposit", deposit_secret)`:
+Deposit into the bridge for Alice's next shield. The wallet builds the recipient and producer-fee notes, computes `intent = shield_intent(auth_domain, v, fee, producer_fee, cm_recipient, cm_producer, mh, mh_producer)`, and asks the bridge to credit `deposit:<hex(intent)>` for exactly `v + fee + producer_fee` mutez:
 
 ```bash
 /usr/local/bin/tzel-wallet \
@@ -272,10 +281,10 @@ The wallet prints an L1 operation hash. Wait for it to land, then poll:
 /usr/local/bin/tzel-wallet --wallet alice.wallet balance
 ```
 
-Do not continue until Alice shows a non-zero secret-bound deposit line like:
+Do not continue until Alice shows a non-zero pending-deposit line like:
 
 ```text
-Secret-bound deposit balance: 300000 across 1 pending deposits
+Pending intent-bound deposit balance: 300000 across 1 pending deposits
 ```
 
 ## 7. Shield Alice’s Funds
@@ -314,8 +323,8 @@ Keep polling until the operator reports a final state. Then sync Alice:
 
 Acceptance:
 
-- Alice’s secret-bound deposit balance drops by the shielded amount plus the fixed `100000` mutez burn and the configured DAL-producer fee
-- Alice’s private available balance becomes non-zero
+- The intent-bound deposit balance drains to zero (single-shot)
+- Alice's private available balance becomes non-zero by exactly the recipient note's value
 
 ## 8. Derive Bob’s Receive Address
 

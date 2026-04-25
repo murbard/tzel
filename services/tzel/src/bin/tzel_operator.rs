@@ -553,13 +553,12 @@ fn enforce_dal_fee_policy(
         .as_ref()
         .ok_or_else(|| "operator is missing DAL fee policy".to_string())?;
     match message {
-        KernelInboxMessage::Shield(req) => {
-            let enc = req
-                .producer_enc
-                .as_ref()
-                .ok_or_else(|| "shield DAL fee note is missing producer_enc".to_string())?;
-            validate_fee_note_against_policy(policy, &req.producer_cm, enc, req.producer_fee)
-        }
+        KernelInboxMessage::Shield(req) => validate_fee_note_against_policy(
+            policy,
+            &req.producer_cm,
+            &req.producer_enc,
+            req.producer_fee,
+        ),
         KernelInboxMessage::Transfer(req) => {
             validate_fee_note_against_policy(policy, &req.cm_3, &req.enc_3, policy.amount)
         }
@@ -1572,23 +1571,28 @@ mod tests {
         producer_cm: F,
         producer_enc: EncryptedNote,
     ) -> Vec<u8> {
-        let policy = sample_fee_policy();
+        let _policy = sample_fee_policy();
+        let mut deposit_id = [0u8; 32];
+        deposit_id[..4].copy_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        // Use a deterministic synthetic client cm/enc for the operator's
+        // fee-policy decoder; consensus validation is exercised elsewhere.
+        let mut client_cm = [0u8; 32];
+        client_cm[..4].copy_from_slice(&[0x11, 0x22, 0x33, 0x44]);
+        let client_enc = producer_enc.clone();
         encode_kernel_inbox_message(&KernelInboxMessage::Shield(
             tzel_core::kernel_wire::KernelShieldReq {
-                deposit_id: tzel_core::deposit_id_from_label("alice"),
+                deposit_id,
                 fee: 100_000,
                 v: 25,
                 producer_fee,
-                address: policy.address,
-                memo: None,
                 proof: tzel_core::kernel_wire::KernelStarkProof {
                     proof_bytes: vec![],
                     output_preimage: vec![],
                 },
-                client_cm: [0u8; 32],
-                client_enc: None,
+                client_cm,
+                client_enc: client_enc,
                 producer_cm,
-                producer_enc: Some(producer_enc),
+                producer_enc: producer_enc,
             },
         ))
         .expect("shield payload should encode")

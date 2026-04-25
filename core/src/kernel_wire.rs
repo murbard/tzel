@@ -1,21 +1,22 @@
 use crate::canonical_wire::{
     decode_tze, encode_tze, felt_to_wire, u16_to_wire, u64_to_wire, wire_to_felt, wire_to_u16,
-    wire_to_u64, WireEncryptedNote, WireFelt, WirePaymentAddress, WireU16Le, WireU64Le,
+    wire_to_u64, WireEncryptedNote, WireFelt, WireU16Le, WireU64Le,
 };
+#[cfg(test)]
+use crate::PaymentAddress;
 use crate::{
-    hash, wots_sign, EncryptedNote, PaymentAddress, ProgramHashes, Proof, ShieldReq, ShieldResp,
-    TransferReq, TransferResp, UnshieldReq, UnshieldResp, ENCRYPTED_NOTE_BYTES, F,
-    ML_KEM768_CIPHERTEXT_BYTES, NOTE_AEAD_NONCE_BYTES, OUTGOING_RECOVERY_CT_BYTES,
+    hash, wots_sign, EncryptedNote, ProgramHashes, Proof, ShieldReq, ShieldResp, TransferReq,
+    TransferResp, UnshieldReq, UnshieldResp, ENCRYPTED_NOTE_BYTES, F, ML_KEM768_CIPHERTEXT_BYTES,
+    NOTE_AEAD_NONCE_BYTES, OUTGOING_RECOVERY_CT_BYTES,
 };
 use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const KERNEL_WIRE_VERSION: u16 = 13;
+pub const KERNEL_WIRE_VERSION: u16 = 14;
 pub const KERNEL_VERIFIER_CONFIG_KEY_INDEX: u32 = 0;
 pub const KERNEL_BRIDGE_CONFIG_KEY_INDEX: u32 = 1;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
-const MAX_MEMO_BYTES: usize = 4096;
 const MAX_PROOF_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT_PREIMAGE_ITEMS: usize = 1024;
 const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
@@ -63,19 +64,20 @@ pub struct KernelStarkProof {
     pub output_preimage: Vec<F>,
 }
 
+/// Shield message: an L1 user has previously deposited to `deposit_id` (which
+/// is `shield_intent(...)` over the fields below). Both notes are fully
+/// constructed client-side and the server has no role in fabricating them.
 #[derive(Debug, Clone)]
 pub struct KernelShieldReq {
     pub deposit_id: F,
     pub fee: u64,
     pub v: u64,
     pub producer_fee: u64,
-    pub address: PaymentAddress,
-    pub memo: Option<String>,
     pub proof: KernelStarkProof,
     pub client_cm: F,
-    pub client_enc: Option<EncryptedNote>,
+    pub client_enc: EncryptedNote,
     pub producer_cm: F,
-    pub producer_enc: Option<EncryptedNote>,
+    pub producer_enc: EncryptedNote,
 }
 
 #[derive(Debug, Clone)]
@@ -222,14 +224,11 @@ struct WireKernelShieldReq {
     fee: WireU64Le,
     v: WireU64Le,
     producer_fee: WireU64Le,
-    address: WirePaymentAddress,
-    #[encoding(string = "MAX_MEMO_BYTES")]
-    memo: Option<String>,
     proof: WireEncodedProof,
     client_cm: WireFelt,
-    client_enc: Option<WireEncryptedNote>,
+    client_enc: WireEncryptedNote,
     producer_cm: WireFelt,
-    producer_enc: Option<WireEncryptedNote>,
+    producer_enc: WireEncryptedNote,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -552,8 +551,6 @@ pub fn kernel_shield_req_to_host(req: &KernelShieldReq) -> ShieldReq {
         fee: req.fee,
         v: req.v,
         producer_fee: req.producer_fee,
-        address: req.address.clone(),
-        memo: req.memo.clone(),
         proof: kernel_proof_to_host(&req.proof),
         client_cm: req.client_cm,
         client_enc: req.client_enc.clone(),
@@ -764,28 +761,6 @@ fn program_hashes_from_wire(wire: WireProgramHashes) -> Result<ProgramHashes, St
     })
 }
 
-fn payment_address_to_wire(address: &PaymentAddress) -> WirePaymentAddress {
-    WirePaymentAddress {
-        d_j: felt_to_wire(&address.d_j),
-        auth_root: felt_to_wire(&address.auth_root),
-        auth_pub_seed: felt_to_wire(&address.auth_pub_seed),
-        nk_tag: felt_to_wire(&address.nk_tag),
-        ek_v: address.ek_v.clone(),
-        ek_d: address.ek_d.clone(),
-    }
-}
-
-fn payment_address_from_wire(wire: WirePaymentAddress) -> Result<PaymentAddress, String> {
-    Ok(PaymentAddress {
-        d_j: wire_to_felt(wire.d_j)?,
-        auth_root: wire_to_felt(wire.auth_root)?,
-        auth_pub_seed: wire_to_felt(wire.auth_pub_seed)?,
-        nk_tag: wire_to_felt(wire.nk_tag)?,
-        ek_v: wire.ek_v,
-        ek_d: wire.ek_d,
-    })
-}
-
 fn encrypted_note_to_wire(enc: &EncryptedNote) -> Result<WireEncryptedNote, String> {
     enc.validate()?;
     Ok(WireEncryptedNote {
@@ -919,21 +894,11 @@ fn kernel_shield_req_to_wire(req: &KernelShieldReq) -> Result<WireKernelShieldRe
         fee: u64_to_wire(req.fee),
         v: u64_to_wire(req.v),
         producer_fee: u64_to_wire(req.producer_fee),
-        address: payment_address_to_wire(&req.address),
-        memo: req.memo.clone(),
         proof: encoded_proof_to_wire(&req.proof)?,
         client_cm: felt_to_wire(&req.client_cm),
-        client_enc: req
-            .client_enc
-            .as_ref()
-            .map(encrypted_note_to_wire)
-            .transpose()?,
+        client_enc: encrypted_note_to_wire(&req.client_enc)?,
         producer_cm: felt_to_wire(&req.producer_cm),
-        producer_enc: req
-            .producer_enc
-            .as_ref()
-            .map(encrypted_note_to_wire)
-            .transpose()?,
+        producer_enc: encrypted_note_to_wire(&req.producer_enc)?,
     })
 }
 
@@ -943,16 +908,11 @@ fn kernel_shield_req_from_wire(wire: WireKernelShieldReq) -> Result<KernelShield
         fee: wire_to_u64(wire.fee)?,
         v: wire_to_u64(wire.v)?,
         producer_fee: wire_to_u64(wire.producer_fee)?,
-        address: payment_address_from_wire(wire.address)?,
-        memo: wire.memo,
         proof: encoded_proof_from_wire(wire.proof)?,
         client_cm: wire_to_felt(wire.client_cm)?,
-        client_enc: wire.client_enc.map(encrypted_note_from_wire).transpose()?,
+        client_enc: encrypted_note_from_wire(wire.client_enc)?,
         producer_cm: wire_to_felt(wire.producer_cm)?,
-        producer_enc: wire
-            .producer_enc
-            .map(encrypted_note_from_wire)
-            .transpose()?,
+        producer_enc: encrypted_note_from_wire(wire.producer_enc)?,
     })
 }
 
@@ -1243,18 +1203,17 @@ mod tests {
     #[test]
     fn kernel_inbox_roundtrip_preserves_shield_request() {
         let deposit_id = [0x42; 32];
+        let client_cm = [0x55; 32];
         let message = KernelInboxMessage::Shield(KernelShieldReq {
             deposit_id,
             fee: 3,
             v: 42,
             producer_fee: 5,
-            address: sample_payment_address(),
-            memo: Some("hello".into()),
             proof: sample_kernel_stark_proof(),
-            client_cm: ZERO,
-            client_enc: None,
+            client_cm,
+            client_enc: sample_encrypted_note(0x66),
             producer_cm: [9u8; 32],
-            producer_enc: Some(sample_encrypted_note(0x77)),
+            producer_enc: sample_encrypted_note(0x77),
         });
         let encoded = encode_kernel_inbox_message(&message).unwrap();
         let decoded = decode_kernel_inbox_message(&encoded).unwrap();
@@ -1264,17 +1223,14 @@ mod tests {
                 assert_eq!(req.fee, 3);
                 assert_eq!(req.v, 42);
                 assert_eq!(req.producer_fee, 5);
-                assert_eq!(req.memo.as_deref(), Some("hello"));
                 assert_eq!(
                     req.proof.proof_bytes,
                     sample_kernel_stark_proof().proof_bytes
                 );
-                assert_eq!(req.address.d_j, sample_payment_address().d_j);
+                assert_eq!(req.client_cm, client_cm);
+                assert_eq!(req.client_enc.ct_d, sample_encrypted_note(0x66).ct_d);
                 assert_eq!(req.producer_cm, [9u8; 32]);
-                assert_eq!(
-                    req.producer_enc.as_ref().map(|enc| &enc.ct_d),
-                    Some(&sample_encrypted_note(0x77).ct_d)
-                );
+                assert_eq!(req.producer_enc.ct_d, sample_encrypted_note(0x77).ct_d);
             }
             other => panic!("unexpected decoded message: {:?}", other),
         }
@@ -1346,13 +1302,11 @@ mod tests {
             fee: 2,
             v: 7,
             producer_fee: 4,
-            address: sample_payment_address(),
-            memo: None,
             proof: proof.clone(),
             client_cm: [0x44; 32],
-            client_enc: None,
+            client_enc: sample_encrypted_note(0x55),
             producer_cm: [0x66; 32],
-            producer_enc: Some(sample_encrypted_note(0x67)),
+            producer_enc: sample_encrypted_note(0x67),
         });
         let encoded = encode_kernel_inbox_message(&message).unwrap();
         let decoded = decode_kernel_inbox_message(&encoded).unwrap();
@@ -1659,14 +1613,12 @@ mod tests {
         #[test]
         fn prop_kernel_shield_roundtrip_preserves_fields(
             deposit_id in arb_felt(),
-            memo in prop::option::of(small_string(64)),
             fee in any::<u64>(),
             v in any::<u64>(),
             producer_fee in 1u64..u64::MAX,
-            address in arb_payment_address(),
             proof in arb_kernel_stark_proof(),
             client_cm in arb_felt(),
-            client_enc in prop::option::of(arb_encrypted_note()),
+            client_enc in arb_encrypted_note(),
             producer_cm in arb_felt(),
             producer_enc in arb_encrypted_note(),
         ) {
@@ -1675,13 +1627,11 @@ mod tests {
                 fee,
                 v,
                 producer_fee,
-                address: address.clone(),
-                memo: memo.clone(),
                 proof: proof.clone(),
                 client_cm,
                 client_enc: client_enc.clone(),
                 producer_cm,
-                producer_enc: Some(producer_enc.clone()),
+                producer_enc: producer_enc.clone(),
             });
 
             let encoded = encode_kernel_inbox_message(&message).unwrap();
@@ -1693,26 +1643,13 @@ mod tests {
             prop_assert_eq!(req.fee, fee);
             prop_assert_eq!(req.v, v);
             prop_assert_eq!(req.producer_fee, producer_fee);
-            prop_assert_eq!(req.memo, memo);
-            prop_assert_eq!(req.address.d_j, address.d_j);
-            prop_assert_eq!(req.address.auth_root, address.auth_root);
-            prop_assert_eq!(req.address.auth_pub_seed, address.auth_pub_seed);
-            prop_assert_eq!(req.address.nk_tag, address.nk_tag);
-            prop_assert_eq!(req.address.ek_v, address.ek_v);
-            prop_assert_eq!(req.address.ek_d, address.ek_d);
             prop_assert_eq!(req.client_cm, client_cm);
-            prop_assert_eq!(req.client_enc.is_some(), client_enc.is_some());
+            prop_assert_eq!(&req.client_enc.ct_d, &client_enc.ct_d);
+            prop_assert_eq!(req.client_enc.tag, client_enc.tag);
+            prop_assert_eq!(&req.client_enc.ct_v, &client_enc.ct_v);
+            prop_assert_eq!(&req.client_enc.encrypted_data, &client_enc.encrypted_data);
             prop_assert_eq!(req.producer_cm, producer_cm);
-            prop_assert_eq!(
-                req.producer_enc.as_ref().map(|enc| &enc.ct_d),
-                Some(&producer_enc.ct_d)
-            );
-            if let (Some(actual), Some(expected)) = (req.client_enc.as_ref(), client_enc.as_ref()) {
-                prop_assert_eq!(&actual.ct_d, &expected.ct_d);
-                prop_assert_eq!(actual.tag, expected.tag);
-                prop_assert_eq!(&actual.ct_v, &expected.ct_v);
-                prop_assert_eq!(&actual.encrypted_data, &expected.encrypted_data);
-            }
+            prop_assert_eq!(&req.producer_enc.ct_d, &producer_enc.ct_d);
             prop_assert_eq!(req.proof.proof_bytes, proof.proof_bytes);
             prop_assert_eq!(req.proof.output_preimage, proof.output_preimage);
         }
@@ -1929,7 +1866,6 @@ mod tests {
         #[test]
         fn prop_kernel_requests_to_host_preserve_fields(
             deposit_id in arb_felt(),
-            memo in prop::option::of(small_string(64)),
             recipient in small_string(32),
             root in arb_felt(),
             nullifiers in prop::collection::vec(arb_felt(), 0..8),
@@ -1942,14 +1878,13 @@ mod tests {
             fee in any::<u64>(),
             value in any::<u64>(),
             producer_fee in 1u64..u64::MAX,
-            address in arb_payment_address(),
             proof in arb_kernel_stark_proof(),
             enc_1 in arb_encrypted_note(),
             enc_2 in arb_encrypted_note(),
             enc_3 in arb_encrypted_note(),
             enc_change in prop::option::of(arb_encrypted_note()),
             enc_fee in arb_encrypted_note(),
-            client_enc in prop::option::of(arb_encrypted_note()),
+            client_enc in arb_encrypted_note(),
             producer_enc in arb_encrypted_note(),
         ) {
             let shield = KernelShieldReq {
@@ -1957,27 +1892,26 @@ mod tests {
                 fee,
                 v: value,
                 producer_fee,
-                address: address.clone(),
-                memo: memo.clone(),
                 proof: proof.clone(),
                 client_cm,
                 client_enc: client_enc.clone(),
                 producer_cm: cm_fee,
-                producer_enc: Some(producer_enc.clone()),
+                producer_enc: producer_enc.clone(),
             };
             let shield_host = kernel_shield_req_to_host(&shield);
             prop_assert_eq!(shield_host.deposit_id, deposit_id);
             prop_assert_eq!(shield_host.fee, fee);
             prop_assert_eq!(shield_host.v, value);
             prop_assert_eq!(shield_host.producer_fee, producer_fee);
-            prop_assert_eq!(shield_host.address.d_j, address.d_j);
-            prop_assert_eq!(shield_host.memo, memo);
             prop_assert_eq!(shield_host.client_cm, client_cm);
-            prop_assert_eq!(shield_host.client_enc.is_some(), client_enc.is_some());
+            prop_assert_eq!(
+                &shield_host.client_enc.ct_d,
+                &client_enc.ct_d
+            );
             prop_assert_eq!(shield_host.producer_cm, cm_fee);
             prop_assert_eq!(
-                shield_host.producer_enc.as_ref().map(|enc| &enc.ct_d),
-                Some(&producer_enc.ct_d)
+                &shield_host.producer_enc.ct_d,
+                &producer_enc.ct_d
             );
 
             let transfer = KernelTransferReq {

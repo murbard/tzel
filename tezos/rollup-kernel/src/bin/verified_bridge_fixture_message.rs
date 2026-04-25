@@ -82,8 +82,6 @@ mod with_verifier {
             v: req.v,
             fee: req.fee,
             producer_fee: req.producer_fee,
-            address: req.address.clone(),
-            memo: req.memo.clone(),
             proof: kernel_proof_from_fixture(&req.proof),
             client_cm: req.client_cm,
             client_enc: req.client_enc.clone(),

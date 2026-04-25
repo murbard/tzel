@@ -527,20 +527,19 @@ mod tests {
     #[tokio::test]
     async fn test_shield_handler_rejects_trust_me_bro_when_verifier_is_required() {
         let st = rejecting_tmb_state(default_auth_domain());
+        let _ = dummy_payment_address(1);
         let err = shield_handler(
             State(st),
             Json(ShieldReq {
-                deposit_id: deposit_id_from_label("alice"),
+                deposit_id: hash(b"alice"),
                 v: 5,
                 fee: MIN_TX_FEE,
                 producer_fee: 1,
-                address: dummy_payment_address(1),
-                memo: None,
                 proof: Proof::TrustMeBro,
-                client_cm: ZERO,
-                client_enc: None,
+                client_cm: u64_to_felt(7),
+                client_enc: dummy_note(5),
                 producer_cm: u64_to_felt(2),
-                producer_enc: Some(dummy_note(6)),
+                producer_enc: dummy_note(6),
             }),
         )
         .await

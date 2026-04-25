@@ -152,6 +152,7 @@ let () =
         "cm", json_felt shield_note.cm;
         "enc", Tzel.Encoding.encrypted_note_to_json shield_enc;
         "memo_ct_hash", json_felt shield_memo_ct_hash;
+        "producer_address", Tzel.Encoding.payment_address_to_json (payment_address_wire_of_addr producer_addr0);
         "producer_cm", json_felt shield_producer_note.cm;
         "producer_enc", Tzel.Encoding.encrypted_note_to_json shield_producer_enc;
         "producer_memo_ct_hash", json_felt shield_producer_memo_ct_hash;

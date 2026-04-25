@@ -59,49 +59,71 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
   let auth_domain = felt_of_hex (json_string (json_field "auth_domain" json)) in
   let initial_alice_balance = Int64.of_int (json_int (json_field "initial_alice_balance" json)) in
   let ledger = Tzel.Ledger.create ~auth_domain in
-  Tzel.Ledger.set_balance ledger "alice" initial_alice_balance;
 
+  (* Shield: intent-bound. The Rust scenario carries the recipient + producer
+     notes; we recompute the intent (deposit_id) over them and seed the
+     ledger's deposit balance with the exact debit. *)
   let shield = json_field "shield" json in
-  let shield_sender = json_string (json_field "sender" shield) in
+  let shield_v = Int64.of_int (json_int (json_field "v" shield)) in
+  let shield_fee = Int64.of_int (json_int (json_field "fee" shield)) in
+  let shield_producer_fee = Int64.of_int (json_int (json_field "producer_fee" shield)) in
+  let shield_cm = felt_of_hex (json_string (json_field "cm" shield)) in
+  let shield_producer_cm = felt_of_hex (json_string (json_field "producer_cm" shield)) in
+  let shield_mch = felt_of_hex (json_string (json_field "memo_ct_hash" shield)) in
+  let shield_prod_mch = felt_of_hex (json_string (json_field "producer_memo_ct_hash" shield)) in
+  let shield_intent =
+    Tzel.Transaction.shield_intent
+      ~auth_domain
+      ~v_pub:shield_v ~fee:shield_fee ~producer_fee:shield_producer_fee
+      ~cm_new:shield_cm ~cm_producer:shield_producer_cm
+      ~memo_ct_hash:shield_mch ~producer_memo_ct_hash:shield_prod_mch
+  in
   let shield_pub : Tzel.Transaction.shield_public = {
-    v_pub = Int64.of_int (json_int (json_field "v" shield));
-    cm_new = felt_of_hex (json_string (json_field "cm" shield));
-    sender_id = Tzel.Hash.account_id shield_sender;
-    memo_ct_hash = felt_of_hex (json_string (json_field "memo_ct_hash" shield));
+    auth_domain;
+    v_pub = shield_v; fee = shield_fee; producer_fee = shield_producer_fee;
+    cm_new = shield_cm; cm_producer = shield_producer_cm;
+    deposit_id = shield_intent;
+    memo_ct_hash = shield_mch; producer_memo_ct_hash = shield_prod_mch;
   } in
-  begin match Tzel.Ledger.apply_shield ledger ~sender_string:shield_sender ~pub:shield_pub
-                ~memo_ct_hash:shield_pub.memo_ct_hash with
+  let deposit_key =
+    Printf.sprintf "deposit:%s" (Tzel.Felt.to_hex shield_intent)
+  in
+  let exact_debit =
+    Int64.add shield_v (Int64.add shield_fee shield_producer_fee)
+  in
+  Tzel.Ledger.set_balance ledger deposit_key exact_debit;
+  begin match Tzel.Ledger.apply_shield ledger ~pub:shield_pub
+                ~memo_ct_hash:shield_mch
+                ~producer_memo_ct_hash:shield_prod_mch with
   | Ok () -> ()
   | Error e -> Alcotest.failf "shield failed: %s" e
   end;
-  Tzel.Ledger.append_commitment ledger
-    (felt_of_hex (json_string (json_field "producer_cm" shield)));
-  Tzel.Ledger.set_balance ledger shield_sender
-    (Int64.sub (Tzel.Ledger.get_balance ledger shield_sender)
-       (Int64.add
-          (Int64.of_int (json_int (json_field "fee" shield)))
-          (Int64.of_int (json_int (json_field "producer_fee" shield)))));
+  ignore initial_alice_balance;
 
+  (* Transfer: 3 outputs (2 user + 1 producer fee). *)
   let transfer = json_field "transfer" json in
   let transfer_pub : Tzel.Transaction.transfer_public = {
     auth_domain;
     root = felt_of_hex (json_string (json_field "root" transfer));
     nullifiers = List.map (fun x -> felt_of_hex (json_string x))
       (json_list (json_field "nullifiers" transfer));
+    fee = Int64.of_int (json_int (json_field "fee" transfer));
     cm_1 = felt_of_hex (json_string (json_field "cm_1" transfer));
     cm_2 = felt_of_hex (json_string (json_field "cm_2" transfer));
+    cm_3 = felt_of_hex (json_string (json_field "cm_3" transfer));
     memo_ct_hash_1 = felt_of_hex (json_string (json_field "memo_ct_hash_1" transfer));
     memo_ct_hash_2 = felt_of_hex (json_string (json_field "memo_ct_hash_2" transfer));
+    memo_ct_hash_3 = felt_of_hex (json_string (json_field "memo_ct_hash_3" transfer));
   } in
   begin match Tzel.Ledger.apply_transfer ledger transfer_pub
                 ~memo_ct_hash_1:transfer_pub.memo_ct_hash_1
-                ~memo_ct_hash_2:transfer_pub.memo_ct_hash_2 with
+                ~memo_ct_hash_2:transfer_pub.memo_ct_hash_2
+                ~memo_ct_hash_3:transfer_pub.memo_ct_hash_3 with
   | Ok () -> ()
   | Error e -> Alcotest.failf "transfer failed: %s" e
   end;
-  Tzel.Ledger.append_commitment ledger
-    (felt_of_hex (json_string (json_field "cm_3" transfer)));
 
+  (* Unshield: change (optional) + producer fee. *)
   let unshield = json_field "unshield" json in
   let recipient = json_string (json_field "recipient" unshield) in
   let unshield_pub : Tzel.Transaction.unshield_public = {
@@ -110,17 +132,20 @@ let test_rust_wallet_scenario_applies_on_ocaml_ledger () =
     nullifiers = List.map (fun x -> felt_of_hex (json_string x))
       (json_list (json_field "nullifiers" unshield));
     v_pub = Int64.of_int (json_int (json_field "v_pub" unshield));
+    fee = Int64.of_int (json_int (json_field "fee" unshield));
     recipient_id = Tzel.Hash.account_id recipient;
     cm_change = felt_of_hex (json_string (json_field "cm_change" unshield));
     memo_ct_hash_change = felt_of_hex (json_string (json_field "memo_ct_hash_change" unshield));
+    cm_fee = felt_of_hex (json_string (json_field "cm_fee" unshield));
+    memo_ct_hash_fee = felt_of_hex (json_string (json_field "memo_ct_hash_fee" unshield));
   } in
-  begin match Tzel.Ledger.apply_unshield ledger ~recipient_string:recipient unshield_pub
-                ~memo_ct_hash_change:unshield_pub.memo_ct_hash_change with
+  begin match Tzel.Ledger.apply_unshield ledger
+                ~recipient_string:recipient unshield_pub
+                ~memo_ct_hash_change:unshield_pub.memo_ct_hash_change
+                ~memo_ct_hash_fee:unshield_pub.memo_ct_hash_fee with
   | Ok () -> ()
   | Error e -> Alcotest.failf "unshield failed: %s" e
   end;
-  Tzel.Ledger.append_commitment ledger
-    (felt_of_hex (json_string (json_field "cm_fee" unshield)));
 
   let expected = json_field "expected" json in
   let expected_withdrawals =

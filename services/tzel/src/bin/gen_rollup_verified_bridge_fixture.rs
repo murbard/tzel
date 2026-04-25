@@ -109,6 +109,7 @@ fn build_fixture() -> Result<VerifiedBridgeFixture, String> {
     );
     let shield_proof = generate_shield_proof(
         &program_hashes,
+        &auth_domain,
         "alice",
         SHIELD_AMOUNT,
         MIN_TX_FEE,
@@ -234,22 +235,31 @@ fn build_fixture() -> Result<VerifiedBridgeFixture, String> {
         &tree,
     )?;
 
+    let shield_intent_id = tzel_core::shield_intent(
+        &auth_domain,
+        SHIELD_AMOUNT,
+        MIN_TX_FEE,
+        DAL_PRODUCER_FEE,
+        &shield_cm,
+        &shield_producer_cm,
+        &memo_ct_hash(&shield_enc),
+        &memo_ct_hash(&shield_producer_enc),
+    );
+    let _ = &alice_addr_0; // kept for documentation; address is now committed via cm only
     Ok(VerifiedBridgeFixture {
         auth_domain,
         program_hashes,
         bridge_ticketer: BRIDGE_TICKETER.into(),
         shield: ShieldReq {
-            deposit_id: deposit_id_from_label("alice"),
+            deposit_id: shield_intent_id,
             v: SHIELD_AMOUNT,
             fee: MIN_TX_FEE,
             producer_fee: DAL_PRODUCER_FEE,
-            address: alice_addr_0.payment,
-            memo: Some("verified-bridge-shield".into()),
             proof: shield_proof,
             client_cm: shield_cm,
-            client_enc: Some(shield_enc),
+            client_enc: shield_enc,
             producer_cm: shield_producer_cm,
-            producer_enc: Some(shield_producer_enc),
+            producer_enc: shield_producer_enc,
         },
         transfer: TransferReq {
             root: root_after_shield,
@@ -278,9 +288,21 @@ fn build_fixture() -> Result<VerifiedBridgeFixture, String> {
     })
 }
 
+/// Build the witness arguments for the intent-bound shield circuit.
+///
+/// LAYOUT NOTE: this matches the *new* run_shield.cairo layout — the circuit
+/// must compute `intent = shield_intent(auth_domain, v, fee, producer_fee,
+/// cm, producer_cm, mh, producer_mh)` and assert it equals the public
+/// `deposit_id` output. The witness no longer carries a `deposit_secret`;
+/// instead the prover gets the full note material for both the recipient
+/// and producer-fee notes, which the L1 deposit's `intent` already binds.
+/// Until the Cairo circuit is updated to match, regenerating the bridge
+/// fixture from this binary will fail at the in-circuit assertion.
+#[allow(clippy::too_many_arguments)]
 fn generate_shield_proof(
     program_hashes: &ProgramHashes,
-    sender: &str,
+    auth_domain: &F,
+    _sender: &str,
     amount: u64,
     fee: u64,
     producer_fee: u64,
@@ -293,19 +315,21 @@ fn generate_shield_proof(
     producer_enc: &EncryptedNote,
     producer_cm: F,
 ) -> Result<Proof, String> {
-    let deposit_secret = deposit_secret_from_label(sender);
-    let deposit_id = deposit_id_from_secret(&deposit_secret);
+    let mh = memo_ct_hash(enc);
+    let producer_mh = memo_ct_hash(producer_enc);
+    let intent =
+        tzel_core::shield_intent(auth_domain, amount, fee, producer_fee, &cm, &producer_cm, &mh, &producer_mh);
     let args = vec![
         felt_u64_to_hex(19),
+        felt_to_hex(auth_domain),
         felt_u64_to_hex(amount),
         felt_u64_to_hex(fee),
         felt_u64_to_hex(producer_fee),
         felt_to_hex(&cm),
         felt_to_hex(&producer_cm),
-        felt_to_hex(&deposit_id),
-        felt_to_hex(&memo_ct_hash(enc)),
-        felt_to_hex(&memo_ct_hash(producer_enc)),
-        felt_to_hex(&deposit_secret),
+        felt_to_hex(&intent),
+        felt_to_hex(&mh),
+        felt_to_hex(&producer_mh),
         felt_to_hex(&address.auth_root),
         felt_to_hex(&address.auth_pub_seed),
         felt_to_hex(&address.nk_tag),

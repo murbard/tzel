@@ -34,15 +34,28 @@ type proof_bundle = {
   output_preimage : Felt.t list;
 }
 
-(* Witness for shield circuit *)
+(* Per-note witness inside a shield (recipient or producer). *)
+type shield_note_witness = {
+  snw_d_j : Felt.t;
+  snw_rseed : Felt.t;
+  snw_auth_root : Felt.t;
+  snw_auth_pub_seed : Felt.t;
+  snw_nk_tag : Felt.t;
+}
+
+(* Witness for shield circuit. The shield is intent-bound: the deposit_id
+   public output is recomputed inside the circuit as the sighash_fold over
+   every other public output, so the witness exposes everything needed to
+   rebuild both the recipient and producer commitments. *)
 type shield_witness = {
-  sw_d_j : Felt.t;
+  sw_auth_domain : Felt.t;
   sw_v : int64;
-  sw_rseed : Felt.t;
-  sw_auth_root : Felt.t;
-  sw_nk_tag : Felt.t;
-  sw_sender_string : string;
+  sw_fee : int64;
+  sw_producer_fee : int64;
+  sw_recipient : shield_note_witness;
+  sw_producer : shield_note_witness;
   sw_memo_ct_hash : Felt.t;
+  sw_producer_memo_ct_hash : Felt.t;
 }
 
 (* Per-input witness for transfer/unshield *)
@@ -91,15 +104,26 @@ let felt_to_json f = `String (Felt.to_hex f)
 let felt_array_to_json arr =
   `List (Array.to_list (Array.map felt_to_json arr))
 
+let shield_note_witness_to_json (n : shield_note_witness) =
+  `Assoc [
+    "d_j", felt_to_json n.snw_d_j;
+    "rseed", felt_to_json n.snw_rseed;
+    "auth_root", felt_to_json n.snw_auth_root;
+    "auth_pub_seed", felt_to_json n.snw_auth_pub_seed;
+    "nk_tag", felt_to_json n.snw_nk_tag;
+  ]
+
 let shield_witness_to_json w =
   `Assoc [
-    "d_j", felt_to_json w.sw_d_j;
+    "type", `String "shield";
+    "auth_domain", felt_to_json w.sw_auth_domain;
     "v", `String (Int64.to_string w.sw_v);
-    "rseed", felt_to_json w.sw_rseed;
-    "auth_root", felt_to_json w.sw_auth_root;
-    "nk_tag", felt_to_json w.sw_nk_tag;
-    "sender_string", `String w.sw_sender_string;
+    "fee", `String (Int64.to_string w.sw_fee);
+    "producer_fee", `String (Int64.to_string w.sw_producer_fee);
+    "recipient", shield_note_witness_to_json w.sw_recipient;
+    "producer", shield_note_witness_to_json w.sw_producer;
     "memo_ct_hash", felt_to_json w.sw_memo_ct_hash;
+    "producer_memo_ct_hash", felt_to_json w.sw_producer_memo_ct_hash;
   ]
 
 let spend_witness_to_json w =

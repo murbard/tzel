@@ -21,7 +21,7 @@ Privacy on blockchains today relies on elliptic curve cryptography that quantum 
 ### How it works
 
 A UTXO-based private transaction system where:
-- **Deposits** credit a namespaced secret-bound rollup deposit key; `shield` proves knowledge of the underlying deposit secret and moves that value into private notes
+- **Deposits** credit a namespaced *intent-bound* rollup deposit key whose hash commits to the entire shield (recipient note, producer-fee note, fees, auth_domain). `shield` opens the preimage and consumes the deposit. Because every prover-rewritable field is folded into the deposit_id, shield is **safe to delegate to an untrusted prover** — no in-circuit signature is required.
 - **Transfers** spend 1-7 private notes and create recipient, change, and DAL-producer fee notes
 - **Withdrawals** (unshield) destroy private notes, release value publicly, and create a DAL-producer fee note plus optional change
 - **Every shield / transfer / unshield burns at least 100000 mutez (0.1 tez)**, with a simple per-level stepped fee under congestion in the current rollup deployment
@@ -40,11 +40,13 @@ cd cairo && scarb build && cd ..
 # If you launch it from elsewhere, also pass --executables-dir /abs/path/to/cairo/target/dev
 target/release/sp-ledger --port 8080 --reprove-bin apps/prover/target/release/reprove &
 
-# Run the developer/test wallet harness
+# Run the developer/test wallet harness. The `shield` command builds the
+# recipient + producer-fee notes, computes the intent-bound deposit_id, funds
+# the local ledger's `deposit:<intent>` balance for exactly the bound debit,
+# then proves and submits.
 target/release/sp-client -w alice.json keygen
 target/release/sp-client -w producer.json keygen
 target/release/sp-client -w producer.json address | sed -n '2,$p' > producer-address.json
-target/release/sp-client -w alice.json fund -l http://localhost:8080 --addr alice --amount 300002
 target/release/sp-client -w alice.json shield -l http://localhost:8080 --sender alice --amount 200001 --dal-fee 1 --dal-fee-address producer-address.json
 target/release/sp-client -w alice.json scan -l http://localhost:8080
 target/release/sp-client -w alice.json balance
@@ -64,7 +66,7 @@ For deployment-oriented installs with standard paths instead of a workspace chec
 
 > **WARNING:** The ledger refuses to start unless you pass either `--reprove-bin` (verified STARK proofs) or `--trust-me-bro` (development only, no cryptographic verification). In verified mode it also authenticates the expected `run_shield` / `run_transfer` / `run_unshield` executable hashes from `--executables-dir` (default `cairo/target/dev`). `--trust-me-bro` is never appropriate for real value.
 >
-> **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, and memo-hash checks. For local shield testing, `sp-client fund --addr alice` and `sp-client shield --sender alice` deterministically derive a secret-bound deposit id from the label `alice`. The public-balance layer is not a network-authenticated account service and should not be exposed as a real public endpoint.
+> **REFERENCE IMPLEMENTATION NOTE:** `sp-ledger` is a localhost demo / reference implementation of the proof, nullifier, root, commitment, intent-binding, and memo-hash checks. For local shield testing, `sp-client shield` builds both the recipient and producer-fee notes client-side, computes the shield intent over them, and funds `deposit:<hex(intent)>` for exactly the bound amount before submitting. The public-balance layer is not a network-authenticated account service and should not be exposed as a real public endpoint.
 >
 > **DEVELOPER WALLET NOTE:** `sp-client` is a developer/reference CLI used for local testing, demos, and integration flows. It persists plaintext secrets and wallet state in local JSON files and is not intended to be a hardened end-user wallet.
 
@@ -195,7 +197,7 @@ It:
 - reads raw inbox messages from the WASM host
 - persists basic durable state for inbox stats and the last message seen
 - decodes Tezos Data Encoding inbox messages into shared TzEL request types
-- treats `transfer` as the only fully internal rollup transaction, with `deposit`/`shield` and `unshield`/`withdraw` handling rollup ingress and egress around it
+- treats `transfer` as the only fully internal rollup transaction, with bridge-`deposit` + `shield` handling rollup ingress and `unshield` (which directly emits an L1-outbox transfer to the depositor's tz/KT1 recipient) handling egress
 - applies the shared transition logic from `tzel-core`
 - persists path-addressed durable state for notes, bridge balances, roots, nullifiers, and the commitment-tree frontier
 - verifies proofs through the shared verifier path without linking prover code
