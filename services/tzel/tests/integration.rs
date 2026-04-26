@@ -609,26 +609,6 @@ fn test_e2e_trust_me_bro() {
         assert!(ok, "alice balance 2: {}", out);
         assert!(out.contains("Private balance: 0"));
 
-        // ── Public balances remain empty after direct withdrawal ────
-        let resp: serde_json::Value = ureq::get(&format!("{}/balances", l))
-            .call()
-            .unwrap()
-            .into_body()
-            .read_json()
-            .unwrap();
-        let balances = resp.get("balances").unwrap();
-        assert_eq!(
-            balances.get("alice").and_then(|v| v.as_u64()).unwrap_or(0),
-            0
-        );
-        assert_eq!(
-            balances
-                .get(TEST_L1_RECIPIENT)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            0
-        );
-
         // ── Tree integrity ──────────────────────────────────────────
         let tree: serde_json::Value = ureq::get(&format!("{}/tree", l))
             .call()

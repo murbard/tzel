@@ -77,6 +77,7 @@ fn signed_verifier_message(
     shield: String,
     transfer: String,
     unshield: String,
+    operator_producer_owner_tag: String,
 ) -> KernelInboxMessage {
     let ask = config_admin_ask();
     KernelInboxMessage::ConfigureVerifier(
@@ -89,6 +90,7 @@ fn signed_verifier_message(
                     transfer: parse_felt(&transfer),
                     unshield: parse_felt(&unshield),
                 },
+                operator_producer_owner_tag: parse_felt(&operator_producer_owner_tag),
             },
         )
         .expect("verifier config should sign"),
@@ -160,12 +162,21 @@ fn main() {
             let Some(unshield) = args.next() else {
                 usage();
             };
+            let Some(operator_owner_tag) = args.next() else {
+                usage();
+            };
             if args.next().is_some() {
                 usage();
             }
             emit_targeted_message(
                 &rollup_address,
-                &signed_verifier_message(auth_domain, shield, transfer, unshield),
+                &signed_verifier_message(
+                    auth_domain,
+                    shield,
+                    transfer,
+                    unshield,
+                    operator_owner_tag,
+                ),
             );
         }
         "raw-configure-bridge" => {
@@ -190,6 +201,9 @@ fn main() {
             let Some(unshield) = args.next() else {
                 usage();
             };
+            let Some(operator_owner_tag) = args.next() else {
+                usage();
+            };
             if args.next().is_some() {
                 usage();
             }
@@ -198,6 +212,7 @@ fn main() {
                 shield,
                 transfer,
                 unshield,
+                operator_owner_tag,
             ));
         }
         "dal-pointer" => {

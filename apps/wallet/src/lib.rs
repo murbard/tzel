@@ -9,8 +9,8 @@ use tezos_smart_rollup_encoding::{
     smart_rollup::SmartRollupAddress,
 };
 use tzel_services::kernel_wire::{
-    encode_kernel_inbox_message, KernelInboxMessage, KernelShieldReq, KernelStarkProof,
-    KernelTransferReq, KernelUnshieldReq,
+    decode_kernel_verifier_config, encode_kernel_inbox_message, KernelInboxMessage,
+    KernelShieldReq, KernelStarkProof, KernelTransferReq, KernelUnshieldReq,
 };
 use tzel_services::operator_api::{
     RollupSubmission, RollupSubmissionKind, RollupSubmissionStatus, RollupSubmissionTransport,
@@ -545,6 +545,13 @@ struct PendingDeposit {
     /// observes a slot for `deposit_id` whose amount equals `amount`. Until
     /// then, shield is blocked because the kernel needs the slot id.
     slot_id: Option<u64>,
+    /// True once the wallet has observed the recipient note in the
+    /// commitment tree (the shield landed). The deposit is kept in
+    /// `pending_deposits` so the wallet can detect orphan slots — open
+    /// kernel-side slots for the same intent that the wallet's own shield
+    /// did not consume (e.g., because an attacker's mirror-debit deposit
+    /// landed first). The witness is still needed to drain such orphans.
+    settled: bool,
 }
 
 const WATCH_WALLET_VERSION: u16 = 1;
@@ -1739,6 +1746,7 @@ const DURABLE_BALANCE_PREFIX: &str = "/tzel/v1/state/balances/by-key/";
 const DURABLE_DEPOSIT_BY_INTENT_PREFIX: &str = "/tzel/v1/state/deposits/by-intent/";
 const DURABLE_DEPOSIT_SLOT_PREFIX: &str = "/tzel/v1/state/deposits/by-id/";
 const DURABLE_VERIFIER_CONFIG: &str = "/tzel/v1/state/verifier_config.bin";
+const DURABLE_BRIDGE_TICKETER: &str = "/tzel/v1/state/bridge/ticketer";
 
 #[derive(Debug, Clone)]
 struct RollupSubmissionReceipt {
@@ -1973,6 +1981,17 @@ impl<'a> RollupRpc<'a> {
         let mut out = [0u8; 8];
         out.copy_from_slice(&bytes);
         Ok(u64::from_le_bytes(out))
+    }
+
+    fn read_optional_durable_bytes_at_block(
+        &self,
+        block_ref: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, String> {
+        if self.read_durable_length_at_block(block_ref, key)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(self.read_durable_bytes_at_block(block_ref, key)?))
     }
 
     fn read_optional_u64_at_block(
@@ -2310,6 +2329,89 @@ impl<'a> RollupRpc<'a> {
                     .into(),
             ),
         }
+    }
+
+    /// Read the operator's canonical producer-fee owner_tag from the
+    /// kernel's verifier config. Returns `None` if the verifier has not
+    /// been configured.
+    fn read_operator_producer_owner_tag(&self, block_ref: &str) -> Result<Option<F>, String> {
+        let Some(bytes) =
+            self.read_optional_durable_bytes_at_block(block_ref, DURABLE_VERIFIER_CONFIG)?
+        else {
+            return Ok(None);
+        };
+        // Decode the kernel verifier config to extract the operator's
+        // expected producer owner_tag.
+        let cfg = decode_kernel_verifier_config(&bytes)
+            .map_err(|e| format!("kernel verifier config decode: {}", e))?;
+        Ok(Some(cfg.operator_producer_owner_tag))
+    }
+
+    /// Confirm `wallet_dal_fee_owner_tag` matches the rollup-published
+    /// operator-producer owner_tag. Refuses if the rollup has the field
+    /// set non-zero AND it disagrees with the wallet's. A zero (unset)
+    /// rollup-side value means the operator hasn't published an expected
+    /// owner_tag — accept the wallet's choice but warn.
+    fn ensure_operator_producer_owner_tag_matches(
+        &self,
+        block_ref: &str,
+        wallet_dal_fee_owner_tag: &F,
+    ) -> Result<(), String> {
+        let Some(rollup_tag) = self.read_operator_producer_owner_tag(block_ref)? else {
+            return Err(
+                "rollup verifier is not configured yet — refusing to send a deposit/unshield."
+                    .into(),
+            );
+        };
+        if rollup_tag == ZERO {
+            eprintln!(
+                "WARNING: rollup operator has not published an expected producer owner_tag; \
+                 wallet profile is the only source of truth for the DAL fee receiver."
+            );
+            return Ok(());
+        }
+        if rollup_tag != *wallet_dal_fee_owner_tag {
+            return Err(format!(
+                "wallet profile dal_fee_address owner_tag ({}) does not match the rollup's \
+                 published operator_producer_owner_tag ({}); refusing to route producer fees \
+                 to a non-operator receiver. Update the wallet profile or the rollup config.",
+                hex::encode(wallet_dal_fee_owner_tag),
+                hex::encode(&rollup_tag),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Confirm the rollup's configured bridge ticketer matches the
+    /// wallet's profile-supplied `bridge_ticketer`. The kernel rejects
+    /// deposits whose `transfer.sender` doesn't match its configured
+    /// ticketer, so submitting an L1 ticket against a different bridge
+    /// would burn real mutez to a slot that never appears.
+    fn ensure_bridge_ticketer_matches(
+        &self,
+        block_ref: &str,
+        expected_ticketer: &str,
+    ) -> Result<(), String> {
+        let bytes = match self.read_durable_length_at_block(block_ref, DURABLE_BRIDGE_TICKETER)? {
+            Some(_) => self.read_durable_bytes_at_block(block_ref, DURABLE_BRIDGE_TICKETER)?,
+            None => {
+                return Err(
+                    "rollup bridge ticketer is not configured yet — refusing to send a bridge \
+                     deposit. The kernel rejects deposits before bridge configuration."
+                        .into(),
+                )
+            }
+        };
+        let configured =
+            String::from_utf8(bytes).map_err(|_| "stored bridge ticketer is not UTF-8")?;
+        if configured != expected_ticketer {
+            return Err(format!(
+                "wallet profile's bridge_ticketer {} does not match the rollup's configured \
+                 ticketer {}; refusing to send a bridge deposit that the kernel would reject.",
+                expected_ticketer, configured
+            ));
+        }
+        Ok(())
     }
 
     fn load_state_snapshot(&self) -> Result<RollupStateSnapshot, String> {
@@ -3143,6 +3245,17 @@ enum UserCmd {
         #[arg(long)]
         recipient: Option<String>,
     },
+    /// Drain an orphan deposit slot — an open kernel slot for an intent we
+    /// know that some other shield (e.g., an attacker's mirror-debit
+    /// deposit) didn't consume. Reuses the witness from the matching
+    /// settled deposit; produces a duplicate recipient cm in the tree at a
+    /// fresh position. Privacy-cost: two leaves with the same cm are
+    /// publicly correlatable.
+    DrainOrphanSlot {
+        /// Slot id (as reported by `tzel-wallet sync`).
+        #[arg(long)]
+        slot_id: u64,
+    },
     /// Query a submission previously accepted by the configured operator.
     Status {
         #[arg(long)]
@@ -3340,7 +3453,8 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         | UserCmd::Deposit { .. }
         | UserCmd::Shield { .. }
         | UserCmd::Send { .. }
-        | UserCmd::Unshield { .. } => Some(acquire_wallet_lock(&cli.wallet)?),
+        | UserCmd::Unshield { .. }
+        | UserCmd::DrainOrphanSlot { .. } => Some(acquire_wallet_lock(&cli.wallet)?),
         UserCmd::Profile { .. }
         | UserCmd::Balance
         | UserCmd::Check
@@ -3422,6 +3536,10 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::Status { submission_id } => {
             let profile = load_required_network_profile(&cli.wallet)?;
             cmd_operator_status(&profile, &submission_id)
+        }
+        UserCmd::DrainOrphanSlot { slot_id } => {
+            let profile = load_required_network_profile(&cli.wallet)?;
+            cmd_drain_orphan_slot(&cli.wallet, &profile, slot_id, &pc)
         }
         UserCmd::ExportDetect { out } => cmd_export_detect(&cli.wallet, out.as_deref()),
         UserCmd::ExportView { out } => cmd_export_view(&cli.wallet, out.as_deref()),
@@ -3911,6 +4029,11 @@ struct ScanSummary {
     confirmed_pending: usize,
     settled_deposits: usize,
     slot_assignments: usize,
+    /// Open kernel slots for an intent we know (settled deposit) that we
+    /// did NOT consume — typically created when an attacker mirror-deposits
+    /// to the same recipient string with the same debit. They hold real L1
+    /// mutez backed by the bridge.
+    orphan_slots: usize,
 }
 
 /// One open kernel-side deposit slot, keyed by intent.
@@ -3968,15 +4091,42 @@ fn apply_scan_feed(
         }
     }
 
-    // Retire pending_deposits whose recipient commitment now exists in the
-    // visible tree (i.e., the shield landed). The recipient note must have
-    // been recovered into `w.notes` for this to fire — sufficient evidence
-    // that the deposit was drained into a private note we can spend.
+    // Mark pending_deposits whose recipient commitment now exists in the
+    // visible tree as settled (shield landed). The deposit stays in the
+    // wallet so we can detect orphan slots for the same intent — open
+    // kernel slots that some other shield (e.g., an attacker's
+    // mirror-debit) didn't consume but that still hold L1 mutez.
     let live_cms: std::collections::HashSet<F> = w.notes.iter().map(|n| n.cm).collect();
-    let before_deposits = w.pending_deposits.len();
-    w.pending_deposits
-        .retain(|d| !live_cms.contains(&d.recipient.cm));
-    let settled_deposits = before_deposits - w.pending_deposits.len();
+    let mut settled_deposits = 0usize;
+    for d in w.pending_deposits.iter_mut() {
+        if !d.settled && live_cms.contains(&d.recipient.cm) {
+            d.settled = true;
+            settled_deposits += 1;
+        }
+    }
+
+    // Orphan-slot detection: for each settled deposit, count slots in
+    // slots_by_intent that the wallet hasn't claimed via slot_id. Settled
+    // deposits with no orphans don't need user attention; ones with
+    // orphans warrant a `tzel-wallet drain-orphan-slot` call.
+    let claimed_slot_ids: std::collections::HashSet<(F, u64)> = w
+        .pending_deposits
+        .iter()
+        .filter_map(|d| d.slot_id.map(|id| (d.deposit_id, id)))
+        .collect();
+    let mut orphan_slots = 0usize;
+    for d in w.pending_deposits.iter() {
+        if !d.settled {
+            continue;
+        }
+        if let Some(open) = slots_by_intent.get(&d.deposit_id) {
+            for slot in open {
+                if !claimed_slot_ids.contains(&(d.deposit_id, slot.id)) {
+                    orphan_slots += 1;
+                }
+            }
+        }
+    }
 
     w.scanned = feed.next_cursor;
     ScanSummary {
@@ -3985,6 +4135,7 @@ fn apply_scan_feed(
         confirmed_pending: before_pending - w.pending_spends.len(),
         settled_deposits,
         slot_assignments,
+        orphan_slots,
     }
 }
 
@@ -5695,6 +5846,7 @@ mod tests {
             amount: 78,
             operation_hash: Some("opHash".into()),
             slot_id: None,
+            settled: false,
         });
 
         let feed = NotesFeedResp {
@@ -5704,7 +5856,10 @@ mod tests {
         let summary = apply_scan_feed(&mut w, &feed, vec![], &Default::default());
         assert_eq!(summary.found, 1);
         assert_eq!(summary.settled_deposits, 1);
-        assert!(w.pending_deposits.is_empty());
+        // The deposit stays in the wallet (not removed) so we can detect
+        // orphan slots later. It's now flagged settled.
+        assert_eq!(w.pending_deposits.len(), 1);
+        assert!(w.pending_deposits[0].settled);
         assert_eq!(w.notes.len(), 1);
     }
 
@@ -5743,6 +5898,7 @@ mod tests {
             amount: 78,
             operation_hash: Some("opHash".into()),
             slot_id: None,
+            settled: false,
         });
 
         // Empty feed: shield has not landed yet.
@@ -5753,6 +5909,68 @@ mod tests {
         let summary = apply_scan_feed(&mut w, &feed, vec![], &Default::default());
         assert_eq!(summary.settled_deposits, 0);
         assert_eq!(w.pending_deposits.len(), 1);
+    }
+
+    #[test]
+    fn test_apply_scan_feed_detects_orphan_slot_after_settlement() {
+        // After the recipient note lands (settled), an UNCLAIMED open slot
+        // for the same intent is reported as an orphan. This is the
+        // mirror-debit attack signature: attacker mirror-deposits, the
+        // wallet's shield consumes one slot (could be either), the
+        // recipient cm appears in the tree, the OTHER slot remains open.
+        let mut w = test_wallet(1);
+        let rseed = felt_tag(b"orphan-detect");
+        let nm = note_memo_for_wallet_address(&w, 0, 77, rseed, None);
+        let intent = hash(b"orphan-detect-intent");
+        let addr = &w.addresses[0];
+        w.pending_deposits.push(PendingDeposit {
+            deposit_id: intent,
+            auth_domain: hash(b"auth-domain"),
+            v: 77,
+            fee: 0,
+            producer_fee: 1,
+            recipient: ShieldNoteWitness {
+                d_j: addr.d_j,
+                rseed,
+                auth_root: addr.auth_root,
+                auth_pub_seed: addr.auth_pub_seed,
+                nk_tag: addr.nk_tag,
+                cm: nm.cm,
+                enc: nm.enc.clone(),
+            },
+            producer: ShieldNoteWitness {
+                d_j: addr.d_j,
+                rseed: felt_tag(b"producer-rseed-orphan"),
+                auth_root: addr.auth_root,
+                auth_pub_seed: addr.auth_pub_seed,
+                nk_tag: addr.nk_tag,
+                cm: hash(b"producer-cm-orphan"),
+                enc: nm.enc.clone(),
+            },
+            amount: 78,
+            operation_hash: Some("opHash".into()),
+            slot_id: Some(7), // wallet claimed slot 7
+            settled: false,
+        });
+
+        // Sync sees: slot 7 (claimed) + slot 9 (orphan, attacker's), plus
+        // recipient note lands → settled flag flips → slot 9 is reported.
+        let feed = NotesFeedResp {
+            notes: vec![nm],
+            next_cursor: 1,
+        };
+        let mut slots = std::collections::HashMap::new();
+        slots.insert(
+            intent,
+            vec![
+                DepositSlotView { id: 7, amount: 78 },
+                DepositSlotView { id: 9, amount: 78 },
+            ],
+        );
+        let summary = apply_scan_feed(&mut w, &feed, vec![], &slots);
+        assert_eq!(summary.settled_deposits, 1);
+        assert_eq!(summary.orphan_slots, 1);
+        assert!(w.pending_deposits[0].settled);
     }
 
     #[test]
@@ -6217,38 +6435,34 @@ fn cmd_user_balance(path: &str) -> Result<(), String> {
     if profile_path.exists() {
         let profile = load_network_profile(&profile_path)?;
         let rollup = RollupRpc::new(&profile);
-        let balances = rollup.load_balances()?;
-        let public_account = resolved_profile_public_balance_key(&profile, &rollup)?;
-        let public_balance = balances.get(&public_account).copied().unwrap_or(0);
-        let legacy_public_balance = legacy_plain_public_balance_label(&profile, &public_account)
-            .map(|legacy| (legacy.clone(), balances.get(&legacy).copied().unwrap_or(0)));
-        let pending_deposit_balance = w
+        // Pending-deposit reporting is slot-based: for each tracked
+        // PendingDeposit, sum the amount IF the kernel has assigned a slot
+        // (slot_id is Some). Unassigned pending deposits are reported
+        // separately as "awaiting slot assignment" — they contribute
+        // nothing yet because the kernel hasn't observed the L1 ticket.
+        let assigned_total: u64 = w
             .pending_deposits
             .iter()
-            .map(|deposit| {
-                balances
-                    .get(&deposit_recipient_string(&deposit.deposit_id))
-                    .copied()
-                    .unwrap_or(0)
-            })
-            .sum::<u64>();
+            .filter(|d| d.slot_id.is_some())
+            .map(|d| d.amount)
+            .sum();
+        let unassigned_count = w
+            .pending_deposits
+            .iter()
+            .filter(|d| d.slot_id.is_none())
+            .count();
+        let assigned_count = w.pending_deposits.len() - unassigned_count;
         println!(
-            "Public rollup balance ({}): {}",
-            public_account, public_balance
+            "Pending shield deposits assigned: {} mutez across {} deposit(s)",
+            assigned_total, assigned_count
         );
-        if let Some((legacy_label, legacy_balance)) = legacy_public_balance {
-            if legacy_balance > 0 {
-                println!(
-                    "Legacy unowned public balance ({}): {}",
-                    legacy_label, legacy_balance
-                );
-            }
+        if unassigned_count > 0 {
+            println!(
+                "Pending shield deposits awaiting slot assignment: {}",
+                unassigned_count
+            );
         }
-        println!(
-            "Secret-bound deposit balance: {} across {} pending deposits",
-            pending_deposit_balance,
-            w.pending_deposits.len()
-        );
+        let _ = rollup;
     }
     Ok(())
 }
@@ -6261,21 +6475,18 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
     let auth_domain = snapshot.auth_domain;
     let tree_size = snapshot.tree.leaves.len();
     let required_tx_fee = snapshot.required_tx_fee;
-    let balances = rollup.load_balances_at_block(&head_hash)?;
-    let public_account = resolved_profile_public_balance_key(profile, &rollup)?;
-    let public_balance = balances.get(&public_account).copied().unwrap_or(0);
-    let legacy_public_balance = legacy_plain_public_balance_label(profile, &public_account)
-        .map(|legacy| (legacy.clone(), balances.get(&legacy).copied().unwrap_or(0)));
-    let pending_deposit_balance = wallet
+    let assigned_total: u64 = wallet
         .pending_deposits
         .iter()
-        .map(|deposit| {
-            balances
-                .get(&deposit_recipient_string(&deposit.deposit_id))
-                .copied()
-                .unwrap_or(0)
-        })
-        .sum::<u64>();
+        .filter(|d| d.slot_id.is_some())
+        .map(|d| d.amount)
+        .sum();
+    let unassigned_count = wallet
+        .pending_deposits
+        .iter()
+        .filter(|d| d.slot_id.is_none())
+        .count();
+    let assigned_count = wallet.pending_deposits.len() - unassigned_count;
 
     println!("Wallet file: {}", path);
     println!("Network: {}", profile.network);
@@ -6294,22 +6505,15 @@ fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), St
         wallet.scanned
     );
     println!(
-        "Public rollup balance ({}): {}",
-        public_account, public_balance
+        "Pending shield deposits assigned: {} mutez across {} deposit(s)",
+        assigned_total, assigned_count
     );
-    if let Some((legacy_label, legacy_balance)) = legacy_public_balance {
-        if legacy_balance > 0 {
-            println!(
-                "Legacy unowned public balance ({}): {}",
-                legacy_label, legacy_balance
-            );
-        }
+    if unassigned_count > 0 {
+        println!(
+            "Pending shield deposits awaiting slot assignment: {}",
+            unassigned_count
+        );
     }
-    println!(
-        "Secret-bound deposit balance: {} across {} pending deposits",
-        pending_deposit_balance,
-        wallet.pending_deposits.len()
-    );
 
     if let Some(operator_url) = &profile.operator_url {
         let health_url = format!("{}/healthz", operator_url.trim_end_matches('/'));
@@ -6336,24 +6540,27 @@ fn cmd_rollup_sync(path: &str, profile: &WalletNetworkProfile) -> Result<(), Str
     let slots_by_intent = rollup.load_slot_map(&w.pending_deposits)?;
     let summary = apply_scan_feed(&mut w, &feed, nullifiers, &slots_by_intent);
     save_wallet(path, &w)?;
-    let balances = rollup.load_balances()?;
-    let public_account = resolved_profile_public_balance_key(profile, &rollup)?;
-    let public_balance = balances.get(&public_account).copied().unwrap_or(0);
-    let pending_deposit_total: u64 = w
+    let pending_assigned_total: u64 = w
         .pending_deposits
         .iter()
-        .map(|deposit| deposit.amount)
+        .filter(|d| d.slot_id.is_some())
+        .map(|d| d.amount)
         .sum();
+    let pending_unassigned_count = w
+        .pending_deposits
+        .iter()
+        .filter(|d| d.slot_id.is_none())
+        .count();
     println!(
-        "Synced: {} new notes, {} spent removed, {} pending confirmed, {} deposits settled, {} slots assigned, private_available={}, public_balance={}, pending_deposit_total={}",
+        "Synced: {} new notes, {} spent removed, {} pending confirmed, {} deposits settled, {} slots assigned, private_available={}, pending_assigned_total={}, pending_awaiting_slot={}",
         summary.found,
         summary.spent,
         summary.confirmed_pending,
         summary.settled_deposits,
         summary.slot_assignments,
         w.available_balance(),
-        public_balance,
-        pending_deposit_total
+        pending_assigned_total,
+        pending_unassigned_count,
     );
     Ok(())
 }
@@ -6435,15 +6642,20 @@ fn cmd_bridge_deposit(
         OutgoingNoteRole::ProducerFee,
     )?;
 
-    // Refuse to send the L1 ticket if the rollup has not yet been
-    // verifier-configured. The kernel's `validate_bridge_deposit` rejects
-    // pre-config tickets (intent commits to auth_domain, which the first
-    // ConfigureVerifier may overwrite), so submitting now would burn real
-    // mutez to a slot that the kernel will never allocate. The
-    // `auth_domain` read above succeeds even on a fresh rollup because of
-    // `ensure_initialized()` defaults — only the explicit verifier-config
-    // probe distinguishes "configured" from "boot defaults".
+    // Refuse to send the L1 ticket unless the rollup is fully configured,
+    // its bridge ticketer matches our profile, AND the producer-fee
+    // receiver our profile claims matches what the operator published in
+    // the rollup's verifier config. The kernel does not enforce
+    // producer-fee routing in-circuit; the wallet-side gate keeps a
+    // misconfigured profile from silently routing fees to an attacker.
     rollup.ensure_verifier_configured(&head_hash)?;
+    rollup.ensure_bridge_ticketer_matches(&head_hash, &profile.bridge_ticketer)?;
+    let wallet_dal_owner_tag = owner_tag(
+        &profile.dal_fee_address.auth_root,
+        &profile.dal_fee_address.auth_pub_seed,
+        &profile.dal_fee_address.nk_tag,
+    );
+    rollup.ensure_operator_producer_owner_tag_matches(&head_hash, &wallet_dal_owner_tag)?;
 
     let intent = shield_intent(
         &auth_domain,
@@ -6494,6 +6706,7 @@ fn cmd_bridge_deposit(
         amount: debit,
         operation_hash: None,
         slot_id: None,
+        settled: false,
     };
     wallet.pending_deposits.push(pending);
     save_wallet(path, &wallet)?;
@@ -7321,6 +7534,120 @@ fn cmd_shield_rollup(
     Ok(())
 }
 
+/// Drain an orphan deposit slot. Looks up the slot's intent on the rollup,
+/// finds the matching settled PendingDeposit (which must still hold the
+/// witness), and submits a fresh shield consuming that slot. The result is
+/// a duplicate recipient cm in the tree at a new tree position with a
+/// distinct nullifier — fully spendable, but publicly correlatable with
+/// the original recipient note.
+fn cmd_drain_orphan_slot(
+    path: &str,
+    profile: &WalletNetworkProfile,
+    slot_id: u64,
+    pc: &ProveConfig,
+) -> Result<(), String> {
+    let wallet = load_wallet(path)?;
+    let rollup = RollupRpc::new(profile);
+    let head_hash = rollup.head_hash()?;
+    // Read the slot's intent and amount directly from durable storage.
+    let (slot_amount, slot_status) = rollup
+        .try_read_deposit_slot(&head_hash, slot_id)?
+        .ok_or_else(|| format!("deposit slot {} does not exist on the rollup", slot_id))?;
+    if slot_status != 0 {
+        return Err(format!(
+            "deposit slot {} is already consumed (tombstoned)",
+            slot_id
+        ));
+    }
+    // Find the wallet's settled deposit whose intent / amount matches the
+    // slot. We require `settled` to ensure the user has already received the
+    // bound recipient note (i.e., this is unambiguously an orphan, not an
+    // unobserved fresh deposit).
+    let pending = wallet
+        .pending_deposits
+        .iter()
+        .find(|d| d.settled && d.amount == slot_amount && d.slot_id != Some(slot_id))
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "no settled deposit witness in wallet matches slot {} (amount {} mutez). \
+                 Run `tzel-wallet sync` first; if the slot was never witness-tracked by \
+                 this wallet, it cannot be drained.",
+                slot_id, slot_amount
+            )
+        })?;
+
+    // Sanity: recompute the intent and confirm slot.intent == that.
+    let recomputed = shield_intent(
+        &pending.auth_domain,
+        pending.v,
+        pending.fee,
+        pending.producer_fee,
+        &pending.recipient.cm,
+        &pending.producer.cm,
+        &memo_ct_hash(&pending.recipient.enc),
+        &memo_ct_hash(&pending.producer.enc),
+    );
+    if recomputed != pending.deposit_id {
+        return Err(
+            "wallet's settled-deposit witness no longer reproduces deposit_id; refusing to drain.".into(),
+        );
+    }
+
+    eprintln!(
+        "Draining orphan slot {} (intent {}, amount {} mutez). Note: this re-shields the \
+         original recipient cm at a new tree position. The two leaves are publicly correlatable.",
+        slot_id,
+        deposit_id_hex(&pending.deposit_id),
+        slot_amount
+    );
+
+    let args: Vec<String> = vec![
+        felt_to_hex(&pending.auth_domain),
+        felt_u64_to_hex(pending.v),
+        felt_u64_to_hex(pending.fee),
+        felt_u64_to_hex(pending.producer_fee),
+        felt_to_hex(&pending.recipient.cm),
+        felt_to_hex(&pending.producer.cm),
+        felt_to_hex(&pending.deposit_id),
+        felt_to_hex(&memo_ct_hash(&pending.recipient.enc)),
+        felt_to_hex(&memo_ct_hash(&pending.producer.enc)),
+        felt_to_hex(&pending.recipient.auth_root),
+        felt_to_hex(&pending.recipient.auth_pub_seed),
+        felt_to_hex(&pending.recipient.nk_tag),
+        felt_to_hex(&pending.recipient.d_j),
+        felt_to_hex(&pending.recipient.rseed),
+        felt_to_hex(&pending.producer.auth_root),
+        felt_to_hex(&pending.producer.auth_pub_seed),
+        felt_to_hex(&pending.producer.nk_tag),
+        felt_to_hex(&pending.producer.d_j),
+        felt_to_hex(&pending.producer.rseed),
+    ];
+    let proof = pc.make_proof("run_shield", &args)?;
+    let req = ShieldReq {
+        deposit_id: pending.deposit_id,
+        deposit_slot: slot_id,
+        v: pending.v,
+        fee: pending.fee,
+        producer_fee: pending.producer_fee,
+        proof,
+        client_cm: pending.recipient.cm,
+        client_enc: pending.recipient.enc.clone(),
+        producer_cm: pending.producer.cm,
+        producer_enc: pending.producer.enc.clone(),
+    };
+    let kernel_req = shield_req_to_kernel(&req)?;
+    let submission = rollup.submit_kernel_message(&KernelInboxMessage::Shield(kernel_req))?;
+    println!(
+        "Submitted orphan-slot drain (slot {}, intent {})",
+        slot_id,
+        deposit_id_hex(&pending.deposit_id),
+    );
+    print_rollup_submission(&submission);
+    print_rollup_sync_hint(&submission);
+    Ok(())
+}
+
 fn cmd_transfer_rollup(
     path: &str,
     profile: &WalletNetworkProfile,
@@ -7543,6 +7870,18 @@ fn cmd_unshield_rollup(
     let fee = resolve_requested_tx_fee(fee, snapshot.required_tx_fee)?;
     ensure_positive_dal_fee(profile.dal_fee)?;
     let root = snapshot.current_root();
+
+    // Verify the producer-fee receiver matches what the operator published.
+    // Without this, a misconfigured profile silently routes the fee note
+    // to a non-operator receiver (no protocol-level enforcement of which
+    // address gets producer fees).
+    let head_hash = rollup.head_hash()?;
+    let wallet_dal_owner_tag = owner_tag(
+        &profile.dal_fee_address.auth_root,
+        &profile.dal_fee_address.auth_pub_seed,
+        &profile.dal_fee_address.nk_tag,
+    );
+    rollup.ensure_operator_producer_owner_tag_matches(&head_hash, &wallet_dal_owner_tag)?;
 
     let mut w = load_wallet(path)?;
     let outgoing_seed = w.account().outgoing_seed;
@@ -8210,6 +8549,48 @@ mod network_profile_tests {
                 ),
                 (200, "null".into()),
             ),
+            // Verifier config: owner_tag=ZERO so the wallet's gate proceeds
+            // with a warning (not a hard refuse) for the test fixture.
+            {
+                let cfg = tzel_services::kernel_wire::KernelVerifierConfig {
+                    auth_domain: default_auth_domain(),
+                    verified_program_hashes: ProgramHashes {
+                        shield: hash(b"test-shield"),
+                        transfer: hash(b"test-transfer"),
+                        unshield: hash(b"test-unshield"),
+                    },
+                    operator_producer_owner_tag: ZERO,
+                };
+                let encoded = tzel_services::kernel_wire::encode_kernel_verifier_config(&cfg)
+                    .expect("verifier config encodes");
+                (
+                    format!(
+                        "/global/block/BLunshieldhead/durable/wasm_2_0_0/length?key={}",
+                        DURABLE_VERIFIER_CONFIG
+                    ),
+                    (200, encoded.len().to_string()),
+                )
+            },
+            {
+                let cfg = tzel_services::kernel_wire::KernelVerifierConfig {
+                    auth_domain: default_auth_domain(),
+                    verified_program_hashes: ProgramHashes {
+                        shield: hash(b"test-shield"),
+                        transfer: hash(b"test-transfer"),
+                        unshield: hash(b"test-unshield"),
+                    },
+                    operator_producer_owner_tag: ZERO,
+                };
+                let encoded = tzel_services::kernel_wire::encode_kernel_verifier_config(&cfg)
+                    .expect("verifier config encodes");
+                (
+                    format!(
+                        "/global/block/BLunshieldhead/durable/wasm_2_0_0/value?key={}",
+                        DURABLE_VERIFIER_CONFIG
+                    ),
+                    (200, format!("\"{}\"", hex::encode(&encoded))),
+                )
+            },
         ]));
         let operator_url = super::tests::spawn_mock_http_server(HashMap::from([(
             "/v1/rollup/submissions".into(),

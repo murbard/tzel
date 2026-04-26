@@ -34,7 +34,6 @@ type t = {
   nullifier_set : (string, unit) Hashtbl.t;
   root_set : (string, unit) Hashtbl.t;
   root_history : string Queue.t;
-  balances : (string, int64) Hashtbl.t;
   withdrawals : (string * int64) Queue.t;
   auth_domain : Felt.t;
   mutable next_deposit_slot_id : int64;
@@ -59,7 +58,6 @@ let create ~auth_domain =
   let nullifier_set = Hashtbl.create 1024 in
   let root_set = Hashtbl.create 256 in
   let root_history = Queue.create () in
-  let balances = Hashtbl.create 64 in
   let withdrawals = Queue.create () in
   let deposit_slots = Hashtbl.create 64 in
   let deposits_by_intent = Hashtbl.create 64 in
@@ -69,7 +67,7 @@ let create ~auth_domain =
   Queue.push initial_root_hex root_history;
   {
     tree; nullifier_set; root_set; root_history;
-    balances; withdrawals; auth_domain;
+    withdrawals; auth_domain;
     next_deposit_slot_id = 0L;
     deposit_slots; deposits_by_intent;
   }
@@ -101,16 +99,17 @@ let consume_deposit_slot ledger ~slot_id ~intent ~debit =
                  slot_id slot.slot_amount debit)
       else begin
         Hashtbl.remove ledger.deposit_slots slot_id;
+        (* Prune the by-intent index entry. Mirrors the kernel's
+           swap-with-last semantics; bounds index size to open-slot count. *)
+        let key = Felt.to_hex intent in
+        (match Hashtbl.find_opt ledger.deposits_by_intent key with
+         | None -> ()
+         | Some r ->
+           r := List.filter (fun id -> Int64.compare id slot_id <> 0) !r;
+           if !r = [] then Hashtbl.remove ledger.deposits_by_intent key);
         Ok ()
       end
 
-let get_balance ledger account =
-  match Hashtbl.find_opt ledger.balances account with
-  | Some b -> b
-  | None -> 0L
-
-let set_balance ledger account balance =
-  Hashtbl.replace ledger.balances account balance
 
 let withdrawals ledger =
   let copy = Queue.copy ledger.withdrawals in

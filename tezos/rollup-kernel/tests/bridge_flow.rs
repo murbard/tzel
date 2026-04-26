@@ -29,7 +29,7 @@ use tzel_core::kernel_wire::{
 use tzel_core::kernel_wire::{
     KernelShieldReq, KernelStarkProof, KernelTransferReq, KernelUnshieldReq,
 };
-use tzel_core::{default_auth_domain, deposit_recipient_string, hash, ProgramHashes, F};
+use tzel_core::{default_auth_domain, deposit_recipient_string, hash, ProgramHashes, F, ZERO};
 
 /// Test-only deterministic deposit_id derived from a label. See note in
 /// tezos/rollup-kernel/src/lib.rs tests for context.
@@ -189,6 +189,7 @@ fn default_verifier_config() -> KernelVerifierConfig {
     KernelVerifierConfig {
         auth_domain: default_auth_domain(),
         verified_program_hashes: sample_program_hashes(),
+        operator_producer_owner_tag: ZERO,
     }
 }
 
@@ -238,7 +239,6 @@ fn bridge_deposit_requires_configuration_and_recovers_after_external_configurati
 
     run_with_host(&mut host);
 
-    assert!(read_ledger(&host).unwrap().balances.is_empty());
     match read_last_result(&host).unwrap() {
         KernelResult::Error { message } => {
             assert!(message.contains("bridge ticketer is not configured"))
@@ -298,7 +298,6 @@ fn bridge_deposit_rejects_non_deposit_id_receiver() {
 
     run_with_host(&mut host);
 
-    assert!(read_ledger(&host).unwrap().balances.is_empty());
     match read_last_result(&host).unwrap() {
         KernelResult::Error { message } => {
             assert!(
@@ -334,7 +333,6 @@ fn bridge_deposit_rejects_non_canonical_deposit_id_receiver() {
 
     run_with_host(&mut host);
 
-    assert!(read_ledger(&host).unwrap().balances.is_empty());
     match read_last_result(&host).unwrap() {
         KernelResult::Error { message } => {
             assert!(
@@ -442,10 +440,11 @@ fn assert_ledger_state_unchanged(before: &tzel_core::Ledger, after: &tzel_core::
     assert_eq!(after.tree.leaves, before.tree.leaves);
     assert_eq!(after.tree.root(), before.tree.root());
     assert_eq!(after.nullifiers, before.nullifiers);
-    assert_eq!(after.balances, before.balances);
     assert_eq!(after.valid_roots, before.valid_roots);
     assert_eq!(after.root_history, before.root_history);
     assert_eq!(after.withdrawals, before.withdrawals);
+    assert_eq!(after.deposit_slots, before.deposit_slots);
+    assert_eq!(after.deposits_by_intent, before.deposits_by_intent);
 }
 
 #[cfg(feature = "proof-verifier")]
@@ -542,6 +541,7 @@ fn configure_verified_bridge_via_dal(host: &mut TestHost, fixture: &VerifiedBrid
         encode_kernel_inbox_message(&signed_verifier_message(KernelVerifierConfig {
             auth_domain: fixture.auth_domain,
             verified_program_hashes: fixture.program_hashes.clone(),
+            operator_producer_owner_tag: ZERO,
         }))
         .unwrap();
     let verifier_pointer = KernelDalPayloadPointer {
@@ -600,6 +600,7 @@ fn configure_verified_bridge_with_hashes(
         encode_external_kernel_message(signed_verifier_message(KernelVerifierConfig {
             auth_domain: fixture.auth_domain,
             verified_program_hashes: hashes,
+            operator_producer_owner_tag: ZERO,
         })),
     );
     host.push_input(

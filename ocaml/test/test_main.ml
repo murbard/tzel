@@ -1764,9 +1764,7 @@ let test_ledger_unshield () =
   Alcotest.(check bool) "unshield ok" true (Result.is_ok result);
   Alcotest.(check withdrawal_list) "withdrawal queued" [(test_l1_recipient, 5000L)]
     (Tzel.Ledger.withdrawals ledger);
-  Alcotest.(check int) "tree has fee" 1 (Tzel.Ledger.tree_size ledger);
-  Alcotest.(check int64) "recipient balance unchanged" 0L
-    (Tzel.Ledger.get_balance ledger test_l1_recipient)
+  Alcotest.(check int) "tree has fee" 1 (Tzel.Ledger.tree_size ledger)
 
 let test_ledger_unshield_with_change () =
   let auth_domain = Tzel.Hash.hash_tag "domain" in
@@ -1785,9 +1783,7 @@ let test_ledger_unshield_with_change () =
   Alcotest.(check bool) "unshield with change ok" true (Result.is_ok result);
   Alcotest.(check int) "tree has change + fee" 2 (Tzel.Ledger.tree_size ledger);
   Alcotest.(check withdrawal_list) "withdrawal queued" [(test_l1_recipient, 3000L)]
-    (Tzel.Ledger.withdrawals ledger);
-  Alcotest.(check int64) "recipient balance unchanged" 0L
-    (Tzel.Ledger.get_balance ledger test_l1_recipient)
+    (Tzel.Ledger.withdrawals ledger)
 
 let test_ledger_unshield_rejects_invalid_l1_recipient () =
   let auth_domain = Tzel.Hash.hash_tag "domain" in
@@ -1867,10 +1863,6 @@ let test_ledger_unshield_fee_memo_mismatch () =
   Alcotest.(check withdrawal_list) "no withdrawal queued" []
     (Tzel.Ledger.withdrawals ledger);
   Alcotest.(check int) "tree unchanged" 0 (Tzel.Ledger.tree_size ledger)
-
-let test_ledger_balance_default () =
-  let ledger = Tzel.Ledger.create ~auth_domain:Tzel.Felt.zero in
-  Alcotest.(check int64) "default balance" 0L (Tzel.Ledger.get_balance ledger "nobody")
 
 let test_ledger_root_history () =
   let auth_domain = Tzel.Hash.hash_tag "domain" in
@@ -2234,9 +2226,7 @@ let test_multi_shield_transfer_unshield () =
     ~memo_ct_hash_change:mch ~memo_ct_hash_fee:mch in
   Alcotest.(check bool) "unshield ok" true (Result.is_ok r2);
   Alcotest.(check withdrawal_list) "withdrawal queued" [(test_l1_recipient, 1500L)]
-    (Tzel.Ledger.withdrawals ledger);
-  Alcotest.(check int64) "recipient balance unchanged" 0L
-    (Tzel.Ledger.get_balance ledger test_l1_recipient)
+    (Tzel.Ledger.withdrawals ledger)
 
 (* ══════════════════════════════════════════════════════════════════════
    Test registration
@@ -2407,7 +2397,6 @@ let () =
       Alcotest.test_case "unshield wrong domain" `Quick test_ledger_unshield_wrong_domain;
       Alcotest.test_case "unshield change memo mismatch" `Quick test_ledger_unshield_change_memo_mismatch;
       Alcotest.test_case "unshield fee memo mismatch" `Quick test_ledger_unshield_fee_memo_mismatch;
-      Alcotest.test_case "balance default" `Quick test_ledger_balance_default;
       Alcotest.test_case "root history" `Quick test_ledger_root_history;
       Alcotest.test_case "root history prunes oldest" `Quick test_ledger_root_history_prunes_oldest;
       Alcotest.test_case "empty nullifiers" `Quick test_ledger_check_nullifiers_empty;

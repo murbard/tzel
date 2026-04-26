@@ -1787,10 +1787,6 @@ pub struct NullifiersResp {
     pub nullifiers: Vec<F>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BalanceResp {
-    pub balances: HashMap<String, u64>,
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConfigResp {
@@ -1832,7 +1828,6 @@ pub struct Ledger {
     pub auth_domain: F,
     pub tree: MerkleTree,
     pub nullifiers: HashSet<F>,
-    pub balances: HashMap<String, u64>,
     pub valid_roots: HashSet<F>,
     #[serde(default)]
     pub root_history: VecDeque<F>,
@@ -1867,8 +1862,6 @@ pub struct Ledger {
 /// `tezos/rollup-kernel/src/lib.rs`.
 pub trait LedgerState {
     fn auth_domain(&self) -> Result<F, String>;
-    fn balance(&self, addr: &str) -> Result<u64, String>;
-    fn set_balance(&mut self, addr: &str, amount: u64) -> Result<(), String>;
     fn required_tx_fee(&self) -> Result<u64, String>;
     fn has_valid_root(&self, root: &F) -> Result<bool, String>;
     fn has_nullifier(&self, nf: &F) -> Result<bool, String>;
@@ -1909,7 +1902,6 @@ impl Ledger {
             auth_domain,
             tree,
             nullifiers: HashSet::new(),
-            balances: HashMap::new(),
             valid_roots: roots,
             root_history,
             memos: vec![],
@@ -1981,15 +1973,6 @@ impl Ledger {
 impl LedgerState for Ledger {
     fn auth_domain(&self) -> Result<F, String> {
         Ok(self.auth_domain)
-    }
-
-    fn balance(&self, addr: &str) -> Result<u64, String> {
-        Ok(self.balances.get(addr).copied().unwrap_or(0))
-    }
-
-    fn set_balance(&mut self, addr: &str, amount: u64) -> Result<(), String> {
-        self.balances.insert(addr.to_string(), amount);
-        Ok(())
     }
 
     fn required_tx_fee(&self) -> Result<u64, String> {
@@ -2081,6 +2064,17 @@ impl LedgerState for Ledger {
             ));
         }
         self.deposit_slots.remove(&slot_id);
+        // Prune the by-intent index entry too, mirroring the kernel's
+        // swap-with-last behavior. Bounds index size to open-slot count
+        // per intent.
+        if let Some(ids) = self.deposits_by_intent.get_mut(intent) {
+            if let Some(pos) = ids.iter().position(|id| *id == slot_id) {
+                ids.swap_remove(pos);
+            }
+            if ids.is_empty() {
+                self.deposits_by_intent.remove(intent);
+            }
+        }
         Ok(())
     }
 }
@@ -2097,7 +2091,45 @@ pub fn apply_deposit<S: LedgerState>(
     state.record_deposit_slot(intent, amount)
 }
 
-pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<ShieldResp, String> {
+/// All inputs needed to commit a shield. Built by `prepare_shield` from
+/// validated request fields; consumed by `commit_prepared_shield`. Holds the
+/// slot id + intent so the commit step can drain the right slot without
+/// re-checking anything that was already validated.
+#[derive(Clone, Debug)]
+pub struct PreparedShield {
+    pub deposit_slot: u64,
+    pub deposit_id: F,
+    pub debit: u64,
+    pub client_cm: F,
+    pub client_enc: EncryptedNote,
+    pub producer_cm: F,
+    pub producer_enc: EncryptedNote,
+}
+
+impl PreparedShield {
+    pub fn deposit_slot(&self) -> u64 {
+        self.deposit_slot
+    }
+    pub fn deposit_id(&self) -> &F {
+        &self.deposit_id
+    }
+    pub fn debit(&self) -> u64 {
+        self.debit
+    }
+    pub fn client_note(&self) -> (&F, &EncryptedNote) {
+        (&self.client_cm, &self.client_enc)
+    }
+    pub fn producer_note(&self) -> (&F, &EncryptedNote) {
+        (&self.producer_cm, &self.producer_enc)
+    }
+}
+
+/// Validate a shield request. Reads state but does not mutate. Returns a
+/// `PreparedShield` that the commit step consumes.
+pub fn prepare_shield<S: LedgerState>(
+    state: &S,
+    req: &ShieldReq,
+) -> Result<PreparedShield, String> {
     let required_fee = state.required_tx_fee()?;
     if req.fee < required_fee {
         return Err(format!("fee below minimum: {} < {}", req.fee, required_fee));
@@ -2135,11 +2167,6 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
         return Err("shield intent mismatch — deposit_id does not match request fields".into());
     }
 
-    // The L1 deposit slot must record this exact intent and the exact debit.
-    // We claim the slot up-front; mismatches leave state untouched. Slots make
-    // dust attacks against `deposit:<intent>` impossible: each L1 ticket
-    // allocates its own slot, so an attacker depositing 1 mutez to the same
-    // intent string just creates an orphan slot the wallet ignores.
     let debit = req
         .v
         .checked_add(req.fee)
@@ -2188,18 +2215,49 @@ pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<Sh
     }
 
     state.ensure_note_capacity(2)?;
-    // Claim the slot. Single-shot — the slot is removed on success.
-    state.consume_deposit_slot(req.deposit_slot, &req.deposit_id, debit)?;
-    let index = state.append_note(req.client_cm, req.client_enc.clone())?;
-    let producer_index = state.append_note(req.producer_cm, req.producer_enc.clone())?;
+
+    Ok(PreparedShield {
+        deposit_slot: req.deposit_slot,
+        deposit_id: req.deposit_id,
+        debit,
+        client_cm: req.client_cm,
+        client_enc: req.client_enc.clone(),
+        producer_cm: req.producer_cm,
+        producer_enc: req.producer_enc.clone(),
+    })
+}
+
+/// Commit a `PreparedShield`. The order is: (1) consume slot — single-shot
+/// authorization, (2) append both notes, (3) snapshot root, (4) bump
+/// private-tx counter. INTENDED CONTRACT (mirrors `commit_prepared_unshield`):
+/// every `LedgerState` write here must be infallible in any state
+/// implementation that observes externally; otherwise a partial failure can
+/// leave the slot tombstoned but the notes unappended, stranding the L1
+/// deposit. The reference in-memory `Ledger` impl satisfies this trivially.
+/// Outbox-emitting / durable-store kernels MUST NOT use this path — they use
+/// the kernel-specific `prepare_durable_shield_commit` /
+/// `apply_durable_shield_commit` pair where the post-validation apply is
+/// explicitly typed infallible.
+pub fn commit_prepared_shield<S: LedgerState>(
+    state: &mut S,
+    prepared: PreparedShield,
+) -> Result<ShieldResp, String> {
+    state.consume_deposit_slot(prepared.deposit_slot, &prepared.deposit_id, prepared.debit)?;
+    let index = state.append_note(prepared.client_cm, prepared.client_enc)?;
+    let producer_index = state.append_note(prepared.producer_cm, prepared.producer_enc)?;
     state.snapshot_root()?;
     state.note_private_tx_applied();
     Ok(ShieldResp {
-        cm: req.client_cm,
+        cm: prepared.client_cm,
         index,
-        producer_cm: req.producer_cm,
+        producer_cm: prepared.producer_cm,
         producer_index,
     })
+}
+
+pub fn apply_shield<S: LedgerState>(state: &mut S, req: &ShieldReq) -> Result<ShieldResp, String> {
+    let prepared = prepare_shield(state, req)?;
+    commit_prepared_shield(state, prepared)
 }
 
 pub fn apply_transfer<S: LedgerState>(
@@ -2725,14 +2783,6 @@ mod tests {
             self.inner.auth_domain()
         }
 
-        fn balance(&self, addr: &str) -> Result<u64, String> {
-            self.inner.balance(addr)
-        }
-
-        fn set_balance(&mut self, addr: &str, amount: u64) -> Result<(), String> {
-            self.inner.set_balance(addr, amount)
-        }
-
         fn required_tx_fee(&self) -> Result<u64, String> {
             Ok(self.required_tx_fee)
         }
@@ -2801,14 +2851,6 @@ mod tests {
     impl LedgerState for FailingWithdrawalQueueLedgerState {
         fn auth_domain(&self) -> Result<F, String> {
             self.inner.auth_domain()
-        }
-
-        fn balance(&self, addr: &str) -> Result<u64, String> {
-            self.inner.balance(addr)
-        }
-
-        fn set_balance(&mut self, addr: &str, amount: u64) -> Result<(), String> {
-            self.inner.set_balance(addr, amount)
         }
 
         fn required_tx_fee(&self) -> Result<u64, String> {
@@ -3809,8 +3851,8 @@ mod tests {
         assert_eq!(resp.index, 0);
         assert_eq!(resp.producer_cm, producer_cm);
         assert_eq!(resp.producer_index, 1);
-        // Intent-bound deposits drain to zero on shield.
-        assert_eq!(ledger.balance(&deposit_recipient_string(&intent)).unwrap(), 0);
+        // Intent-bound deposits: slot consumed on shield.
+        assert!(ledger.deposit_slots.is_empty());
         assert_eq!(ledger.memos.len(), 2);
         assert_ne!(ledger.tree.root(), root_before);
         assert!(ledger.valid_roots.contains(&ledger.tree.root()));
@@ -4464,9 +4506,8 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_unshield_does_not_touch_existing_public_balances() {
+    fn test_apply_unshield_emits_outbox_record_and_increments_tree() {
         let (mut ledger, _addr, nk_spend, shield_resp) = shielded_note_setup(0x75, "alice", 80);
-        ledger.set_balance("bob", 17).unwrap();
         let root = ledger.tree.root();
         let nf = nullifier(&nk_spend, &shield_resp.cm, shield_resp.index as u64);
         let (_acc, fee_addr, _dk_v, _dk_d, _nk_spend_unused) = sample_address_bundle(0x7B, 0);
@@ -4490,7 +4531,6 @@ mod tests {
 
         assert_eq!(resp.change_index, None);
         assert_eq!(resp.producer_index, 2);
-        assert_eq!(ledger.balance("bob").unwrap(), 17);
         assert_eq!(
             ledger.withdrawals,
             vec![WithdrawalRecord {
@@ -4692,9 +4732,9 @@ mod tests {
             .deposit(&deposit_recipient_string(&intent), debit)
             .unwrap();
 
-        let balance_before = state.inner.balance(&deposit_recipient_string(&intent)).unwrap();
         let leaves_before = state.inner.tree.leaves.clone();
         let memos_before = state.inner.memos.len();
+        let slots_before = state.inner.deposit_slots.clone();
 
         let err = apply_shield(
             &mut state,
@@ -4714,10 +4754,8 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("Merkle tree full"));
-        assert_eq!(
-            state.inner.balance(&deposit_recipient_string(&intent)).unwrap(),
-            balance_before
-        );
+        // Slot must be untouched when shield is rejected pre-commit.
+        assert_eq!(state.inner.deposit_slots, slots_before);
         assert_eq!(state.inner.tree.leaves, leaves_before);
         assert_eq!(state.inner.memos.len(), memos_before);
     }

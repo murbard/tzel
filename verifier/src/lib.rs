@@ -204,7 +204,7 @@ mod tests {
     use std::sync::OnceLock;
 
     use serde::Deserialize;
-    use tzel_core::{u64_to_felt, F};
+    use tzel_core::{u64_to_felt, F, ZERO};
 
     use crate::bundle::{canonical_verify_meta, validate_canonical_verify_meta};
 
@@ -338,6 +338,7 @@ mod tests {
         let verifier = DirectProofVerifier::from_kernel_config(&KernelVerifierConfig {
             auth_domain: f(77),
             verified_program_hashes: sample_hashes(),
+            operator_producer_owner_tag: ZERO,
         })
         .unwrap();
 
@@ -358,6 +359,7 @@ mod tests {
         let verifier = DirectProofVerifier::from_kernel_config(&KernelVerifierConfig {
             auth_domain: f(77),
             verified_program_hashes: sample_hashes(),
+            operator_producer_owner_tag: ZERO,
         })
         .unwrap();
 

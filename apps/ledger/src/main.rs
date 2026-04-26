@@ -243,12 +243,6 @@ async fn nullifiers_handler(State(st): State<AppState>) -> Json<NullifiersResp> 
     })
 }
 
-async fn balances_handler(State(st): State<AppState>) -> Json<BalanceResp> {
-    let ledger = st.ledger.lock().unwrap();
-    Json(BalanceResp {
-        balances: ledger.balances.clone(),
-    })
-}
 
 async fn config_handler(State(st): State<AppState>) -> Json<ConfigResp> {
     let ledger = st.ledger.lock().unwrap();
@@ -317,7 +311,6 @@ async fn main() {
         .route("/tree", get(tree_handler))
         .route("/tree/path/{index}", get(tree_path_handler))
         .route("/nullifiers", get(nullifiers_handler))
-        .route("/balances", get(balances_handler))
         .with_state(state);
 
     let addr = format!("{}:{}", cli.listen, cli.port);
@@ -578,13 +571,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_balances_handler_empty_state_returns_empty_map() {
-        let st = test_state(default_auth_domain());
-        let Json(resp) = balances_handler(State(st)).await;
-        assert!(resp.balances.is_empty());
-    }
-
-    #[tokio::test]
     async fn test_tree_path_handler_rejects_out_of_range() {
         let st = test_state(default_auth_domain());
         let err = tree_path_handler(State(st), axum::extract::Path(0))
@@ -692,7 +678,6 @@ mod tests {
 
         let ledger = st.ledger.lock().unwrap();
         assert!(ledger.withdrawals.is_empty());
-        assert!(ledger.balances.is_empty());
         assert!(ledger.nullifiers.is_empty());
         assert_eq!(ledger.tree.leaves.len(), 0);
     }

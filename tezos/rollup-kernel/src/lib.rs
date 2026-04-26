@@ -41,9 +41,9 @@ use tzel_core::{
         KernelSignedVerifierConfig, KernelVerifierConfig, KERNEL_BRIDGE_CONFIG_KEY_INDEX,
         KERNEL_VERIFIER_CONFIG_KEY_INDEX,
     },
-    prepare_unshield, required_tx_fee_for_private_tx_count, verify_wots_signature_against_leaf,
-    DepositSlot, EncryptedNote, Ledger, LedgerState, UnshieldResp, WithdrawalRecord, DEPTH, F,
-    ZERO,
+    prepare_shield, prepare_unshield, required_tx_fee_for_private_tx_count,
+    verify_wots_signature_against_leaf, DepositSlot, EncryptedNote, Ledger, LedgerState,
+    ShieldResp, UnshieldResp, WithdrawalRecord, DEPTH, F, ZERO,
 };
 #[cfg(any(test, debug_assertions))]
 use tzel_core::{auth_leaf_hash, derive_auth_pub_seed};
@@ -87,7 +87,6 @@ const PATH_TREE_SIZE: &[u8] = b"/tzel/v1/state/tree/size";
 const PATH_TREE_ROOT: &[u8] = b"/tzel/v1/state/tree/root";
 const PATH_NULLIFIER_COUNT: &[u8] = b"/tzel/v1/state/nullifiers/count";
 const PATH_VALID_ROOT_COUNT: &[u8] = b"/tzel/v1/state/roots/count";
-const PATH_BALANCE_ACCOUNT_COUNT: &[u8] = b"/tzel/v1/state/balances/count";
 const PATH_WITHDRAWAL_COUNT: &[u8] = b"/tzel/v1/state/withdrawals/count";
 const PATH_BRIDGE_TICKETER: &[u8] = b"/tzel/v1/state/bridge/ticketer";
 const PATH_VERIFIER_CONFIG: &[u8] = b"/tzel/v1/state/verifier_config.bin";
@@ -100,8 +99,6 @@ const PATH_NULLIFIER_PREFIX: &[u8] = b"/tzel/v1/state/nullifiers/by-key/";
 const PATH_NULLIFIER_INDEX_PREFIX: &[u8] = b"/tzel/v1/state/nullifiers/index/";
 const PATH_VALID_ROOT_PREFIX: &[u8] = b"/tzel/v1/state/roots/by-key/";
 const PATH_VALID_ROOT_INDEX_PREFIX: &[u8] = b"/tzel/v1/state/roots/index/";
-const PATH_BALANCE_PREFIX: &[u8] = b"/tzel/v1/state/balances/by-key/";
-const PATH_BALANCE_INDEX_PREFIX: &[u8] = b"/tzel/v1/state/balances/index/";
 const PATH_WITHDRAWAL_PREFIX: &[u8] = b"/tzel/v1/state/withdrawals/index/";
 /// Bridge-deposit slots. Each successful `apply_deposit` allocates one,
 /// indexed by a monotonic counter. A slot stores `(intent, amount)` and
@@ -203,13 +200,6 @@ impl<'a, H: Host> DurableLedgerState<'a, H> {
         if self.host.read_store(PATH_NULLIFIER_COUNT, 8).is_none() {
             self.write_u64(PATH_NULLIFIER_COUNT, 0);
         }
-        if self
-            .host
-            .read_store(PATH_BALANCE_ACCOUNT_COUNT, 8)
-            .is_none()
-        {
-            self.write_u64(PATH_BALANCE_ACCOUNT_COUNT, 0);
-        }
         if self.host.read_store(PATH_WITHDRAWAL_COUNT, 8).is_none() {
             self.write_u64(PATH_WITHDRAWAL_COUNT, 0);
         }
@@ -230,7 +220,6 @@ impl<'a, H: Host> DurableLedgerState<'a, H> {
     fn is_pristine(&self) -> Result<bool, String> {
         Ok(self.read_u64(PATH_TREE_SIZE)?.unwrap_or(0) == 0
             && self.read_u64(PATH_NULLIFIER_COUNT)?.unwrap_or(0) == 0
-            && self.read_u64(PATH_BALANCE_ACCOUNT_COUNT)?.unwrap_or(0) == 0
             && self.read_u64(PATH_DEPOSIT_SLOT_COUNT)?.unwrap_or(0) == 0)
     }
 
@@ -297,11 +286,6 @@ impl<'a, H: Host> DurableLedgerState<'a, H> {
         self.host.write_store(&path, key);
     }
 
-    fn write_account_key_at_index(&mut self, index: u64, addr: &str) {
-        let path = indexed_path(PATH_BALANCE_INDEX_PREFIX, index);
-        self.host.write_store(&path, addr.as_bytes());
-    }
-
     fn write_withdrawal_at_index(&mut self, index: u64, record: &WithdrawalRecord) {
         let path = indexed_path(PATH_WITHDRAWAL_PREFIX, index);
         self.host
@@ -326,21 +310,6 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
     fn auth_domain(&self) -> Result<F, String> {
         self.read_felt(PATH_AUTH_DOMAIN)?
             .ok_or_else(|| "missing auth_domain".into())
-    }
-
-    fn balance(&self, addr: &str) -> Result<u64, String> {
-        Ok(self.read_u64(&balance_path(addr))?.unwrap_or(0))
-    }
-
-    fn set_balance(&mut self, addr: &str, amount: u64) -> Result<(), String> {
-        let path = balance_path(addr);
-        if self.host.read_store(&path, 8).is_none() {
-            let index = self.read_u64(PATH_BALANCE_ACCOUNT_COUNT)?.unwrap_or(0);
-            self.write_account_key_at_index(index, addr);
-            self.write_u64(PATH_BALANCE_ACCOUNT_COUNT, index + 1);
-        }
-        self.write_u64(&path, amount);
-        Ok(())
     }
 
     fn required_tx_fee(&self) -> Result<u64, String> {
@@ -511,9 +480,69 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
             ));
         }
         // Tombstone the slot. Intentionally a single-byte rewrite so the
-        // by-id path remains readable (returns Some([0x01])) and the by-intent
-        // index can still be enumerated for audit.
+        // by-id path remains readable (returns Some([0x01])).
         self.host.write_store(&path, &encode_deposit_slot_consumed());
+
+        // Prune the by-intent index entry: swap-with-last and decrement
+        // count. Without pruning, the index grows monotonically per intent
+        // and a dust-spamming attacker can inflate the wallet's sync cost
+        // by a factor of N for the targeted intent.
+        let by_intent_count_path = deposits_by_intent_count_path(intent);
+        let count = match self.host.read_store(&by_intent_count_path, 8) {
+            None => 0u64,
+            Some(bytes) => {
+                if bytes.len() != 8 {
+                    return Err(format!(
+                        "bad u64 at {}",
+                        String::from_utf8_lossy(&by_intent_count_path)
+                    ));
+                }
+                u64::from_le_bytes(bytes.try_into().unwrap())
+            }
+        };
+        // Linear scan to find this slot_id's position. Bounded by per-intent
+        // slot count; an attacker who inflates the index pays for each scan.
+        let mut found_position: Option<u64> = None;
+        for position in 0..count {
+            let entry_path = deposits_by_intent_index_path(intent, position);
+            let entry = self
+                .host
+                .read_store(&entry_path, 8)
+                .ok_or_else(|| format!("missing by-intent entry at position {}", position))?;
+            if entry.len() != 8 {
+                return Err(format!(
+                    "bad u64 at {}",
+                    String::from_utf8_lossy(&entry_path)
+                ));
+            }
+            let id_at_pos = u64::from_le_bytes(entry.try_into().unwrap());
+            if id_at_pos == slot_id {
+                found_position = Some(position);
+                break;
+            }
+        }
+        let position = found_position.ok_or_else(|| {
+            format!(
+                "deposit slot {} not present in by-intent index — index inconsistency",
+                slot_id
+            )
+        })?;
+        let last_position = count.saturating_sub(1);
+        if position != last_position {
+            // Move the last entry into the consumed slot's position.
+            let last_path = deposits_by_intent_index_path(intent, last_position);
+            let last_bytes = self
+                .host
+                .read_store(&last_path, 8)
+                .ok_or_else(|| "missing last by-intent entry".to_string())?;
+            self.host
+                .write_store(&deposits_by_intent_index_path(intent, position), &last_bytes);
+        }
+        // Decrement count. The entry at the old `last_position` is no longer
+        // enumerated; its bytes remain readable at that path but are
+        // unreachable through the count-bounded iteration.
+        self.host
+            .write_store(&by_intent_count_path, &last_position.to_le_bytes());
         Ok(())
     }
 }
@@ -575,13 +604,6 @@ fn nullifier_path(nf: &F) -> Vec<u8> {
     let mut path = Vec::with_capacity(PATH_NULLIFIER_PREFIX.len() + 64);
     path.extend_from_slice(PATH_NULLIFIER_PREFIX);
     path.extend_from_slice(hex::encode(nf).as_bytes());
-    path
-}
-
-fn balance_path(addr: &str) -> Vec<u8> {
-    let mut path = Vec::with_capacity(PATH_BALANCE_PREFIX.len() + addr.len() * 2);
-    path.extend_from_slice(PATH_BALANCE_PREFIX);
-    path.extend_from_slice(hex::encode(addr.as_bytes()).as_bytes());
     path
 }
 
@@ -717,36 +739,38 @@ fn decode_rollup_message(
     bytes: &[u8],
     current_rollup: &[u8],
 ) -> Result<ParsedRollupMessage, String> {
-    if let Ok((rest, inbox)) = TezosInboxMessage::<BridgeDepositPayload>::parse(bytes) {
-        if rest.is_empty() {
-            return match inbox {
-                TezosInboxMessage::Internal(TezosInternalInboxMessage::Transfer(transfer)) => {
-                    if transfer.destination.hash().as_ref().as_slice() != current_rollup {
+    let (rest, inbox) = TezosInboxMessage::<BridgeDepositPayload>::parse(bytes)
+        .map_err(|_| "invalid rollup inbox message: failed to parse TezosInboxMessage frame".to_string())?;
+    if !rest.is_empty() {
+        return Err(
+            "invalid rollup inbox message: trailing bytes after TezosInboxMessage frame".into(),
+        );
+    }
+    match inbox {
+        TezosInboxMessage::Internal(TezosInternalInboxMessage::Transfer(transfer)) => {
+            if transfer.destination.hash().as_ref().as_slice() != current_rollup {
+                Ok(ParsedRollupMessage::Ignore)
+            } else {
+                Ok(ParsedRollupMessage::Deposit(parse_bridge_deposit(
+                    transfer,
+                )?))
+            }
+        }
+        TezosInboxMessage::Internal(_) => Ok(ParsedRollupMessage::Ignore),
+        TezosInboxMessage::External(payload) => {
+            match ExternalMessageFrame::parse(payload) {
+                Ok(ExternalMessageFrame::Targetted { address, contents }) => {
+                    if address.hash().as_ref().as_slice() != current_rollup {
                         Ok(ParsedRollupMessage::Ignore)
                     } else {
-                        Ok(ParsedRollupMessage::Deposit(parse_bridge_deposit(
-                            transfer,
-                        )?))
+                        decode_kernel_inbox_message(contents)
+                            .map(ParsedRollupMessage::Kernel)
                     }
                 }
-                TezosInboxMessage::Internal(_) => Ok(ParsedRollupMessage::Ignore),
-                TezosInboxMessage::External(payload) => {
-                    match ExternalMessageFrame::parse(payload) {
-                        Ok(ExternalMessageFrame::Targetted { address, contents }) => {
-                            if address.hash().as_ref().as_slice() != current_rollup {
-                                Ok(ParsedRollupMessage::Ignore)
-                            } else {
-                                decode_kernel_inbox_message(contents)
-                                    .map(ParsedRollupMessage::Kernel)
-                            }
-                        }
-                        Err(_) => Ok(ParsedRollupMessage::Ignore),
-                    }
-                }
-            };
+                Err(_) => Ok(ParsedRollupMessage::Ignore),
+            }
         }
     }
-    decode_kernel_inbox_message(bytes).map(ParsedRollupMessage::Kernel)
 }
 
 fn parse_bridge_deposit(
@@ -882,7 +906,6 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
     let tree_size = read_u64(host, PATH_TREE_SIZE).unwrap_or(0);
     let nullifier_count = read_u64(host, PATH_NULLIFIER_COUNT).unwrap_or(0);
     let valid_root_count = read_u64(host, PATH_VALID_ROOT_COUNT).unwrap_or(0);
-    let balance_count = read_u64(host, PATH_BALANCE_ACCOUNT_COUNT).unwrap_or(0);
     let withdrawal_count = read_u64(host, PATH_WITHDRAWAL_COUNT).unwrap_or(0);
     let deposit_slot_count = read_u64(host, PATH_DEPOSIT_SLOT_COUNT).unwrap_or(0);
 
@@ -890,7 +913,6 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
     ledger.tree.leaves.clear();
     ledger.nullifiers.clear();
     ledger.valid_roots.clear();
-    ledger.balances.clear();
     ledger.memos.clear();
     ledger.withdrawals.clear();
     ledger.deposit_slots.clear();
@@ -929,17 +951,6 @@ pub fn read_ledger<H: Host>(host: &H) -> Result<Ledger, String> {
         let mut root = ZERO;
         root.copy_from_slice(&bytes);
         ledger.valid_roots.insert(root);
-    }
-
-    for i in 0..balance_count {
-        let key_path = indexed_path(PATH_BALANCE_INDEX_PREFIX, i);
-        let key_bytes = host
-            .read_store(&key_path, MAX_STORE_STRING_BYTES)
-            .ok_or_else(|| format!("missing persisted balance key {}", i))?;
-        let addr = String::from_utf8(key_bytes)
-            .map_err(|_| "stored balance key is not UTF-8".to_string())?;
-        let amount = read_u64(host, &balance_path(&addr)).unwrap_or(0);
-        ledger.balances.insert(addr, amount);
     }
 
     for i in 0..withdrawal_count {
@@ -1167,7 +1178,11 @@ fn apply_kernel_message<H: Host>(
         KernelInboxMessage::Shield(req) => {
             validate_transition_proof(ledger.host, &req.proof, tzel_core::CircuitKind::Shield)?;
             let req = host_shield_req_for_transition(&req);
-            apply_shield(ledger, &req).map(KernelResult::Shield)
+            let prepared = prepare_shield(ledger, &req)?;
+            let commit = prepare_durable_shield_commit(ledger, &prepared)?;
+            Ok(KernelResult::Shield(apply_durable_shield_commit(
+                ledger, commit,
+            )))
         }
         KernelInboxMessage::Transfer(req) => {
             validate_transition_proof(ledger.host, &req.proof, tzel_core::CircuitKind::Transfer)?;
@@ -1370,6 +1385,227 @@ fn apply_durable_unshield_commit<H: Host>(
 
     ledger.write_withdrawal_at_index(commit.withdrawal_index, &commit.withdrawal_record);
     ledger.write_u64(PATH_WITHDRAWAL_COUNT, commit.withdrawal_index + 1);
+
+    if let Some((root_index, root)) = &commit.root_marker {
+        let path = root_marker_path(root);
+        ledger.write_marker(&path);
+        ledger.write_key_at_index(PATH_VALID_ROOT_INDEX_PREFIX, *root_index, root);
+        ledger.write_u64(PATH_VALID_ROOT_COUNT, root_index + 1);
+    }
+
+    ledger.note_private_tx_applied();
+    commit.response
+}
+
+/// All staged durable writes for a shield, precomputed in
+/// `prepare_durable_shield_commit` so the apply step is infallible.
+struct PreparedDurableShieldCommit {
+    /// Encoded notes (recipient, then producer) keyed by tree index.
+    encoded_notes: Vec<(u64, Vec<u8>)>,
+    /// Updated frontier branches (level, felt).
+    branch_values: Vec<(usize, F)>,
+    new_tree_root: F,
+    new_tree_size: u64,
+    /// Slot tombstone path. The slot's by-id record is overwritten with the
+    /// consumed-status byte. The current intent + amount were verified equal
+    /// to the request's deposit_id and debit during prepare.
+    slot_path: Vec<u8>,
+    /// Pending swap-with-last for the by-intent index. `None` if the
+    /// consumed slot was already at the last position (no swap needed).
+    by_intent_swap: Option<(Vec<u8>, Vec<u8>)>, // (target_path, source_bytes)
+    by_intent_count_path: Vec<u8>,
+    by_intent_count_after: u64,
+    /// Optional new valid-root marker (only if the resulting root is fresh).
+    root_marker: Option<(u64, F)>,
+    response: ShieldResp,
+}
+
+/// Validate the slot record (must exist, be open, match intent + debit) and
+/// precompute every durable write the shield will perform. Read-only on the
+/// store. The returned struct is then consumed by the infallible apply.
+fn prepare_durable_shield_commit<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    prepared: &tzel_core::PreparedShield,
+) -> Result<PreparedDurableShieldCommit, String> {
+    // 1. Validate the slot record without mutating.
+    let slot_path = deposit_slot_path(prepared.deposit_slot());
+    let slot_bytes = ledger
+        .host
+        .read_store(&slot_path, MAX_STORE_BINARY_BYTES)
+        .ok_or_else(|| format!("deposit slot {} does not exist", prepared.deposit_slot()))?;
+    let slot = decode_deposit_slot_open(&slot_bytes)?
+        .ok_or_else(|| format!("deposit slot {} already consumed", prepared.deposit_slot()))?;
+    if slot.intent != *prepared.deposit_id() {
+        return Err(format!(
+            "deposit slot {} intent mismatch: slot binds a different deposit",
+            prepared.deposit_slot()
+        ));
+    }
+    if slot.amount != prepared.debit() {
+        return Err(format!(
+            "deposit slot {} amount mismatch: have {}, expected exactly {}",
+            prepared.deposit_slot(),
+            slot.amount,
+            prepared.debit()
+        ));
+    }
+
+    // 2. Plan the by-intent index swap-with-last.
+    let by_intent_count_path = deposits_by_intent_count_path(prepared.deposit_id());
+    let by_intent_count = match ledger.host.read_store(&by_intent_count_path, 8) {
+        None => 0u64,
+        Some(bytes) => {
+            if bytes.len() != 8 {
+                return Err(format!(
+                    "bad u64 at {}",
+                    String::from_utf8_lossy(&by_intent_count_path)
+                ));
+            }
+            u64::from_le_bytes(bytes.try_into().unwrap())
+        }
+    };
+    let mut found_position: Option<u64> = None;
+    for position in 0..by_intent_count {
+        let entry_path = deposits_by_intent_index_path(prepared.deposit_id(), position);
+        let entry = ledger
+            .host
+            .read_store(&entry_path, 8)
+            .ok_or_else(|| format!("missing by-intent entry at position {}", position))?;
+        if entry.len() != 8 {
+            return Err(format!(
+                "bad u64 at {}",
+                String::from_utf8_lossy(&entry_path)
+            ));
+        }
+        let id_at_pos = u64::from_le_bytes(entry.try_into().unwrap());
+        if id_at_pos == prepared.deposit_slot() {
+            found_position = Some(position);
+            break;
+        }
+    }
+    let position = found_position.ok_or_else(|| {
+        format!(
+            "deposit slot {} not present in by-intent index — index inconsistency",
+            prepared.deposit_slot()
+        )
+    })?;
+    let last_position = by_intent_count.saturating_sub(1);
+    let by_intent_swap = if position != last_position {
+        let last_path = deposits_by_intent_index_path(prepared.deposit_id(), last_position);
+        let last_bytes = ledger
+            .host
+            .read_store(&last_path, 8)
+            .ok_or_else(|| "missing last by-intent entry".to_string())?;
+        Some((
+            deposits_by_intent_index_path(prepared.deposit_id(), position),
+            last_bytes,
+        ))
+    } else {
+        None
+    };
+
+    // 3. Plan the tree appends. Read frontier, simulate two appends.
+    let mut branches = (0..DEPTH)
+        .map(|level| ledger.read_felt(&branch_path(level)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut tree_size = ledger.read_u64(PATH_TREE_SIZE)?.unwrap_or(0);
+    assert_frontier_matches_tree_size(&branches, tree_size)?;
+
+    let (client_cm, client_enc) = prepared.client_note();
+    let client_index_u64 = tree_size;
+    let mut encoded_notes = Vec::with_capacity(2);
+    encoded_notes.push((client_index_u64, encode_published_note(client_cm, client_enc)?));
+    let _ = simulate_frontier_append(
+        &ledger.zero_hashes,
+        &mut branches,
+        client_index_u64,
+        *client_cm,
+    )?;
+    tree_size += 1;
+    let client_index = usize::try_from(client_index_u64)
+        .map_err(|_| "note index does not fit in usize".to_string())?;
+
+    let (producer_cm, producer_enc) = prepared.producer_note();
+    let producer_index_u64 = tree_size;
+    encoded_notes.push((
+        producer_index_u64,
+        encode_published_note(producer_cm, producer_enc)?,
+    ));
+    let next_root = simulate_frontier_append(
+        &ledger.zero_hashes,
+        &mut branches,
+        producer_index_u64,
+        *producer_cm,
+    )?;
+    tree_size += 1;
+    let producer_index = usize::try_from(producer_index_u64)
+        .map_err(|_| "note index does not fit in usize".to_string())?;
+
+    // 4. Plan the valid-root marker.
+    let root_marker = if ledger.has_marker(&root_marker_path(&next_root)) {
+        None
+    } else {
+        Some((
+            ledger.read_u64(PATH_VALID_ROOT_COUNT)?.unwrap_or(0),
+            next_root,
+        ))
+    };
+
+    Ok(PreparedDurableShieldCommit {
+        encoded_notes,
+        branch_values: branches
+            .into_iter()
+            .enumerate()
+            .filter_map(|(level, value)| value.map(|felt| (level, felt)))
+            .collect(),
+        new_tree_root: next_root,
+        new_tree_size: tree_size,
+        slot_path,
+        by_intent_swap,
+        by_intent_count_path,
+        by_intent_count_after: last_position,
+        root_marker,
+        response: ShieldResp {
+            cm: *client_cm,
+            index: client_index,
+            producer_cm: *producer_cm,
+            producer_index,
+        },
+    })
+}
+
+/// Apply the staged durable writes for a shield. SAFETY-CRITICAL: this
+/// function MUST remain infallible — once it starts mutating, the slot
+/// tombstone makes the operation irreversible. Every call here is either a
+/// `Host::write_store` (declared infallible by the trait) or a pure-local
+/// update. Do NOT introduce fallible operations; route fallible work into
+/// `prepare_durable_shield_commit` instead.
+fn apply_durable_shield_commit<H: Host>(
+    ledger: &mut DurableLedgerState<'_, H>,
+    commit: PreparedDurableShieldCommit,
+) -> ShieldResp {
+    // Tombstone the slot (irreversible).
+    ledger
+        .host
+        .write_store(&commit.slot_path, &encode_deposit_slot_consumed());
+    // Prune the by-intent index entry: swap-with-last, decrement count.
+    if let Some((target_path, source_bytes)) = &commit.by_intent_swap {
+        ledger.host.write_store(target_path, source_bytes);
+    }
+    ledger.host.write_store(
+        &commit.by_intent_count_path,
+        &commit.by_intent_count_after.to_le_bytes(),
+    );
+
+    // Append the two notes and update frontier / tree size / tree root.
+    for (index, encoded) in &commit.encoded_notes {
+        write_note_payload(ledger.host, *index, encoded);
+    }
+    for (level, felt) in &commit.branch_values {
+        ledger.write_felt(&branch_path(*level), felt);
+    }
+    ledger.write_felt(PATH_TREE_ROOT, &commit.new_tree_root);
+    ledger.write_u64(PATH_TREE_SIZE, commit.new_tree_size);
 
     if let Some((root_index, root)) = &commit.root_marker {
         let path = root_marker_path(root);
@@ -1641,6 +1877,22 @@ fn configure_verifier<H: Host>(
 
     let existing = read_verifier_config(ledger.host)?;
     if let Some(existing) = existing {
+        // auth_domain is frozen on first install. Any attempt to change it
+        // after the first config — even on a pristine ledger — is rejected,
+        // because in-flight deposits compute intent against the auth_domain
+        // they read from rollup HEAD and submit irreversible L1 tickets.
+        // Allowing a reconfig in the in-flight window would silently strand
+        // those deposits.
+        if existing.auth_domain != config.auth_domain {
+            return Err(
+                "auth_domain is frozen after first verifier configuration; \
+                 changing it would strand any in-flight bridge deposit"
+                    .into(),
+            );
+        }
+        // Other verifier-config fields (program hashes) may still be reconfigured
+        // while the ledger is pristine — auth_domain is the only field whose
+        // change has a deposit-stranding risk.
         if existing != *config && !ledger.is_pristine()? {
             return Err("cannot change verifier configuration after ledger state exists".into());
         }
@@ -2121,7 +2373,7 @@ mod tests {
             id: 1,
             payload: encode_external_kernel_message_for_rollup(
                 sample_other_rollup_address(),
-                signed_bridge_message(KernelBridgeConfig {
+                &signed_bridge_message(KernelBridgeConfig {
                     ticketer: sample_ticketer().into(),
                 }),
             ),
@@ -2139,7 +2391,6 @@ mod tests {
         run_with_host(&mut host);
 
         assert!(read_last_result(&host).is_none());
-        assert!(read_ledger(&host).unwrap().balances.is_empty());
         assert!(!host.debug.contains("invalid inbox message"));
         assert!(!host.debug.contains("transition failed"));
     }
@@ -2210,6 +2461,7 @@ mod tests {
         let config = KernelVerifierConfig {
             auth_domain: default_auth_domain(),
             verified_program_hashes: sample_program_hashes(),
+            operator_producer_owner_tag: ZERO,
         };
         host.write_store(
             PATH_VERIFIER_CONFIG,
@@ -2254,7 +2506,7 @@ mod tests {
             producer_cm,
             producer_enc: producer_enc,
         };
-        let message = encode_kernel_inbox_message(&KernelInboxMessage::Shield(shield_req)).unwrap();
+        let message = encode_external_kernel_message(&KernelInboxMessage::Shield(shield_req));
         host.inputs.push_back(InputMessage {
             level: 2,
             id: 1,
@@ -2298,6 +2550,7 @@ mod tests {
         let config = KernelVerifierConfig {
             auth_domain: sample_felt(0x41),
             verified_program_hashes: sample_program_hashes(),
+            operator_producer_owner_tag: ZERO,
         };
         let payload =
             encode_kernel_inbox_message(&signed_verifier_message(config.clone())).unwrap();
@@ -2312,7 +2565,7 @@ mod tests {
         host.inputs.push_back(InputMessage {
             level: 13,
             id: 0,
-            payload: encode_kernel_inbox_message(&KernelInboxMessage::DalPointer(pointer)).unwrap(),
+            payload: encode_external_kernel_message(&KernelInboxMessage::DalPointer(pointer)),
         });
 
         run_with_host(&mut host);
@@ -2349,7 +2602,7 @@ mod tests {
         host.inputs.push_back(InputMessage {
             level: 14,
             id: 0,
-            payload: encode_kernel_inbox_message(&KernelInboxMessage::DalPointer(pointer)).unwrap(),
+            payload: encode_external_kernel_message(&KernelInboxMessage::DalPointer(pointer)),
         });
 
         run_with_host(&mut host);
@@ -2380,7 +2633,7 @@ mod tests {
         let client_rseed = sample_felt(0x35);
         let client_enc = sample_encrypted_note(&address, 50, client_rseed, b"shield");
         let client_cm = sample_commitment(&address, 50, client_rseed);
-        let payload = encode_kernel_inbox_message(&KernelInboxMessage::Shield(KernelShieldReq {
+        let payload = encode_external_kernel_message(&KernelInboxMessage::Shield(KernelShieldReq {
             deposit_id: deposit_id_from_label("alice"),
             deposit_slot: 0,
             fee: MIN_TX_FEE,
@@ -2391,8 +2644,7 @@ mod tests {
             client_enc,
             producer_cm,
             producer_enc,
-        }))
-        .unwrap();
+        }));
         let mut bad_hash = hash(&payload);
         bad_hash[0] ^= 0xFF;
         let pointer = KernelDalPayloadPointer {
@@ -2406,7 +2658,7 @@ mod tests {
         host.inputs.push_back(InputMessage {
             level: 16,
             id: 0,
-            payload: encode_kernel_inbox_message(&KernelInboxMessage::DalPointer(pointer)).unwrap(),
+            payload: encode_external_kernel_message(&KernelInboxMessage::DalPointer(pointer)),
         });
 
         run_with_host(&mut host);
@@ -2414,8 +2666,8 @@ mod tests {
         let _ = producer_fee;
         let ledger = read_ledger(&host).unwrap();
         assert!(
-            ledger.balances.is_empty(),
-            "DAL hash mismatch must not credit any balance"
+            ledger.deposit_slots.is_empty(),
+            "DAL hash mismatch must not allocate any deposit slot"
         );
         assert!(ledger.tree.leaves.is_empty());
         match read_last_result(&host).unwrap() {
@@ -2453,7 +2705,7 @@ mod tests {
             enc_3: enc_3.clone(),
             proof: sample_kernel_test_proof(),
         };
-        let message = encode_kernel_inbox_message(&KernelInboxMessage::Transfer(req)).unwrap();
+        let message = encode_external_kernel_message(&KernelInboxMessage::Transfer(req));
         host.inputs.push_back(InputMessage {
             level: 5,
             id: 0,
@@ -2517,7 +2769,7 @@ mod tests {
             enc_3,
             proof: sample_kernel_test_proof(),
         };
-        let message = encode_kernel_inbox_message(&KernelInboxMessage::Transfer(req)).unwrap();
+        let message = encode_external_kernel_message(&KernelInboxMessage::Transfer(req));
         host.inputs.push_back(InputMessage {
             level: 5,
             id: 1,
@@ -2565,7 +2817,7 @@ mod tests {
             enc_fee: enc_fee.clone(),
             proof: sample_kernel_test_proof(),
         };
-        let message = encode_kernel_inbox_message(&KernelInboxMessage::Unshield(req)).unwrap();
+        let message = encode_external_kernel_message(&KernelInboxMessage::Unshield(req));
         host.inputs.push_back(InputMessage {
             level: 6,
             id: 1,
@@ -2631,7 +2883,7 @@ mod tests {
             enc_fee,
             proof: sample_kernel_test_proof(),
         };
-        let message = encode_kernel_inbox_message(&KernelInboxMessage::Unshield(req)).unwrap();
+        let message = encode_external_kernel_message(&KernelInboxMessage::Unshield(req));
         host.inputs.push_back(InputMessage {
             level: 6,
             id: 2,
@@ -2678,7 +2930,7 @@ mod tests {
             enc_fee,
             proof: sample_kernel_test_proof(),
         };
-        let message = encode_kernel_inbox_message(&KernelInboxMessage::Unshield(req)).unwrap();
+        let message = encode_external_kernel_message(&KernelInboxMessage::Unshield(req));
         host.inputs.push_back(InputMessage {
             level: 6,
             id: 24,
@@ -2712,7 +2964,7 @@ mod tests {
         let nf = sample_felt(0xAB);
         let root = read_ledger(&host).unwrap().tree.root();
         let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
                 root,
                 vec![nf],
                 33,
@@ -2721,8 +2973,7 @@ mod tests {
                 None,
                 cm_fee,
                 enc_fee,
-            )))
-            .unwrap();
+            )));
         host.inputs.push_back(InputMessage {
             level: 6,
             id: 25,
@@ -2768,7 +3019,7 @@ mod tests {
         let root = read_ledger(&host).unwrap().tree.root();
 
         let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
                 root,
                 vec![nf],
                 33,
@@ -2777,8 +3028,7 @@ mod tests {
                 Some(enc_change.clone()),
                 cm_fee,
                 enc_fee.clone(),
-            )))
-            .unwrap();
+            )));
         host.inputs.push_back(InputMessage {
             level: 6,
             id: 2,
@@ -2838,7 +3088,7 @@ mod tests {
         let nf = sample_felt(0xA6);
         let root = read_ledger(&host).unwrap().tree.root();
         let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
                 root,
                 vec![nf],
                 33,
@@ -2847,8 +3097,7 @@ mod tests {
                 None,
                 cm_fee,
                 enc_fee,
-            )))
-            .unwrap();
+            )));
         host.inputs.push_back(InputMessage {
             level: 6,
             id: 3,
@@ -2881,7 +3130,7 @@ mod tests {
         let root = read_ledger(&host).unwrap().tree.root();
         host.write_store(PATH_WITHDRAWAL_COUNT, &[0x01]);
         let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
                 root,
                 vec![nf],
                 33,
@@ -2890,8 +3139,7 @@ mod tests {
                 None,
                 cm_fee,
                 enc_fee,
-            )))
-            .unwrap();
+            )));
         host.inputs.push_back(InputMessage {
             level: 6,
             id: 30,
@@ -2927,7 +3175,7 @@ mod tests {
         let nf = sample_felt(0xA7);
         let root = read_ledger(&host).unwrap().tree.root();
         let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
                 root,
                 vec![nf],
                 33,
@@ -2936,8 +3184,7 @@ mod tests {
                 None,
                 cm_fee,
                 enc_fee,
-            )))
-            .unwrap();
+            )));
         host.inputs.push_back(InputMessage {
             level: 6,
             id: 4,
@@ -2970,7 +3217,7 @@ mod tests {
         let first_cm_fee = sample_commitment(&address, 1, [0x35; 32]);
         let first_nf = sample_felt(0xA9);
         let first_message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
                 read_ledger(&host).unwrap().tree.root(),
                 vec![first_nf],
                 33,
@@ -2979,8 +3226,7 @@ mod tests {
                 None,
                 first_cm_fee,
                 first_enc_fee,
-            )))
-            .unwrap();
+            )));
         host.inputs.push_back(InputMessage {
             level: 6,
             id: 31,
@@ -2995,7 +3241,7 @@ mod tests {
         let second_cm_fee = sample_commitment(&address, 1, [0x36; 32]);
         let second_nf = sample_felt(0xAA);
         let second_message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
                 second_root,
                 vec![second_nf],
                 34,
@@ -3004,8 +3250,7 @@ mod tests {
                 None,
                 second_cm_fee,
                 second_enc_fee,
-            )))
-            .unwrap();
+            )));
         host.inputs.push_back(InputMessage {
             level: 6,
             id: 32,
@@ -3049,7 +3294,7 @@ mod tests {
         let nf = sample_felt(0xA8);
         let root = read_ledger(&host).unwrap().tree.root();
         let message =
-            encode_kernel_inbox_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
+            encode_external_kernel_message(&KernelInboxMessage::Unshield(sample_kernel_unshield_req(
                 root,
                 vec![nf],
                 33,
@@ -3058,8 +3303,7 @@ mod tests {
                 None,
                 cm_fee,
                 enc_fee,
-            )))
-            .unwrap();
+            )));
         host.inputs.push_back(InputMessage {
             level: 6,
             id: 5,
@@ -3084,10 +3328,9 @@ mod tests {
     #[test]
     fn configures_bridge_ticketer_via_kernel_message() {
         let mut host = MockHost::default();
-        let message = encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
+        let message = encode_external_kernel_message(&signed_bridge_message(KernelBridgeConfig {
             ticketer: sample_ticketer().into(),
-        }))
-        .unwrap();
+        }));
         host.inputs.push_back(InputMessage {
             level: 1,
             id: 0,
@@ -3112,7 +3355,7 @@ mod tests {
         host.inputs.push_back(InputMessage {
             level: 1,
             id: 5,
-            payload: encode_external_kernel_message(signed_bridge_message(KernelBridgeConfig {
+            payload: encode_external_kernel_message(&signed_bridge_message(KernelBridgeConfig {
                 ticketer: sample_ticketer().into(),
             })),
         });
@@ -3135,12 +3378,12 @@ mod tests {
         let original = KernelVerifierConfig {
             auth_domain: sample_felt(0x33),
             verified_program_hashes: sample_program_hashes(),
+            operator_producer_owner_tag: ZERO,
         };
         host.inputs.push_back(InputMessage {
             level: 6,
             id: 1,
-            payload: encode_kernel_inbox_message(&signed_verifier_message(original.clone()))
-                .unwrap(),
+            payload: encode_external_kernel_message(&signed_verifier_message(original.clone())),
         });
         run_with_host(&mut host);
         {
@@ -3152,8 +3395,9 @@ mod tests {
         let reconfigured = KernelVerifierConfig {
             auth_domain: new_domain,
             verified_program_hashes: sample_program_hashes(),
+            operator_producer_owner_tag: ZERO,
         };
-        let message = encode_kernel_inbox_message(&signed_verifier_message(reconfigured)).unwrap();
+        let message = encode_external_kernel_message(&signed_verifier_message(reconfigured));
         host.inputs.push_back(InputMessage {
             level: 7,
             id: 2,
@@ -3166,7 +3410,11 @@ mod tests {
         assert_ne!(ledger.auth_domain, new_domain);
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
-                assert!(message.contains("cannot change verifier configuration"))
+                assert!(
+                    message.contains("auth_domain is frozen"),
+                    "unexpected error: {}",
+                    message
+                )
             }
             other => panic!("unexpected rollup result: {:?}", other),
         }
@@ -3179,8 +3427,9 @@ mod tests {
         let config = KernelVerifierConfig {
             auth_domain: new_domain,
             verified_program_hashes: sample_program_hashes(),
+            operator_producer_owner_tag: ZERO,
         };
-        let message = encode_kernel_inbox_message(&signed_verifier_message(config)).unwrap();
+        let message = encode_external_kernel_message(&signed_verifier_message(config));
         host.inputs.push_back(InputMessage {
             level: 8,
             id: 1,
@@ -3198,6 +3447,74 @@ mod tests {
     }
 
     #[test]
+    fn auth_domain_is_frozen_after_first_configuration_even_on_pristine_ledger() {
+        // Freezing auth_domain after the first install closes a deposit-stranding
+        // race: a wallet that read auth_domain D and submitted an L1 ticket
+        // computed with D would otherwise be silently broken if an admin
+        // reconfigured to D' before the ticket lands.
+        let mut host = MockHost::default();
+        let initial_domain = sample_felt(0x55);
+        let initial = KernelVerifierConfig {
+            auth_domain: initial_domain,
+            verified_program_hashes: sample_program_hashes(),
+            operator_producer_owner_tag: ZERO,
+        };
+        host.inputs.push_back(InputMessage {
+            level: 1,
+            id: 0,
+            payload: encode_external_kernel_message(&signed_verifier_message(initial)),
+        });
+        // Reconfigure the program hashes only — same auth_domain — should
+        // succeed (still pristine).
+        let new_hashes = ProgramHashes {
+            shield: hash(b"new-shield"),
+            transfer: hash(b"new-transfer"),
+            unshield: hash(b"new-unshield"),
+        };
+        let same_domain_new_hashes = KernelVerifierConfig {
+            auth_domain: initial_domain,
+            verified_program_hashes: new_hashes.clone(),
+            operator_producer_owner_tag: ZERO,
+        };
+        host.inputs.push_back(InputMessage {
+            level: 2,
+            id: 0,
+            payload: encode_external_kernel_message(&signed_verifier_message(
+                same_domain_new_hashes.clone(),
+            )),
+        });
+        // Reconfigure with a different auth_domain — must be rejected by
+        // the freeze rule even though the ledger is still pristine.
+        let new_domain = sample_felt(0x66);
+        let different_domain = KernelVerifierConfig {
+            auth_domain: new_domain,
+            verified_program_hashes: new_hashes,
+            operator_producer_owner_tag: ZERO,
+        };
+        host.inputs.push_back(InputMessage {
+            level: 3,
+            id: 0,
+            payload: encode_external_kernel_message(&signed_verifier_message(different_domain)),
+        });
+
+        run_with_host(&mut host);
+
+        let ledger = read_ledger(&host).unwrap();
+        assert_eq!(
+            ledger.auth_domain, initial_domain,
+            "auth_domain must remain frozen after first install"
+        );
+        match read_last_result(&host).unwrap() {
+            KernelResult::Error { message } => assert!(
+                message.contains("auth_domain is frozen"),
+                "unexpected error: {}",
+                message
+            ),
+            other => panic!("expected freeze error, got: {:?}", other),
+        }
+    }
+
+    #[test]
     fn rejects_bridge_deposit_before_verifier_configuration() {
         let mut host = MockHost::default();
         install_test_bridge(&mut host);
@@ -3212,7 +3529,6 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.balances.get(&deposit_key), None);
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => assert!(
                 message.contains("bridge deposits not accepted before verifier configuration"),
@@ -3231,12 +3547,13 @@ mod tests {
         let config = KernelVerifierConfig {
             auth_domain: sample_felt(0x57),
             verified_program_hashes: sample_program_hashes(),
+            operator_producer_owner_tag: ZERO,
         };
 
         host.inputs.push_back(InputMessage {
             level: 8,
             id: 1,
-            payload: encode_kernel_inbox_message(&signed_verifier_message(config.clone())).unwrap(),
+            payload: encode_external_kernel_message(&signed_verifier_message(config.clone())),
         });
         host.inputs.push_back(InputMessage {
             level: 9,
@@ -3265,6 +3582,7 @@ mod tests {
             KernelVerifierConfig {
                 auth_domain: sample_felt(0x56),
                 verified_program_hashes: sample_program_hashes(),
+                operator_producer_owner_tag: ZERO,
             },
         )
         .unwrap();
@@ -3273,8 +3591,7 @@ mod tests {
         let mut host = MockHost::with_inputs(vec![InputMessage {
             level: 8,
             id: 1,
-            payload: encode_kernel_inbox_message(&KernelInboxMessage::ConfigureVerifier(signed))
-                .unwrap(),
+            payload: encode_external_kernel_message(&KernelInboxMessage::ConfigureVerifier(signed)),
         }]);
 
         run_with_host(&mut host);
@@ -3295,12 +3612,12 @@ mod tests {
         let original = KernelVerifierConfig {
             auth_domain: default_auth_domain(),
             verified_program_hashes: sample_program_hashes(),
+            operator_producer_owner_tag: ZERO,
         };
         host.inputs.push_back(InputMessage {
             level: 6,
             id: 1,
-            payload: encode_kernel_inbox_message(&signed_verifier_message(original.clone()))
-                .unwrap(),
+            payload: encode_external_kernel_message(&signed_verifier_message(original.clone())),
         });
         run_with_host(&mut host);
         {
@@ -3312,11 +3629,11 @@ mod tests {
         host.inputs.push_back(InputMessage {
             level: 8,
             id: 3,
-            payload: encode_kernel_inbox_message(&signed_verifier_message(KernelVerifierConfig {
+            payload: encode_external_kernel_message(&signed_verifier_message(KernelVerifierConfig {
                 auth_domain: original.auth_domain,
                 verified_program_hashes: changed_hashes,
-            }))
-            .unwrap(),
+                operator_producer_owner_tag: ZERO,
+            })),
         });
 
         run_with_host(&mut host);
@@ -3347,8 +3664,7 @@ mod tests {
         let mut host = MockHost::with_inputs(vec![InputMessage {
             level: 5,
             id: 1,
-            payload: encode_kernel_inbox_message(&KernelInboxMessage::ConfigureBridge(signed))
-                .unwrap(),
+            payload: encode_external_kernel_message(&KernelInboxMessage::ConfigureBridge(signed)),
         }]);
 
         run_with_host(&mut host);
@@ -3386,7 +3702,7 @@ mod tests {
             producer_cm,
             producer_enc,
         };
-        let message = encode_kernel_inbox_message(&KernelInboxMessage::Shield(shield_req)).unwrap();
+        let message = encode_external_kernel_message(&KernelInboxMessage::Shield(shield_req));
         let mut host = MockHost::with_inputs(vec![InputMessage {
             level: 3,
             id: 2,
@@ -3416,7 +3732,6 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert!(ledger.balances.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("invalid inbox message"))
@@ -3431,18 +3746,18 @@ mod tests {
         let config = KernelVerifierConfig {
             auth_domain: sample_felt(0x55),
             verified_program_hashes: sample_program_hashes(),
+            operator_producer_owner_tag: ZERO,
         };
         let mut host = MockHost::with_inputs(vec![
             InputMessage {
                 level: 8,
                 id: 1,
-                payload: encode_kernel_inbox_message(&signed_verifier_message(config.clone()))
-                    .unwrap(),
+                payload: encode_external_kernel_message(&signed_verifier_message(config.clone())),
             },
             InputMessage {
                 level: 9,
                 id: 2,
-                payload: encode_kernel_inbox_message(&KernelInboxMessage::Shield(
+                payload: encode_external_kernel_message(&KernelInboxMessage::Shield(
                     KernelShieldReq {
                         deposit_id: deposit_id_from_label("alice"),
             deposit_slot: 0,
@@ -3457,8 +3772,7 @@ mod tests {
                         producer_cm: ZERO,
                         producer_enc: None,
                     },
-                ))
-                .unwrap(),
+                )),
             },
         ]);
 
@@ -3481,6 +3795,7 @@ mod tests {
         let config = KernelVerifierConfig {
             auth_domain: default_auth_domain(),
             verified_program_hashes: sample_program_hashes(),
+            operator_producer_owner_tag: ZERO,
         };
         let verifier = DirectProofVerifier::from_kernel_config(&config).unwrap();
 
@@ -3522,7 +3837,6 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert!(ledger.balances.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("unexpected ticketer"))
@@ -3542,7 +3856,6 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert!(ledger.balances.is_empty());
         assert!(host
             .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
             .is_none());
@@ -3573,7 +3886,6 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert!(ledger.balances.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("token_id must be 0"))
@@ -3601,7 +3913,6 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert!(ledger.balances.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("creator does not match transfer sender"))
@@ -3629,7 +3940,6 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert!(ledger.balances.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("metadata must be None"))
@@ -3657,7 +3967,6 @@ mod tests {
         run_with_host(&mut host);
 
         let ledger = read_ledger(&host).unwrap();
-        assert!(ledger.balances.is_empty());
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("receiver is not UTF-8"))
@@ -3669,10 +3978,9 @@ mod tests {
     #[test]
     fn rejects_implicit_bridge_ticketer_configuration() {
         let mut host = MockHost::default();
-        let message = encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
+        let message = encode_external_kernel_message(&signed_bridge_message(KernelBridgeConfig {
             ticketer: sample_l1_receiver().into(),
-        }))
-        .unwrap();
+        }));
         host.inputs.push_back(InputMessage {
             level: 11,
             id: 0,
@@ -3701,10 +4009,9 @@ mod tests {
             apply_deposit(&mut state, &deposit_recipient_string(&deposit_id_from_label("alice")), 3).unwrap();
         }
 
-        let message = encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
+        let message = encode_external_kernel_message(&signed_bridge_message(KernelBridgeConfig {
             ticketer: sample_other_ticketer().into(),
-        }))
-        .unwrap();
+        }));
         host.inputs.push_back(InputMessage {
             level: 12,
             id: 0,
@@ -3734,10 +4041,9 @@ mod tests {
             apply_deposit(&mut state, &deposit_recipient_string(&deposit_id_from_label("alice")), 3).unwrap();
         }
 
-        let message = encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
+        let message = encode_external_kernel_message(&signed_bridge_message(KernelBridgeConfig {
             ticketer: sample_ticketer().into(),
-        }))
-        .unwrap();
+        }));
         host.inputs.push_back(InputMessage {
             level: 12,
             id: 1,
@@ -3874,19 +4180,6 @@ mod tests {
     }
 
     #[test]
-    fn read_ledger_rejects_non_utf8_balance_key() {
-        let mut host = MockHost::default();
-        host.write_store(PATH_BALANCE_ACCOUNT_COUNT, &1u64.to_le_bytes());
-        host.write_store(&indexed_path(PATH_BALANCE_INDEX_PREFIX, 0), &[0xFF, 0xFE]);
-
-        let err = match read_ledger(&host) {
-            Ok(_) => panic!("non-UTF-8 balance key must be rejected"),
-            Err(err) => err,
-        };
-        assert!(err.contains("not UTF-8"));
-    }
-
-    #[test]
     fn read_ledger_rejects_missing_persisted_withdrawal() {
         let mut host = MockHost::default();
         host.write_store(PATH_WITHDRAWAL_COUNT, &1u64.to_le_bytes());
@@ -3962,6 +4255,7 @@ mod tests {
         let config = KernelVerifierConfig {
             auth_domain: default_auth_domain(),
             verified_program_hashes: sample_program_hashes(),
+            operator_producer_owner_tag: ZERO,
         };
         host.write_store(
             PATH_VERIFIER_CONFIG,
@@ -4018,10 +4312,9 @@ mod tests {
     }
 
     fn install_test_bridge(host: &mut MockHost) {
-        let message = encode_kernel_inbox_message(&signed_bridge_message(KernelBridgeConfig {
+        let message = encode_external_kernel_message(&signed_bridge_message(KernelBridgeConfig {
             ticketer: sample_ticketer().into(),
-        }))
-        .unwrap();
+        }));
         host.inputs.push_back(InputMessage {
             level: 0,
             id: 0,
@@ -4172,15 +4465,15 @@ mod tests {
         bytes
     }
 
-    fn encode_external_kernel_message(message: KernelInboxMessage) -> Vec<u8> {
+    fn encode_external_kernel_message(message: &KernelInboxMessage) -> Vec<u8> {
         encode_external_kernel_message_for_rollup(sample_rollup_address(), message)
     }
 
     fn encode_external_kernel_message_for_rollup(
         rollup: SmartRollupAddress,
-        message: KernelInboxMessage,
+        message: &KernelInboxMessage,
     ) -> Vec<u8> {
-        let payload = encode_kernel_inbox_message(&message).unwrap();
+        let payload = tzel_core::kernel_wire::encode_kernel_inbox_message(message).unwrap();
         let mut framed = Vec::new();
         ExternalMessageFrame::Targetted {
             address: rollup,

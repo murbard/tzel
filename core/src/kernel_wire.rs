@@ -13,7 +13,7 @@ use tezos_data_encoding::enc::BinWriter;
 use tezos_data_encoding::encoding::HasEncoding;
 use tezos_data_encoding::nom::NomReader;
 
-pub const KERNEL_WIRE_VERSION: u16 = 15;
+pub const KERNEL_WIRE_VERSION: u16 = 16;
 pub const KERNEL_VERIFIER_CONFIG_KEY_INDEX: u32 = 0;
 pub const KERNEL_BRIDGE_CONFIG_KEY_INDEX: u32 = 1;
 const MAX_ACCOUNT_ID_BYTES: usize = 1024;
@@ -39,6 +39,14 @@ const MAX_UNSHIELD_PAYLOAD_BYTES: usize =
 pub struct KernelVerifierConfig {
     pub auth_domain: F,
     pub verified_program_hashes: ProgramHashes,
+    /// Operator's canonical DAL-producer-fee receiver, expressed as the
+    /// derived `owner_tag = H_owner(auth_root, auth_pub_seed, nk_tag)`.
+    /// Wallets compare this against their `profile.dal_fee_address`-derived
+    /// owner_tag and refuse to send if they disagree, so a misconfigured
+    /// wallet profile cannot silently route producer fees to the wrong
+    /// receiver. Distinct from the burned-fee policy: producer fees are
+    /// real notes that end up under the operator's spend authority.
+    pub operator_producer_owner_tag: F,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +210,7 @@ struct WireStarkProof {
 struct WireKernelVerifierConfig {
     auth_domain: WireFelt,
     verified_program_hashes: WireProgramHashes,
+    operator_producer_owner_tag: WireFelt,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, HasEncoding, NomReader, BinWriter)]
@@ -599,6 +608,7 @@ fn config_to_wire(config: &KernelVerifierConfig) -> WireKernelVerifierConfig {
     WireKernelVerifierConfig {
         auth_domain: felt_to_wire(&config.auth_domain),
         verified_program_hashes: program_hashes_to_wire(&config.verified_program_hashes),
+        operator_producer_owner_tag: felt_to_wire(&config.operator_producer_owner_tag),
     }
 }
 
@@ -615,6 +625,7 @@ fn config_from_wire(wire: WireKernelVerifierConfig) -> Result<KernelVerifierConf
     Ok(KernelVerifierConfig {
         auth_domain: wire_to_felt(wire.auth_domain)?,
         verified_program_hashes: program_hashes_from_wire(wire.verified_program_hashes)?,
+        operator_producer_owner_tag: wire_to_felt(wire.operator_producer_owner_tag)?,
     })
 }
 
@@ -1844,6 +1855,7 @@ mod tests {
                     transfer,
                     unshield,
                 },
+                operator_producer_owner_tag: ZERO,
             };
 
             let signed = sign_kernel_verifier_config(&ask, config).unwrap();

@@ -2601,9 +2601,8 @@ exit 2
 
 
     #[test]
-    fn test_unshield_queues_withdrawal_without_touching_existing_public_balance() {
+    fn test_unshield_queues_withdrawal() {
         let mut ledger = Ledger::new();
-        ledger.balances.insert("alice".into(), u64::MAX);
         let (cm_fee, enc_fee, _mh_fee) = test_output_note(0x57);
 
         let req = UnshieldReq {
@@ -2622,7 +2621,6 @@ exit 2
         let resp = ledger.unshield(&req).unwrap();
         assert_eq!(resp.change_index, None);
         assert_eq!(resp.producer_index, 0);
-        assert_eq!(ledger.balances.get("alice"), Some(&u64::MAX));
         assert_eq!(
             ledger.withdrawals,
             vec![WithdrawalRecord {
@@ -2636,7 +2634,6 @@ exit 2
     #[test]
     fn test_unshield_with_change_note_is_atomic_around_withdrawal_queueing() {
         let mut ledger = Ledger::new();
-        ledger.balances.insert("alice".into(), u64::MAX);
         let tree_size_before = ledger.tree.leaves.len();
         let memo_count_before = ledger.memos.len();
 
@@ -2666,7 +2663,6 @@ exit 2
         assert_eq!(resp.producer_index, tree_size_before + 1);
         assert_eq!(ledger.tree.leaves.len(), tree_size_before + 2);
         assert_eq!(ledger.memos.len(), memo_count_before + 2);
-        assert_eq!(ledger.balances.get("alice"), Some(&u64::MAX));
         assert_eq!(
             ledger.withdrawals,
             vec![WithdrawalRecord {
