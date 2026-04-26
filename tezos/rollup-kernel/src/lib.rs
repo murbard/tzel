@@ -29,7 +29,7 @@ use tezos_smart_rollup_encoding::{
     outbox::{OutboxMessage as TezosOutboxMessage, OutboxMessageTransaction},
 };
 use tzel_core::{
-    apply_deposit, apply_shield, apply_transfer,
+    apply_deposit, apply_transfer,
     canonical_wire::{decode_published_note, encode_published_note},
     default_auth_domain, hash, hash_merkle,
     kernel_wire::{

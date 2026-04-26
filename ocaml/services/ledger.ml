@@ -3,7 +3,6 @@
    - Append-only commitment Merkle tree (depth 48)
    - Global nullifier set
    - Historical root set (anchors)
-   - Public balance accounts
    - Pending withdrawals
 
    NOTE on protocol drift:

@@ -1740,9 +1740,6 @@ const DURABLE_NOTE_CHUNK_BYTES: usize = 1024;
 const MAX_PUBLISHED_NOTE_BYTES: usize = 4 * 1024 * 1024;
 const DURABLE_NULLIFIER_COUNT: &str = "/tzel/v1/state/nullifiers/count";
 const DURABLE_NULLIFIER_INDEX_PREFIX: &str = "/tzel/v1/state/nullifiers/index/";
-const DURABLE_BALANCE_COUNT: &str = "/tzel/v1/state/balances/count";
-const DURABLE_BALANCE_INDEX_PREFIX: &str = "/tzel/v1/state/balances/index/";
-const DURABLE_BALANCE_PREFIX: &str = "/tzel/v1/state/balances/by-key/";
 const DURABLE_DEPOSIT_BY_INTENT_PREFIX: &str = "/tzel/v1/state/deposits/by-intent/";
 const DURABLE_DEPOSIT_SLOT_PREFIX: &str = "/tzel/v1/state/deposits/by-id/";
 const DURABLE_VERIFIER_CONFIG: &str = "/tzel/v1/state/verifier_config.bin";
@@ -1809,34 +1806,6 @@ fn resolve_rollup_unshield_recipient(
         Some(value) => validate_l1_withdrawal_recipient(value),
         None => Ok(rollup.source_address_info()?.hash),
     }
-}
-
-fn resolved_profile_public_balance_key(
-    profile: &WalletNetworkProfile,
-    rollup: &RollupRpc,
-) -> Result<String, String> {
-    if is_implicit_tezos_account_id(&profile.public_account)
-        || parse_public_balance_key(&profile.public_account).is_some()
-    {
-        return Ok(profile.public_account.clone());
-    }
-    let source = rollup.source_address_info()?;
-    canonicalize_public_balance_key(&source.hash, &profile.public_account)
-}
-
-fn legacy_plain_public_balance_label(
-    profile: &WalletNetworkProfile,
-    canonical_key: &str,
-) -> Option<String> {
-    let raw = profile.public_account.trim();
-    if raw.is_empty()
-        || raw == canonical_key
-        || is_implicit_tezos_account_id(raw)
-        || parse_public_balance_key(raw).is_some()
-    {
-        return None;
-    }
-    Some(raw.to_string())
 }
 
 fn effective_octez_protocol(profile: &WalletNetworkProfile) -> Option<&str> {
@@ -2049,15 +2018,6 @@ impl<'a> RollupRpc<'a> {
         Ok(out)
     }
 
-    fn read_string_at_block(&self, block_ref: &str, key: &str) -> Result<String, String> {
-        let bytes = self.read_durable_bytes_at_block(block_ref, key)?;
-        Self::parse_string(key, bytes)
-    }
-
-    fn parse_string(key: &str, bytes: Vec<u8>) -> Result<String, String> {
-        String::from_utf8(bytes).map_err(|_| format!("durable string at {} is not UTF-8", key))
-    }
-
     fn block_level(&self, block_ref: &str) -> Result<i32, String> {
         let raw = get_text(&self.block_level_url(block_ref))?;
         if let Ok(level) = serde_json::from_str::<i32>(&raw) {
@@ -2213,10 +2173,6 @@ impl<'a> RollupRpc<'a> {
         Ok(nullifiers)
     }
 
-    fn load_balances(&self) -> Result<std::collections::HashMap<String, u64>, String> {
-        self.load_balances_at_block("head")
-    }
-
     /// For each pending deposit's intent, fetch the kernel-side list of open
     /// slots and their amounts. The wallet uses this to assign `slot_id` on
     /// pending deposits during sync.
@@ -2247,7 +2203,7 @@ impl<'a> RollupRpc<'a> {
                     position
                 );
                 let id = self.read_u64_at_block(&head, &id_key)?;
-                if let Some((amount, status)) = self.try_read_deposit_slot(&head, id)? {
+                if let Some((_intent, amount, status)) = self.try_read_deposit_slot(&head, id)? {
                     if status == 0 {
                         slots.push(DepositSlotView { id, amount });
                     }
@@ -2260,13 +2216,15 @@ impl<'a> RollupRpc<'a> {
         Ok(map)
     }
 
-    /// Read a deposit slot record. Returns `Some((amount, status))` if the
-    /// slot exists, `None` if missing. Status 0 = open, 1 = consumed.
+    /// Return `(intent, amount, status)` for an existing slot record, or
+    /// `None` if the slot id has never been written. Status: 0 = open,
+    /// 1 = consumed (tombstone). For tombstones the intent and amount
+    /// fields are not present in storage and are returned as `ZERO`/`0`.
     fn try_read_deposit_slot(
         &self,
         block_ref: &str,
         slot_id: u64,
-    ) -> Result<Option<(u64, u8)>, String> {
+    ) -> Result<Option<(F, u64, u8)>, String> {
         let key = format!("{}{:016x}", DURABLE_DEPOSIT_SLOT_PREFIX, slot_id);
         if self.read_durable_length_at_block(block_ref, &key)?.is_none() {
             return Ok(None);
@@ -2284,35 +2242,17 @@ impl<'a> RollupRpc<'a> {
                         bytes.len()
                     ));
                 }
+                let mut intent: F = ZERO;
+                intent.copy_from_slice(&bytes[1..33]);
                 let amount = u64::from_le_bytes(bytes[33..].try_into().unwrap());
-                Ok(Some((amount, 0)))
+                Ok(Some((intent, amount, 0)))
             }
-            1 => Ok(Some((0, 1))),
+            1 => Ok(Some((ZERO, 0, 1))),
             other => Err(format!(
                 "deposit slot {} has unknown status byte 0x{:02x}",
                 slot_id, other
             )),
         }
-    }
-
-    fn load_balances_at_block(
-        &self,
-        block_ref: &str,
-    ) -> Result<std::collections::HashMap<String, u64>, String> {
-        let count: usize = self
-            .read_u64_at_block(block_ref, DURABLE_BALANCE_COUNT)?
-            .try_into()
-            .map_err(|_| "balance count does not fit in usize".to_string())?;
-        let mut balances = std::collections::HashMap::with_capacity(count);
-        for i in 0..count {
-            let account = self.read_string_at_block(
-                block_ref,
-                &indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, i as u64),
-            )?;
-            let amount = self.read_u64_at_block(block_ref, &balance_durable_key(&account))?;
-            balances.insert(account, amount);
-        }
-        Ok(balances)
     }
 
     /// Probe the rollup's durable storage for an installed verifier config.
@@ -2703,14 +2643,6 @@ fn indexed_durable_note_chunk_key(index: u64, chunk_index: usize) -> String {
         "{}{}{chunk_index:08x}",
         indexed_durable_key(DURABLE_NOTE_PREFIX, index),
         DURABLE_NOTE_CHUNK_PREFIX
-    )
-}
-
-fn balance_durable_key(account: &str) -> String {
-    format!(
-        "{}{}",
-        DURABLE_BALANCE_PREFIX,
-        hex::encode(account.as_bytes())
     )
 }
 
@@ -4020,6 +3952,13 @@ fn cmd_scan(path: &str, ledger: &str) -> Result<(), String> {
         summary.slot_assignments,
         w.available_balance()
     );
+    if summary.orphan_slots > 0 {
+        println!(
+            "WARNING: {} orphan deposit slot(s) detected for settled deposits. \
+             Run `tzel-wallet drain-orphan-slot --slot-id <id>` to recover the L1 mutez.",
+            summary.orphan_slots
+        );
+    }
     Ok(())
 }
 
@@ -4276,14 +4215,6 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).expect("fixture read"))
                 .expect("fixture parse")
         })
-    }
-
-    #[test]
-    fn balance_durable_key_hex_encodes_public_account() {
-        assert_eq!(
-            balance_durable_key("tzelshadownet"),
-            "/tzel/v1/state/balances/by-key/747a656c736861646f776e6574"
-        );
     }
 
     #[test]
@@ -7550,7 +7481,7 @@ fn cmd_drain_orphan_slot(
     let rollup = RollupRpc::new(profile);
     let head_hash = rollup.head_hash()?;
     // Read the slot's intent and amount directly from durable storage.
-    let (slot_amount, slot_status) = rollup
+    let (slot_intent, slot_amount, slot_status) = rollup
         .try_read_deposit_slot(&head_hash, slot_id)?
         .ok_or_else(|| format!("deposit slot {} does not exist on the rollup", slot_id))?;
     if slot_status != 0 {
@@ -7559,21 +7490,28 @@ fn cmd_drain_orphan_slot(
             slot_id
         ));
     }
-    // Find the wallet's settled deposit whose intent / amount matches the
-    // slot. We require `settled` to ensure the user has already received the
-    // bound recipient note (i.e., this is unambiguously an orphan, not an
-    // unobserved fresh deposit).
+    // Find the wallet's settled deposit whose intent AND amount match the
+    // slot. Matching only on amount would let a deposit-with-different-intent
+    // pass through (the kernel would reject, but at the cost of wasted
+    // proving). The slot.intent is the canonical key.
     let pending = wallet
         .pending_deposits
         .iter()
-        .find(|d| d.settled && d.amount == slot_amount && d.slot_id != Some(slot_id))
+        .find(|d| {
+            d.settled
+                && d.deposit_id == slot_intent
+                && d.amount == slot_amount
+                && d.slot_id != Some(slot_id)
+        })
         .cloned()
         .ok_or_else(|| {
             format!(
-                "no settled deposit witness in wallet matches slot {} (amount {} mutez). \
+                "no settled deposit witness in wallet matches slot {} (intent {}, amount {} mutez). \
                  Run `tzel-wallet sync` first; if the slot was never witness-tracked by \
                  this wallet, it cannot be drained.",
-                slot_id, slot_amount
+                slot_id,
+                hex::encode(&slot_intent),
+                slot_amount,
             )
         })?;
 
@@ -7662,6 +7600,17 @@ fn cmd_transfer_rollup(
     let fee = resolve_requested_tx_fee(fee, snapshot.required_tx_fee)?;
     ensure_positive_dal_fee(profile.dal_fee)?;
     let root = snapshot.current_root();
+
+    // Verify the producer-fee receiver matches what the operator published.
+    // Without this, a misconfigured profile silently routes the fee note
+    // to a non-operator receiver.
+    let head_hash = rollup.head_hash()?;
+    let wallet_dal_owner_tag = owner_tag(
+        &profile.dal_fee_address.auth_root,
+        &profile.dal_fee_address.auth_pub_seed,
+        &profile.dal_fee_address.nk_tag,
+    );
+    rollup.ensure_operator_producer_owner_tag_matches(&head_hash, &wallet_dal_owner_tag)?;
 
     let mut w = load_wallet(path)?;
     let outgoing_seed = w.account().outgoing_seed;
@@ -8377,42 +8326,6 @@ mod network_profile_tests {
 
         let err = load_required_network_profile(wallet_path_str).unwrap_err();
         assert!(err.contains("operator_url requires operator_bearer_token"));
-    }
-
-    #[test]
-    fn rollup_rpc_load_balances_preserves_raw_json_deposit_balance_key() {
-        // Test-only synthetic deposit id; the production key is computed via
-        // shield_intent at deposit time.
-        let deposit_key = deposit_recipient_string(&hash(b"alice"));
-        let amount = 123u64;
-        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
-            (
-                format!(
-                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
-                    DURABLE_BALANCE_COUNT
-                ),
-                (200, format!("\"{}\"", hex::encode(1u64.to_le_bytes()))),
-            ),
-            (
-                format!(
-                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
-                    indexed_durable_key(DURABLE_BALANCE_INDEX_PREFIX, 0)
-                ),
-                (200, format!("\"{}\"", deposit_key)),
-            ),
-            (
-                format!(
-                    "/global/block/head/durable/wasm_2_0_0/value?key={}",
-                    balance_durable_key(&deposit_key)
-                ),
-                (200, format!("\"{}\"", hex::encode(amount.to_le_bytes()))),
-            ),
-        ]));
-        let profile = super::tests::rollup_profile_for_url(&base_url);
-
-        let balances = RollupRpc::new(&profile).load_balances().unwrap();
-
-        assert_eq!(balances.get(&deposit_key), Some(&amount));
     }
 
     // bridge_deposit_persists_secret_before_l1_submission was removed when the
