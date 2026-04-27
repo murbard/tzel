@@ -456,20 +456,16 @@ By design (the constraint that closes the dust-bricking attack), but
 the doc comment at the top of `shield.cairo` does not make this
 explicit; only the wallet code does.
 
-### F-C-6 [LOW, OPEN] — Producer note witness is unconstrained relative to recipient
+### F-C-6 [LOW, INVALID] — Producer note witness is unconstrained relative to recipient
 
-Nothing in the circuit prevents the prover from passing
-`(producer_auth_root, producer_auth_pub_seed, producer_nk_tag,
-producer_d_j) == (auth_root, auth_pub_seed, nk_tag, d_j)` and
-`producer_rseed == rseed`. With `producer_fee == v_note`, that yields
-`cm_producer == cm_new`. The kernel's replay set tracks `cm_new` only,
-so two appended leaves with identical cm are not blocked at the
-kernel level — both are independently spendable (different positions
-→ different nullifiers).
-
-Same failure mode as the wallet routing producer notes back to itself,
-which the kernel also doesn't enforce. Worth noting that the *circuit*
-makes it trivially possible.
+**Decision: invalid.** Originally framed as an exploit where the prover
+routes the producer fee back to themselves, "stealing" it from the
+operator. There is no rollup operator — the producer fee is paid to
+whichever DAL slot publisher includes the transaction, and publishers
+gate inclusion off-chain by checking the producer note's `owner_tag`
+matches their own. A prover who sets `producer == recipient` is paying
+themselves; no publisher will bundle the transaction (no fee for them),
+so it never reaches the kernel. Self-defeating, not exploitable.
 
 ### F-C-7 [LOW, WONTFIX] — `producer_fee > 0` is the only positivity check in the circuit
 
@@ -550,21 +546,23 @@ no fix without a different field.
 
 ## Kernel-level enforcement gaps (out of audit scope, pre-existing)
 
-### F-X-1 [MED, OPEN] — Producer-fee owner_tag not enforced on chain
+### F-X-1 [MED, INVALID] — Producer-fee owner_tag not enforced on chain
 
-The kernel's verifier config has `operator_producer_owner_tag` but
-the kernel never checks the producer note's owner_tag against it.
-The wallet's `cmd_shield_rollup` checks via
-`ensure_operator_producer_owner_tag_matches`, but a malicious or
-rogue wallet/prover can route the producer note anywhere — including
-back to themselves — bypassing the operator's revenue. Symmetric
-issue exists on transfer and unshield.
+**Decision: invalid — wrong mental model.** The original framing assumed
+a privileged rollup operator collecting producer fees, and treated the
+absence of a kernel cross-check as theft-enabling. There is no such
+role: the producer fee is a market price paid to whichever DAL slot
+publisher chooses to include the transaction. Publishers (anyone
+willing to pay a baker for a slot) enforce their own inclusion policy
+off-chain — they only bundle a transaction if the producer note is
+payable to them. A wallet that routes the fee to "the wrong receiver"
+just won't get included.
 
-This is a pre-existing kernel-level gap, not introduced by the
-redesign. Documented as wallet-side enforcement only in the
-`KernelVerifierConfig::operator_producer_owner_tag` doc comment.
-Fixing on-chain would require exposing `producer_owner_tag` as a
-public output of every spend circuit and adding a kernel check.
+The kernel field `operator_producer_owner_tag` and the wallet helper
+`ensure_operator_producer_owner_tag_matches` are vestiges of this wrong
+model and have been left in code with corrected docs; their actual role
+is at most a deployment-blessed default publisher hint, not a
+consensus-relevant binding. Removing them is a separate cleanup.
 
 ---
 
@@ -621,11 +619,11 @@ These were verified during the audit and stand as positive results:
 | F-C-3  | LOW      | WONTFIX (caller-layer responsibility) |
 | F-C-4  | LOW      | WONTFIX (`try_into().unwrap()` IS the bound check) |
 | F-C-5  | INFO     | WONTFIX (by design)  |
-| F-C-6  | LOW      | OPEN (subsumed by F-X-1) |
+| F-C-6  | LOW      | INVALID (no operator role; publisher gates inclusion) |
 | F-C-7  | LOW      | WONTFIX (kernel-layer policy) |
 | F-C-8  | INFO     | WONTFIX (privacy/recovery trade-off) |
 | F-C-9  | INFO     | WONTFIX (type system enforces) |
 | F-C-10 | INFO     | WONTFIX (caller-layer responsibility) |
 | F-C-11 | INFO     | WONTFIX (251-bit felt forced) |
 | F-C-12 | INFO     | FIXED    |
-| F-X-1  | MED      | OPEN     |
+| F-X-1  | MED      | INVALID (no operator role; publisher gates inclusion) |

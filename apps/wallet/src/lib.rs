@@ -2259,27 +2259,32 @@ impl<'a> RollupRpc<'a> {
         Ok(())
     }
 
-    /// Read the operator's canonical producer-fee owner_tag from the
-    /// kernel's verifier config. Returns `None` if the verifier has not
-    /// been configured.
+    /// Read the deployment's blessed default DAL-slot-publisher owner_tag
+    /// from the kernel's verifier config. Returns `None` if the verifier
+    /// has not been configured. This is an advisory hint, not a
+    /// security-critical value: producer fees are paid in a permissionless
+    /// market to whichever DAL slot publisher chooses to include the
+    /// transaction, and publishers gate inclusion off-chain. The kernel
+    /// does not cross-check this field.
     fn read_operator_producer_owner_tag(&self, block_ref: &str) -> Result<Option<F>, String> {
         let Some(bytes) =
             self.read_optional_durable_bytes_at_block(block_ref, DURABLE_VERIFIER_CONFIG)?
         else {
             return Ok(None);
         };
-        // Decode the kernel verifier config to extract the operator's
-        // expected producer owner_tag.
         let cfg = decode_kernel_verifier_config(&bytes)
             .map_err(|e| format!("kernel verifier config decode: {}", e))?;
         Ok(Some(cfg.operator_producer_owner_tag))
     }
 
-    /// Confirm `wallet_dal_fee_owner_tag` matches the rollup-published
-    /// operator-producer owner_tag. Refuses if the rollup has the field
-    /// set non-zero AND it disagrees with the wallet's. A zero (unset)
-    /// rollup-side value means the operator hasn't published an expected
-    /// owner_tag — accept the wallet's choice but warn.
+    /// Advisory check that `wallet_dal_fee_owner_tag` matches the
+    /// deployment's published default-publisher hint. Refuses if the hint
+    /// is set non-zero AND the wallet targets a different publisher;
+    /// passes silently otherwise. This is profile-drift detection, not a
+    /// consensus check: the producer fee is a market price between the
+    /// wallet and a DAL slot publisher of its choosing, and any publisher
+    /// will gate inclusion themselves on the producer note being routed
+    /// to them.
     fn ensure_operator_producer_owner_tag_matches(
         &self,
         block_ref: &str,
@@ -2292,17 +2297,16 @@ impl<'a> RollupRpc<'a> {
             );
         };
         if rollup_tag == ZERO {
-            eprintln!(
-                "WARNING: rollup operator has not published an expected producer owner_tag; \
-                 wallet profile is the only source of truth for the DAL fee receiver."
-            );
             return Ok(());
         }
         if rollup_tag != *wallet_dal_fee_owner_tag {
             return Err(format!(
-                "wallet profile dal_fee_address owner_tag ({}) does not match the rollup's \
-                 published operator_producer_owner_tag ({}); refusing to route producer fees \
-                 to a non-operator receiver. Update the wallet profile or the rollup config.",
+                "wallet profile dal_fee_address owner_tag ({}) does not match the deployment's \
+                 published default DAL-slot-publisher owner_tag ({}). This is advisory — there \
+                 is no canonical receiver enforced on chain — but the mismatch usually means the \
+                 wallet profile has drifted from the deployment's blessed default. Update one to \
+                 match, or override this check if you intend to route producer fees to a \
+                 different publisher.",
                 hex::encode(wallet_dal_fee_owner_tag),
                 hex::encode(&rollup_tag),
             ));
@@ -7658,9 +7662,11 @@ fn cmd_transfer_rollup(
     ensure_positive_dal_fee(profile.dal_fee)?;
     let root = snapshot.current_root();
 
-    // Verify the producer-fee receiver matches what the operator published.
-    // Without this, a misconfigured profile silently routes the fee note
-    // to a non-operator receiver.
+    // Advisory check: warn if the wallet profile's DAL fee receiver has
+    // drifted from the deployment's blessed default publisher hint. Not a
+    // security gate — producer fees are a market price to whichever DAL
+    // slot publisher includes the tx, and publishers enforce inclusion
+    // themselves.
     let head_hash = rollup.head_hash()?;
     let wallet_dal_owner_tag = owner_tag(
         &profile.dal_fee_address.auth_root,
@@ -7877,10 +7883,11 @@ fn cmd_unshield_rollup(
     ensure_positive_dal_fee(profile.dal_fee)?;
     let root = snapshot.current_root();
 
-    // Verify the producer-fee receiver matches what the operator published.
-    // Without this, a misconfigured profile silently routes the fee note
-    // to a non-operator receiver (no protocol-level enforcement of which
-    // address gets producer fees).
+    // Advisory check: warn if the wallet profile's DAL fee receiver has
+    // drifted from the deployment's blessed default publisher hint. Not a
+    // security gate — producer fees are a market price to whichever DAL
+    // slot publisher includes the tx, and publishers enforce inclusion
+    // themselves.
     let head_hash = rollup.head_hash()?;
     let wallet_dal_owner_tag = owner_tag(
         &profile.dal_fee_address.auth_root,

@@ -37,13 +37,16 @@ const MAX_UNSHIELD_PAYLOAD_BYTES: usize =
 pub struct KernelVerifierConfig {
     pub auth_domain: F,
     pub verified_program_hashes: ProgramHashes,
-    /// Operator's canonical DAL-producer-fee receiver, expressed as the
-    /// derived `owner_tag = H_owner(auth_root, auth_pub_seed, nk_tag)`.
-    /// Wallets compare this against their `profile.dal_fee_address`-derived
-    /// owner_tag and refuse to send if they disagree, so a misconfigured
-    /// wallet profile cannot silently route producer fees to the wrong
-    /// receiver. Distinct from the burned-fee policy: producer fees are
-    /// real notes that end up under the operator's spend authority.
+    /// Deployment-blessed default DAL slot publisher's owner_tag, expressed
+    /// as `H_owner(auth_root, auth_pub_seed, nk_tag)`. Vestigial: there is
+    /// no privileged rollup operator; producer fees are a permissionless
+    /// market price paid to whichever DAL slot publisher chooses to include
+    /// the transaction, and publishers enforce their own inclusion policy
+    /// off-chain. The kernel does not cross-check this field against
+    /// anything, and a `ZERO` value is treated as "no default published."
+    /// Reference wallets may use it as a default routing hint; they remain
+    /// free to target any other publisher. Kept for now to preserve the
+    /// kernel-config wire format; removable in a later cleanup.
     pub operator_producer_owner_tag: F,
 }
 

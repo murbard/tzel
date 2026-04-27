@@ -278,7 +278,7 @@ Before submitting the L1 ticket, the wallet runs preflight checks against the ro
 1. The kernel verifier config (`/tzel/v1/state/verifier_config.bin`) is installed. Deposits before configuration are rejected by the kernel; the L1 ticket would burn for nothing.
 2. The kernel's configured bridge ticketer (`/tzel/v1/state/bridge/ticketer`) equals `profile.bridge_ticketer`. A mismatch means the kernel won't accept tickets from this bridge contract.
 
-(The producer-fee `operator_producer_owner_tag` gate runs at shield/transfer/unshield time, not at deposit time, since the producer-fee note is now picked at shield time.)
+(The producer-fee receiver isn't checked by the kernel at all — it's enforced by the DAL slot publisher off-chain as their inclusion policy, since the producer fee is the publisher's revenue. The wallet picks `(v, fee, producer_fee, producer_owner_tag)` at shield/transfer/unshield time, not at deposit time, so any publisher-targeting work runs then.)
 
 ```bash
 DEPOSIT_OUTPUT="$(

@@ -495,25 +495,25 @@ sign each request — the same operational model as transfer / unshield.
 \(auth\_domain\) between the wallet computing \(pubkey\_hash\) and the L1
 ticket landing would silently strand the deposit. The kernel therefore
 freezes \(auth\_domain\) on first verifier configuration: subsequent
-\texttt{configure\_verifier} messages may rotate program hashes or the
-operator's producer-fee receiver, but any attempt to change
-\(auth\_domain\) is rejected, even on a still-pristine ledger. Other
-verifier-config fields remain rotatable while pristine.
+\texttt{configure\_verifier} messages may rotate program hashes, but
+any attempt to change \(auth\_domain\) is rejected, even on a
+still-pristine ledger. Other verifier-config fields remain rotatable
+while pristine.
 
-\paragraph{Producer-fee receiver binding.} The producer-fee note
-recipient is a private input; the circuit only proves that
-\(\cm_{producer}\) commits to some
-\(producer\_otag = \Hash_{owner}(auth\_root, pub\_seed, nk\_tag)\), not
-that \(producer\_otag\) equals the operator's address. To prevent a
-misconfigured wallet profile from silently routing fees to a
-non-operator receiver, the kernel's verifier config carries an
-\(operator\_producer\_owner\_tag\) field, signed alongside
-\(auth\_domain\) and the program hashes. Reference wallets refuse to
-submit shield, transfer, or unshield unless the \(owner\_tag\) derived
-from the profile-supplied DAL-fee receiver equals the published
-\(operator\_producer\_owner\_tag\). This is reference behavior, not a
-consensus rule — a custom wallet that skips it merely loses its own fee
-notes.
+\paragraph{Producer-fee receiver is a publisher-side concern.} The
+producer-fee note recipient is a private input; the circuit only proves
+that \(\cm_{producer}\) commits to some
+\(producer\_otag = \Hash_{owner}(auth\_root, pub\_seed, nk\_tag)\) and
+that the note has positive value. There is no privileged rollup
+operator: the producer fee is paid to whichever DAL slot publisher
+chooses to include the transaction, in a permissionless market where
+publishers pay bakers for slot inclusion and keep the spread between
+producer fees collected and L1 inclusion costs. Publishers therefore
+gate inclusion off-chain on \(producer\_otag\) matching their own
+address — a wallet routing fees elsewhere simply won't be bundled. The
+kernel does not — and intentionally need not — cross-check the producer
+receiver against any on-chain value, because there is no canonical
+receiver to check against.
 
 \paragraph{Top-ups and partial drains.} A user can send multiple L1
 tickets to the same \texttt{deposit:<hex(pubkey\_hash)>} recipient; each
