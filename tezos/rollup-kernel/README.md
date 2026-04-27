@@ -44,13 +44,11 @@ The kernel does not keep the full ledger as one serialized blob. It stores:
 - per-pool aggregated deposit balances keyed by `pubkey_hash`. A pool
   whose balance reaches zero is removed (best-effort delete via empty
   value).
-- a single-byte "ever received" marker (set on the first deposit;
-  never cleared) used by `is_pristine` for the verifier-config freeze
 - queued withdrawals under append-only per-index paths
-- the configured bridge ticketer (the L1 contract whose ticket transfers
-  the kernel will accept)
+- the configured bridge ticketer (one-shot; reconfiguration is
+  rejected once set)
 - the verifier config (`auth_domain`, program hashes, the operator's
-  expected producer-fee `owner_tag`)
+  expected producer-fee `owner_tag`); also one-shot.
 
 The current POC kernel uses a simple congestion fee policy for private
 transactions:
@@ -77,8 +75,9 @@ Durable storage paths:
 - `/tzel/v1/state/nullifiers/*`
 - `/tzel/v1/state/deposits/balance/<hex(pubkey_hash)>` — u64 balance
   for the named pool. Empty value or absent key means "no funds".
-- `/tzel/v1/state/deposits/ever_received` — single-byte presence
-  marker, used by is_pristine for the freeze rule
+- `/tzel/v1/state/shields/applied_cm/<hex(client_cm)>` — single-byte
+  marker recording that a shield with this `client_cm` has been
+  applied. Replay protection.
 - `/tzel/v1/state/withdrawals/*`
 - `/tzel/v1/state/bridge/ticketer`
 - `/tzel/v1/state/verifier_config.bin`

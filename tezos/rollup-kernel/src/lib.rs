@@ -106,10 +106,6 @@ const PATH_WITHDRAWAL_PREFIX: &[u8] = b"/tzel/v1/state/withdrawals/index/";
 /// pubkey_hash aggregate. A pool whose balance reaches zero is removed from
 /// storage to bound durable footprint.
 const PATH_DEPOSIT_BALANCE_PREFIX: &[u8] = b"/tzel/v1/state/deposits/balance/";
-/// Single-byte marker set by `apply_deposit` on the very first L1 ticket.
-/// Never cleared; used by `is_pristine` to refuse verifier reconfigurations
-/// once any deposit has been observed (the freeze rule).
-const PATH_DEPOSIT_EVER_RECEIVED: &[u8] = b"/tzel/v1/state/deposits/ever_received";
 /// Replay-protection set for shield commitments. Each successful shield
 /// records `client_cm` here; a subsequent shield carrying the same
 /// `client_cm` is rejected before any state mutation. Without this,
@@ -224,15 +220,6 @@ impl<'a, H: Host> DurableLedgerState<'a, H> {
             self.write_u64(PATH_VALID_ROOT_COUNT, 1);
         }
         Ok(())
-    }
-
-    fn is_pristine(&self) -> Result<bool, String> {
-        Ok(self.read_u64(PATH_TREE_SIZE)?.unwrap_or(0) == 0
-            && self.read_u64(PATH_NULLIFIER_COUNT)?.unwrap_or(0) == 0
-            && self
-                .host
-                .read_store(PATH_DEPOSIT_EVER_RECEIVED, 1)
-                .is_none())
     }
 
     fn read_u64(&self, path: &[u8]) -> Result<Option<u64>, String> {
@@ -473,14 +460,6 @@ impl<H: Host> LedgerState for DurableLedgerState<'_, H> {
             .checked_add(amount)
             .ok_or_else(|| "deposit balance overflow".to_string())?;
         self.host.write_store(&path, &next.to_le_bytes());
-        // First-deposit-ever marker (used by is_pristine for the freeze rule).
-        if self
-            .host
-            .read_store(PATH_DEPOSIT_EVER_RECEIVED, 1)
-            .is_none()
-        {
-            self.host.write_store(PATH_DEPOSIT_EVER_RECEIVED, &[1]);
-        }
         Ok(())
     }
 
@@ -762,10 +741,11 @@ fn validate_bridge_deposit<H: Host>(
                 .into(),
         );
     }
-    // Intent-bound deposits commit to the auth_domain that was current when
-    // the wallet computed the intent. If the verifier (and therefore the
-    // canonical auth_domain) is not yet locked, a later first-config could
-    // install a different auth_domain and permanently strand the deposit.
+    // Wallets compute `pubkey_hash = H(0x04, auth_domain, auth_root,
+    // auth_pub_seed, blind)` against the kernel's current auth_domain.
+    // Before the verifier is configured the kernel has no auth_domain to
+    // anchor the pool key; reject so the depositor doesn't burn an L1
+    // ticket against a key the kernel can't recompute.
     if read_verifier_config(ledger.host)?.is_none() {
         return Err(
             "bridge deposits not accepted before verifier configuration".into(),
@@ -1772,6 +1752,13 @@ fn validate_transition_proof<H: Host>(
     verifier.validate_kernel(proof, circuit)
 }
 
+/// Install the verifier configuration. **One-shot, no reconfiguration**:
+/// once the rollup is configured, the verifier config is frozen for the
+/// life of the kernel. Deposits, shields, transfers, and unshields are
+/// rejected before this is set; once set, every subsequent config message
+/// errors. Wallets that read `auth_domain` from rollup HEAD therefore see
+/// a value that never changes, removing the deposit-stranding race that
+/// motivated the original "freeze auth_domain after first install" rule.
 fn configure_verifier<H: Host>(
     ledger: &mut DurableLedgerState<'_, H>,
     config: &KernelVerifierConfig,
@@ -1779,42 +1766,19 @@ fn configure_verifier<H: Host>(
     #[cfg(feature = "proof-verifier")]
     DirectProofVerifier::from_kernel_config(config)?;
 
-    let existing = read_verifier_config(ledger.host)?;
-    if let Some(existing) = existing {
-        // auth_domain is frozen on first install. Any attempt to change it
-        // after the first config — even on a pristine ledger — is rejected,
-        // because in-flight deposits compute intent against the auth_domain
-        // they read from rollup HEAD and submit irreversible L1 tickets.
-        // Allowing a reconfig in the in-flight window would silently strand
-        // those deposits.
-        if existing.auth_domain != config.auth_domain {
-            return Err(
-                "auth_domain is frozen after first verifier configuration; \
-                 changing it would strand any in-flight bridge deposit"
-                    .into(),
-            );
-        }
-        // Other verifier-config fields (program hashes) may still be reconfigured
-        // while the ledger is pristine — auth_domain is the only field whose
-        // change has a deposit-stranding risk.
-        if existing != *config && !ledger.is_pristine()? {
-            return Err("cannot change verifier configuration after ledger state exists".into());
-        }
-    } else if !ledger.is_pristine()? {
-        // First-time verifier config installs the canonical auth_domain.
-        // Bridge deposits are blocked before configuration (see
-        // `validate_bridge_deposit`) precisely because intent-bound deposits
-        // commit to that auth_domain; reaching this branch with non-pristine
-        // state would mean a deposit slipped through, which we never permit.
-        return Err("cannot configure verifier after ledger state exists".into());
+    if read_verifier_config(ledger.host)?.is_some() {
+        return Err("rollup verifier is already configured".into());
     }
-
     ledger.write_felt(PATH_AUTH_DOMAIN, &config.auth_domain);
     let encoded = encode_kernel_verifier_config(config)?;
     ledger.host.write_store(PATH_VERIFIER_CONFIG, &encoded);
     Ok(())
 }
 
+/// Install the bridge configuration. **One-shot, no reconfiguration**:
+/// once the bridge ticketer is set it is frozen for the life of the
+/// kernel. Bridge deposits before configuration are rejected; subsequent
+/// config messages error.
 fn configure_bridge<H: Host>(
     ledger: &mut DurableLedgerState<'_, H>,
     config: &KernelBridgeConfig,
@@ -1825,11 +1789,12 @@ fn configure_bridge<H: Host>(
         return Err("bridge ticketer must be a KT1 contract".into());
     }
 
-    let existing = ledger.read_string(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)?;
-    if !ledger.is_pristine()? && existing.as_deref() != Some(config.ticketer.as_str()) {
-        return Err("cannot change bridge ticketer after ledger state exists".into());
+    if ledger
+        .read_string(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)?
+        .is_some()
+    {
+        return Err("rollup bridge is already configured".into());
     }
-
     ledger.write_string(PATH_BRIDGE_TICKETER, &config.ticketer);
     Ok(())
 }
@@ -3278,55 +3243,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_auth_domain_reconfiguration_after_state_exists() {
-        let mut host = MockHost::default();
-        let original = KernelVerifierConfig {
-            auth_domain: sample_felt(0x33),
-            verified_program_hashes: sample_program_hashes(),
-            operator_producer_owner_tag: ZERO,
-        };
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 1,
-            payload: encode_external_kernel_message(&signed_verifier_message(original.clone())),
-        });
-        run_with_host(&mut host);
-        {
-            let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, &deposit_recipient_string(&pubkey_hash_from_label("alice")), 1).unwrap();
-        }
-
-        let new_domain = sample_felt(0x44);
-        let reconfigured = KernelVerifierConfig {
-            auth_domain: new_domain,
-            verified_program_hashes: sample_program_hashes(),
-            operator_producer_owner_tag: ZERO,
-        };
-        let message = encode_external_kernel_message(&signed_verifier_message(reconfigured));
-        host.inputs.push_back(InputMessage {
-            level: 7,
-            id: 2,
-            payload: message,
-        });
-
-        run_with_host(&mut host);
-
-        let ledger = read_ledger(&host).unwrap();
-        assert_ne!(ledger.auth_domain, new_domain);
-        match read_last_result(&host).unwrap() {
-            KernelResult::Error { message } => {
-                assert!(
-                    message.contains("auth_domain is frozen"),
-                    "unexpected error: {}",
-                    message
-                )
-            }
-            other => panic!("unexpected rollup result: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn configures_auth_domain_on_pristine_ledger() {
+    fn configures_verifier_on_empty_ledger() {
         let mut host = MockHost::default();
         let new_domain = sample_felt(0x55);
         let config = KernelVerifierConfig {
@@ -3334,11 +3251,10 @@ mod tests {
             verified_program_hashes: sample_program_hashes(),
             operator_producer_owner_tag: ZERO,
         };
-        let message = encode_external_kernel_message(&signed_verifier_message(config));
         host.inputs.push_back(InputMessage {
             level: 8,
             id: 1,
-            payload: message,
+            payload: encode_external_kernel_message(&signed_verifier_message(config)),
         });
 
         run_with_host(&mut host);
@@ -3352,70 +3268,67 @@ mod tests {
     }
 
     #[test]
-    fn auth_domain_is_frozen_after_first_configuration_even_on_pristine_ledger() {
-        // Freezing auth_domain after the first install closes a deposit-stranding
-        // race: a wallet that read auth_domain D and submitted an L1 ticket
-        // computed with D would otherwise be silently broken if an admin
-        // reconfigured to D' before the ticket lands.
+    fn rejects_verifier_reconfiguration_once_configured() {
+        // The verifier config is one-shot: any second configure-verifier
+        // message — same fields, different auth_domain, different
+        // program hashes, anything — is rejected so wallets that read
+        // `auth_domain` (and the canonical program hashes) once never
+        // have to worry about them changing under them.
         let mut host = MockHost::default();
-        let initial_domain = sample_felt(0x55);
         let initial = KernelVerifierConfig {
-            auth_domain: initial_domain,
+            auth_domain: sample_felt(0x55),
             verified_program_hashes: sample_program_hashes(),
             operator_producer_owner_tag: ZERO,
         };
         host.inputs.push_back(InputMessage {
             level: 1,
             id: 0,
-            payload: encode_external_kernel_message(&signed_verifier_message(initial)),
+            payload: encode_external_kernel_message(&signed_verifier_message(initial.clone())),
         });
-        // Reconfigure the program hashes only — same auth_domain — should
-        // succeed (still pristine).
-        let new_hashes = ProgramHashes {
-            shield: hash(b"new-shield"),
-            transfer: hash(b"new-transfer"),
-            unshield: hash(b"new-unshield"),
-        };
-        let same_domain_new_hashes = KernelVerifierConfig {
-            auth_domain: initial_domain,
-            verified_program_hashes: new_hashes.clone(),
-            operator_producer_owner_tag: ZERO,
-        };
-        host.inputs.push_back(InputMessage {
-            level: 2,
-            id: 0,
-            payload: encode_external_kernel_message(&signed_verifier_message(
-                same_domain_new_hashes.clone(),
-            )),
-        });
-        // Reconfigure with a different auth_domain — must be rejected by
-        // the freeze rule even though the ledger is still pristine.
-        let new_domain = sample_felt(0x66);
-        let different_domain = KernelVerifierConfig {
-            auth_domain: new_domain,
-            verified_program_hashes: new_hashes,
-            operator_producer_owner_tag: ZERO,
-        };
-        host.inputs.push_back(InputMessage {
-            level: 3,
-            id: 0,
-            payload: encode_external_kernel_message(&signed_verifier_message(different_domain)),
-        });
-
         run_with_host(&mut host);
+        assert!(matches!(
+            read_last_result(&host).unwrap(),
+            KernelResult::Configured
+        ));
 
-        let ledger = read_ledger(&host).unwrap();
-        assert_eq!(
-            ledger.auth_domain, initial_domain,
-            "auth_domain must remain frozen after first install"
-        );
-        match read_last_result(&host).unwrap() {
-            KernelResult::Error { message } => assert!(
-                message.contains("auth_domain is frozen"),
-                "unexpected error: {}",
-                message
-            ),
-            other => panic!("expected freeze error, got: {:?}", other),
+        let attempts = [
+            // Same config byte-for-byte.
+            initial.clone(),
+            // Same auth_domain, different program hashes.
+            KernelVerifierConfig {
+                auth_domain: initial.auth_domain,
+                verified_program_hashes: ProgramHashes {
+                    shield: hash(b"new-shield"),
+                    transfer: hash(b"new-transfer"),
+                    unshield: hash(b"new-unshield"),
+                },
+                operator_producer_owner_tag: ZERO,
+            },
+            // Different auth_domain.
+            KernelVerifierConfig {
+                auth_domain: sample_felt(0x66),
+                verified_program_hashes: sample_program_hashes(),
+                operator_producer_owner_tag: ZERO,
+            },
+        ];
+        for (level, attempt) in attempts.into_iter().enumerate() {
+            host.inputs.push_back(InputMessage {
+                level: 2 + level as i32,
+                id: 0,
+                payload: encode_external_kernel_message(&signed_verifier_message(attempt)),
+            });
+            run_with_host(&mut host);
+            match read_last_result(&host).unwrap() {
+                KernelResult::Error { message } => assert!(
+                    message.contains("rollup verifier is already configured"),
+                    "{}",
+                    message
+                ),
+                other => panic!("expected one-shot rejection, got: {:?}", other),
+            }
+            // Persisted config never changed.
+            let ledger = read_ledger(&host).unwrap();
+            assert_eq!(ledger.auth_domain, initial.auth_domain);
         }
     }
 
@@ -3505,53 +3418,6 @@ mod tests {
         match read_last_result(&host).unwrap() {
             KernelResult::Error { message } => {
                 assert!(message.contains("configuration signature verification failed"))
-            }
-            other => panic!("unexpected rollup result: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn rejects_verifier_hash_reconfiguration_after_state_exists() {
-        let mut host = MockHost::default();
-        let original = KernelVerifierConfig {
-            auth_domain: default_auth_domain(),
-            verified_program_hashes: sample_program_hashes(),
-            operator_producer_owner_tag: ZERO,
-        };
-        host.inputs.push_back(InputMessage {
-            level: 6,
-            id: 1,
-            payload: encode_external_kernel_message(&signed_verifier_message(original.clone())),
-        });
-        run_with_host(&mut host);
-        {
-            let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, &deposit_recipient_string(&pubkey_hash_from_label("alice")), 1).unwrap();
-        }
-        let mut changed_hashes = original.verified_program_hashes;
-        changed_hashes.transfer = sample_felt(0x99);
-        host.inputs.push_back(InputMessage {
-            level: 8,
-            id: 3,
-            payload: encode_external_kernel_message(&signed_verifier_message(KernelVerifierConfig {
-                auth_domain: original.auth_domain,
-                verified_program_hashes: changed_hashes,
-                operator_producer_owner_tag: ZERO,
-            })),
-        });
-
-        run_with_host(&mut host);
-
-        let ledger = read_ledger(&host).unwrap();
-        assert_eq!(ledger.auth_domain, original.auth_domain);
-        // Pre-existing balance remains; reconfiguration was rejected.
-        let balance_path =
-            deposit_balance_path(&pubkey_hash_from_label("alice"));
-        let bytes = host.read_store(&balance_path, 8).expect("balance entry");
-        assert_eq!(u64::from_le_bytes(bytes.try_into().unwrap()), 1);
-        match read_last_result(&host).unwrap() {
-            KernelResult::Error { message } => {
-                assert!(message.contains("cannot change verifier configuration"))
             }
             other => panic!("unexpected rollup result: {:?}", other),
         }
@@ -3907,69 +3773,39 @@ mod tests {
     }
 
     #[test]
-    fn rejects_bridge_ticketer_reconfiguration_after_state_exists() {
+    fn rejects_bridge_reconfiguration_once_configured() {
+        // The bridge config is one-shot: any second configure-bridge
+        // message — even one that would set the same value — is
+        // rejected so wallets that read the ticketer once never have
+        // to worry about it changing under them.
         let mut host = MockHost::default();
         install_test_bridge(&mut host);
-        {
-            let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, &deposit_recipient_string(&pubkey_hash_from_label("alice")), 3).unwrap();
-        }
 
-        let message = encode_external_kernel_message(&signed_bridge_message(KernelBridgeConfig {
-            ticketer: sample_other_ticketer().into(),
-        }));
-        host.inputs.push_back(InputMessage {
-            level: 12,
-            id: 0,
-            payload: message,
-        });
-
-        run_with_host(&mut host);
-
-        let persisted = host
-            .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
-            .expect("bridge ticketer persists");
-        assert_eq!(String::from_utf8(persisted).unwrap(), sample_ticketer());
-        match read_last_result(&host).unwrap() {
-            KernelResult::Error { message } => {
-                assert!(message.contains("cannot change bridge ticketer"))
+        for ticketer in [sample_ticketer(), sample_other_ticketer()] {
+            let message = encode_external_kernel_message(&signed_bridge_message(
+                KernelBridgeConfig {
+                    ticketer: ticketer.into(),
+                },
+            ));
+            host.inputs.push_back(InputMessage {
+                level: 12,
+                id: 0,
+                payload: message,
+            });
+            run_with_host(&mut host);
+            match read_last_result(&host).unwrap() {
+                KernelResult::Error { message } => assert!(
+                    message.contains("rollup bridge is already configured"),
+                    "{}",
+                    message
+                ),
+                other => panic!("expected one-shot rejection, got: {:?}", other),
             }
-            other => panic!("unexpected rollup result: {:?}", other),
+            let persisted = host
+                .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
+                .expect("bridge ticketer persists");
+            assert_eq!(String::from_utf8(persisted).unwrap(), sample_ticketer());
         }
-    }
-
-    #[test]
-    fn allows_bridge_ticketer_reconfiguration_to_same_value_after_state_exists() {
-        let mut host = MockHost::default();
-        install_test_bridge(&mut host);
-        {
-            let mut state = DurableLedgerState::new(&mut host).unwrap();
-            apply_deposit(&mut state, &deposit_recipient_string(&pubkey_hash_from_label("alice")), 3).unwrap();
-        }
-
-        let message = encode_external_kernel_message(&signed_bridge_message(KernelBridgeConfig {
-            ticketer: sample_ticketer().into(),
-        }));
-        host.inputs.push_back(InputMessage {
-            level: 12,
-            id: 1,
-            payload: message,
-        });
-
-        run_with_host(&mut host);
-
-        let persisted = host
-            .read_store(PATH_BRIDGE_TICKETER, MAX_INPUT_BYTES)
-            .expect("bridge ticketer persists");
-        assert_eq!(String::from_utf8(persisted).unwrap(), sample_ticketer());
-        // Pre-existing pool balance remained through bridge reconfiguration.
-        let balance_path =
-            deposit_balance_path(&pubkey_hash_from_label("alice"));
-        assert!(host.read_store(&balance_path, 8).is_some());
-        assert!(matches!(
-            read_last_result(&host).unwrap(),
-            KernelResult::Configured
-        ));
     }
 
     #[test]
