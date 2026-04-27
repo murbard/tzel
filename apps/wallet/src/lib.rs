@@ -3086,6 +3086,28 @@ enum UserCmd {
         #[arg(long)]
         amount: u64,
     },
+    /// Reconstruct `PendingDeposit` entries from the seed alone after a
+    /// wallet-file loss. For each candidate `(address_index,
+    /// deposit_nonce)` pair within the bounds, derive the deterministic
+    /// blind, compute the pubkey_hash, and probe the rollup for a
+    /// non-zero balance. Each found pool is added to
+    /// `pending_deposits` and the local `deposit_nonce` counter is
+    /// bumped past the highest recovered value so a subsequent
+    /// `deposit` doesn't collide with an existing pool. The address
+    /// derivation requires a full XMSS rebuild per address index, so
+    /// this command is slow (~tens of seconds per address).
+    RecoverDeposits {
+        /// Inclusive upper bound on `address_index` to scan. Default
+        /// is 16 — the address-index space is `u32`, but realistic
+        /// users only ever consume small values.
+        #[arg(long, default_value_t = 16)]
+        max_address_index: u32,
+        /// Inclusive upper bound on `deposit_nonce` to scan per
+        /// address. Default is 16 — the nonce space is `u64`, but
+        /// realistic users only ever consume small values.
+        #[arg(long, default_value_t = 16)]
+        max_deposit_nonce: u64,
+    },
     /// Drain a deposit pool into a shielded note owned by the pool's own
     /// auth tree. The shield circuit verifies an in-circuit WOTS+ signature
     /// under the recipient's auth tree, so only the wallet that owns the
@@ -3316,6 +3338,7 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         | UserCmd::Receive
         | UserCmd::Sync { .. }
         | UserCmd::Deposit { .. }
+        | UserCmd::RecoverDeposits { .. }
         | UserCmd::Shield { .. }
         | UserCmd::Send { .. }
         | UserCmd::Unshield { .. } => Some(acquire_wallet_lock(&cli.wallet)?),
@@ -3363,6 +3386,18 @@ fn run_user(cli: UserCli) -> Result<(), String> {
         UserCmd::Deposit { amount } => {
             let profile = load_required_network_profile(&cli.wallet)?;
             cmd_bridge_deposit(&cli.wallet, &profile, amount)
+        }
+        UserCmd::RecoverDeposits {
+            max_address_index,
+            max_deposit_nonce,
+        } => {
+            let profile = load_required_network_profile(&cli.wallet)?;
+            cmd_recover_deposits(
+                &cli.wallet,
+                &profile,
+                max_address_index,
+                max_deposit_nonce,
+            )
         }
         UserCmd::Shield {
             pubkey_hash,
@@ -6676,6 +6711,140 @@ fn cmd_bridge_deposit(
     Ok(())
 }
 
+/// Reconstruct `PendingDeposit` entries after wallet-file loss using
+/// only the seed already in the wallet. The deterministic blind
+/// derivation `H("tzel-deposit-blind", master_sk, address_index,
+/// deposit_nonce)` lets us recompute every pubkey_hash the wallet
+/// could ever have created; we just have to brute-force the
+/// `(i, j)` grid up to user-supplied bounds and ask the kernel
+/// which pubkey_hashes have a non-zero balance.
+///
+/// Each iteration of `i` requires a full XMSS auth-tree rebuild
+/// (~tens of seconds on a modern CPU), so default bounds are
+/// deliberately small. Bumping them is cheap if the user knows they
+/// went deeper.
+///
+/// Drained pools are NOT recovered: the kernel writes empty bytes
+/// after a full drain (best-effort delete) and the wallet treats
+/// that as absent. That's fine — funds in a drained pool are
+/// already in the recipient note, recoverable through `sync` via
+/// the ML-KEM detection key. Only currently-funded pools matter
+/// here.
+fn cmd_recover_deposits(
+    path: &str,
+    profile: &WalletNetworkProfile,
+    max_address_index: u32,
+    max_deposit_nonce: u64,
+) -> Result<(), String> {
+    let mut wallet = load_wallet(path)?;
+    let master_sk = wallet.master_sk;
+    let rollup = RollupRpc::new(profile);
+    rollup.ensure_rollup_address_matches()?;
+    let head_hash = rollup.head_hash()?;
+    let auth_domain = rollup.read_felt_at_block(&head_hash, DURABLE_AUTH_DOMAIN)?;
+
+    // Materialize addresses 0..=max_address_index. `materialize_addresses`
+    // derives any addresses below `addr_counter` that aren't already in
+    // `addresses`; setting `addr_counter` first guarantees the loop
+    // covers the whole range we're about to scan.
+    let target_count = max_address_index
+        .checked_add(1)
+        .ok_or_else(|| "max_address_index overflow".to_string())?;
+    if wallet.addr_counter < target_count {
+        wallet.addr_counter = target_count;
+    }
+    let needs_derivation = (wallet.addresses.len() as u32) < target_count;
+    if needs_derivation {
+        eprintln!(
+            "Materializing addresses {}..{} (full XMSS rebuild per address — slow)",
+            wallet.addresses.len(),
+            target_count,
+        );
+    }
+    wallet.materialize_addresses()?;
+    save_wallet(path, &wallet)?;
+
+    let known_pubkey_hashes: std::collections::HashSet<F> = wallet
+        .pending_deposits
+        .iter()
+        .map(|p| p.pubkey_hash)
+        .collect();
+
+    let mut recovered = 0usize;
+    let mut max_nonce_seen: Option<u64> = None;
+
+    for i in 0..target_count {
+        let addr = wallet.addresses[i as usize].clone();
+        eprintln!(
+            "Scanning address_index={} auth_root={} for deposit_nonce 0..={}",
+            i,
+            short(&addr.auth_root),
+            max_deposit_nonce,
+        );
+        for j in 0..=max_deposit_nonce {
+            let blind = derive_deposit_blind(&master_sk, i, j);
+            let pubkey_hash = deposit_pubkey_hash(
+                &auth_domain,
+                &addr.auth_root,
+                &addr.auth_pub_seed,
+                &blind,
+            );
+            if known_pubkey_hashes.contains(&pubkey_hash) {
+                continue;
+            }
+            let balance = rollup.try_read_deposit_balance(&head_hash, &pubkey_hash)?;
+            let Some(amount) = balance else { continue };
+            if amount == 0 {
+                continue;
+            }
+            eprintln!(
+                "  recovered: address_index={} deposit_nonce={} balance={} pubkey_hash={}",
+                i,
+                j,
+                amount,
+                pubkey_hash_hex(&pubkey_hash),
+            );
+            wallet.pending_deposits.push(PendingDeposit {
+                pubkey_hash,
+                blind,
+                address_index: i,
+                auth_domain,
+                amount,
+                operation_hash: None,
+                shielded_cm: None,
+            });
+            max_nonce_seen = Some(match max_nonce_seen {
+                Some(prev) => prev.max(j),
+                None => j,
+            });
+            recovered += 1;
+        }
+    }
+
+    // Bump deposit_nonce so a subsequent `tzel-wallet deposit` doesn't
+    // re-derive a blind that already collides with a recovered pool.
+    if let Some(max_j) = max_nonce_seen {
+        let target_nonce = max_j
+            .checked_add(1)
+            .ok_or_else(|| "deposit_nonce overflow".to_string())?;
+        if wallet.deposit_nonce < target_nonce {
+            wallet.deposit_nonce = target_nonce;
+        }
+    }
+    save_wallet(path, &wallet)?;
+
+    println!("Recovered {} deposit pool(s)", recovered);
+    println!("addr_counter now {}", wallet.addr_counter);
+    println!("deposit_nonce now {}", wallet.deposit_nonce);
+    if recovered == 0 {
+        println!(
+            "No funded pools found in the scan window. Bump --max-address-index or \
+             --max-deposit-nonce if you suspect deposits beyond these bounds."
+        );
+    }
+    Ok(())
+}
+
 fn cmd_operator_status(profile: &WalletNetworkProfile, submission_id: &str) -> Result<(), String> {
     let operator_url = profile
         .operator_url
@@ -9308,6 +9477,180 @@ mod network_profile_tests {
             err.contains("rollup-node served address")
                 && err.contains("does not match wallet profile.rollup_address"),
             "expected rollup-address mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn cmd_recover_deposits_finds_funded_pool_from_seed_alone() {
+        // After wallet-file loss the user keeps the seed. The new
+        // `tzel-wallet recover-deposits` command brute-forces the
+        // `(address_index, deposit_nonce)` grid up to user-supplied
+        // bounds, recomputes each candidate `pubkey_hash`, and
+        // probes the rollup. A funded pool produces a fresh
+        // `PendingDeposit` entry and `deposit_nonce` is bumped past
+        // the highest recovered value so a subsequent `deposit`
+        // doesn't collide.
+        //
+        // Test wallet uses the prederived 3-address fixture so we
+        // don't pay the full XMSS rebuild cost.
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let profile_path = default_network_profile_path(wallet_path_str);
+        // Wallet starts with no `pending_deposits` and `deposit_nonce
+        // = 0` — exactly the state after a fresh recovery from seed.
+        let wallet = super::tests::test_wallet(3);
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        // Plant a balance for (address_index=1, deposit_nonce=2).
+        // Picking values away from the diagonal exercises the full
+        // grid scan, not just the simple case.
+        let auth_domain = default_auth_domain();
+        let target_addr_index = 1u32;
+        let target_deposit_nonce = 2u64;
+        let target_addr = wallet.addresses[target_addr_index as usize].clone();
+        let target_blind = derive_deposit_blind(
+            &wallet.master_sk,
+            target_addr_index,
+            target_deposit_nonce,
+        );
+        let target_pubkey_hash = deposit_pubkey_hash(
+            &auth_domain,
+            &target_addr.auth_root,
+            &target_addr.auth_pub_seed,
+            &target_blind,
+        );
+        let funded_balance: u64 = 314_159;
+
+        let funded_length_route = format!(
+            "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}{}",
+            DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(target_pubkey_hash),
+        );
+        let funded_value_route = format!(
+            "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}{}",
+            DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(target_pubkey_hash),
+        );
+
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            (
+                "/global/smart_rollup_address".into(),
+                (200, "\"sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP\"".into()),
+            ),
+            ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_AUTH_DOMAIN
+                ),
+                (200, format!("\"{}\"", hex::encode(auth_domain))),
+            ),
+            // Funded pool: length+value mocked to return the planted
+            // balance; every other candidate falls through to the
+            // mock server's default 404, which `try_read_deposit_
+            // balance` parses as None.
+            (funded_length_route, (200, "\"8\"".into())),
+            (
+                funded_value_route,
+                (200, format!("\"{}\"", hex::encode(funded_balance.to_le_bytes()))),
+            ),
+        ]));
+
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        save_network_profile(&profile_path, &profile).expect("save profile");
+
+        cmd_recover_deposits(wallet_path_str, &profile, 2, 4)
+            .expect("recover-deposits should succeed");
+
+        let recovered = load_wallet(wallet_path_str).expect("reload wallet");
+        assert_eq!(
+            recovered.pending_deposits.len(),
+            1,
+            "exactly one pool should have been recovered"
+        );
+        let pending = &recovered.pending_deposits[0];
+        assert_eq!(pending.pubkey_hash, target_pubkey_hash);
+        assert_eq!(pending.address_index, target_addr_index);
+        assert_eq!(pending.blind, target_blind);
+        assert_eq!(pending.auth_domain, auth_domain);
+        assert_eq!(pending.amount, funded_balance);
+        assert!(pending.shielded_cm.is_none());
+        // `deposit_nonce` bumped past the highest recovered value so
+        // a subsequent fresh `deposit` doesn't reuse blind (i=*, j=2).
+        assert_eq!(recovered.deposit_nonce, target_deposit_nonce + 1);
+    }
+
+    #[test]
+    fn cmd_recover_deposits_skips_pools_already_tracked_locally() {
+        // If the wallet already has a PendingDeposit for the funded
+        // pubkey_hash, recovery must NOT add a duplicate. (The
+        // command is idempotent under repeated runs.)
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let profile_path = default_network_profile_path(wallet_path_str);
+        let mut wallet = super::tests::test_wallet(3);
+
+        let auth_domain = default_auth_domain();
+        let target_addr = wallet.addresses[0].clone();
+        let blind = derive_deposit_blind(&wallet.master_sk, 0, 0);
+        let pkh = deposit_pubkey_hash(
+            &auth_domain,
+            &target_addr.auth_root,
+            &target_addr.auth_pub_seed,
+            &blind,
+        );
+        wallet.pending_deposits.push(PendingDeposit {
+            pubkey_hash: pkh,
+            blind,
+            address_index: 0,
+            auth_domain,
+            amount: 999,
+            operation_hash: Some("opPreexisting".into()),
+            shielded_cm: None,
+        });
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        let funded_length_route = format!(
+            "/global/block/BLmockhead/durable/wasm_2_0_0/length?key={}{}",
+            DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(pkh),
+        );
+        let funded_value_route = format!(
+            "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}{}",
+            DURABLE_DEPOSIT_BALANCE_PREFIX,
+            hex::encode(pkh),
+        );
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([
+            (
+                "/global/smart_rollup_address".into(),
+                (200, "\"sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP\"".into()),
+            ),
+            ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            (
+                format!(
+                    "/global/block/BLmockhead/durable/wasm_2_0_0/value?key={}",
+                    DURABLE_AUTH_DOMAIN
+                ),
+                (200, format!("\"{}\"", hex::encode(auth_domain))),
+            ),
+            (funded_length_route, (200, "\"8\"".into())),
+            (
+                funded_value_route,
+                (200, format!("\"{}\"", hex::encode(42u64.to_le_bytes()))),
+            ),
+        ]));
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        save_network_profile(&profile_path, &profile).expect("save profile");
+
+        cmd_recover_deposits(wallet_path_str, &profile, 2, 4)
+            .expect("recover-deposits idempotent run");
+        let after = load_wallet(wallet_path_str).expect("reload wallet");
+        assert_eq!(
+            after.pending_deposits.len(),
+            1,
+            "no duplicate entry must be added for an already-tracked pool"
         );
     }
 

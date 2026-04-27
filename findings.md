@@ -137,35 +137,56 @@ sync)".
 
 **Commit:** `a7c7c2c`.
 
-### F-W-4 [P1, OPEN — docs corrected, recovery scan deferred] — Pool ownership material is not actually recoverable from seed-only or chain-only data
+### F-W-4 [P1, FIXED] — Pool ownership material recoverable from seed alone
 
-The wallet stores the pool ownership material `(blind, address_index,
-auth_domain)` only in local `PendingDeposit` state. The shield path
-refuses to proceed unless the pool is still locally tracked, and on
-the chain side the wallet can only probe balances for pools it
-already knows — the kernel intentionally maintains no enumerable
-deposit-balance index. A successful L1 bridge deposit followed by
-wallet-file loss therefore strands real funds in an opaque pool with
-no discovery path.
+The wallet used to store pool ownership material `(blind,
+address_index, auth_domain)` only in local `PendingDeposit` state.
+The shield path refuses to proceed unless the pool is still locally
+tracked, and on the chain side the wallet can only probe balances
+for pools it already knows — the kernel intentionally maintains no
+enumerable deposit-balance index. A successful L1 bridge deposit
+followed by wallet-file loss therefore stranded real funds in an
+opaque pool with no discovery path.
 
-This was made worse by a code comment on `derive_deposit_blind` and
-a paragraph in `docs/whitepaper.tex` that *claimed* seed-only recovery
-worked. The blind itself is reproducible from the seed (via
-`H("tzel-deposit-blind", master_sk, address_index, deposit_nonce)`),
-but the actually-used `(i, j)` pairs are local-only, so recovery
-requires a bounded brute-force scan that the wallet doesn't
-implement.
+The cryptographic primitive that *enables* recovery was already in
+place: `H("tzel-deposit-blind", master_sk, address_index,
+deposit_nonce)` makes every blind reproducible from the seed alone.
+What was missing was a code path that actually walks the
+`(address_index, deposit_nonce)` grid.
 
-**Partial fix in this commit:** the misleading docs (wallet comment +
-whitepaper paragraph) now say plainly that seed-only recovery requires
-a bounded scan that doesn't exist yet, and reference this finding.
+**Fix:** new `tzel-wallet recover-deposits` command. Given the seed
+already in the wallet file plus user-supplied bounds (default
+`max_address_index = 16`, `max_deposit_nonce = 16`), it:
 
-**Open:** add a `tzel-wallet recover-deposits` command that, given a
-seed and bounds `(max_address_index, max_deposit_nonce)`, derives
-each candidate `(blind, pubkey_hash)` and probes the kernel for a
-non-zero balance, reconstructing `PendingDeposit` entries. Bring the
-local `deposit_nonce` counter up to `max+1` for each address so a
-subsequent `deposit` doesn't collide with an existing pool.
+1. Materializes addresses `0..=max_address_index` (full XMSS rebuild
+   per address — slow, ~tens of seconds each, but only paid once).
+2. For each `(i, j)` pair, derives the candidate blind, computes the
+   candidate `pubkey_hash`, probes the rollup for a non-zero balance.
+3. Records every funded pool as a fresh `PendingDeposit`.
+4. Bumps the local `deposit_nonce` counter past the highest
+   recovered value so a subsequent `tzel-wallet deposit` doesn't
+   accidentally re-derive a blind that already collides with a
+   recovered pool.
+
+Drained pools (kernel balance entry empty after a full debit) are
+deliberately *not* recovered — the funds are already in the user's
+recipient note, and `tzel-wallet sync` recovers those via the
+ML-KEM detection key.
+
+The misleading docs (wallet comment on `derive_deposit_blind` and
+the whitepaper paragraph that claimed seed-only recovery already
+worked) were corrected in commit `c55ffcb` and now point at the
+actual command.
+
+**Regressions:**
+- `cmd_recover_deposits_finds_funded_pool_from_seed_alone` plants a
+  balance off-diagonal at `(addr=1, nonce=2)` and asserts the
+  command finds it from seed alone, sets all `PendingDeposit`
+  fields correctly, and bumps `deposit_nonce` past the recovered
+  value.
+- `cmd_recover_deposits_skips_pools_already_tracked_locally`
+  asserts idempotency: re-running recovery on a wallet that already
+  has the entry doesn't add a duplicate.
 
 ### F-W-5 [P2, FIXED] — Deposit preflight didn't bind `rollup_node_url` to `rollup_address`
 
@@ -505,7 +526,7 @@ These were verified during the audit and stand as positive results:
 | F-W-1  | MED      | FIXED    |
 | F-W-2  | LOW      | FIXED    |
 | F-W-3  | LOW      | FIXED    |
-| F-W-4  | P1       | OPEN (docs corrected; recovery scan deferred) |
+| F-W-4  | P1       | FIXED    |
 | F-W-5  | P2       | FIXED    |
 | F-W-6  | P3       | FIXED    |
 | F-W-7  | P4       | FIXED    |
