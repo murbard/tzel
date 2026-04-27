@@ -26,7 +26,7 @@ pub fn verify(
     nk_spend_list: Span<felt252>,
     auth_root_list: Span<felt252>,
     auth_pub_seed_list: Span<felt252>,
-    auth_index_list: Span<u64>,
+    auth_index_list: Span<u32>,
     d_j_in_list: Span<felt252>,
     v_in_list: Span<u64>,
     rseed_in_list: Span<felt252>,
@@ -92,7 +92,7 @@ pub fn verify(
         let nk_spend = *nk_spend_list.at(i);
         let auth_root = *auth_root_list.at(i);
         let auth_pub_seed = *auth_pub_seed_list.at(i);
-        let auth_idx: u32 = (*auth_index_list.at(i)).try_into().unwrap();
+        let auth_idx: u32 = *auth_index_list.at(i);
         let d_j = *d_j_in_list.at(i);
         let v: u64 = *v_in_list.at(i);
         let rseed = *rseed_in_list.at(i);
@@ -179,7 +179,7 @@ mod tests {
         nk_spend_list: Array<felt252>,
         auth_root_list: Array<felt252>,
         auth_pub_seed_list: Array<felt252>,
-        auth_index_list: Array<u64>,
+        auth_index_list: Array<u32>,
         d_j_in_list: Array<felt252>,
         v_in_list: Array<u64>,
         rseed_in_list: Array<felt252>,
@@ -458,7 +458,7 @@ mod tests {
             nk_spend_list: array![nk_spend],
             auth_root_list: array![auth_root],
             auth_pub_seed_list: array![auth_pub_seed],
-            auth_index_list: array![auth_idx.into()],
+            auth_index_list: array![auth_idx],
             d_j_in_list: array![d_j_in],
             v_in_list: array![v_in],
             rseed_in_list: array![rseed_in],
@@ -676,7 +676,7 @@ mod tests {
             nk_spend_list: array![nk_spend_0, nk_spend_1],
             auth_root_list: array![auth_root, auth_root],
             auth_pub_seed_list: array![auth_pub_seed, auth_pub_seed],
-            auth_index_list: array![auth_idx_0.into(), auth_idx_1.into()],
+            auth_index_list: array![auth_idx_0, auth_idx_1],
             d_j_in_list: array![d_j_in_0, d_j_in_1],
             v_in_list: array![v_in_0, v_in_1],
             rseed_in_list: array![rseed_in_0, rseed_in_1],
@@ -894,7 +894,7 @@ mod tests {
 
         let mut auth_leaves: Array<felt252> = array![];
         let mut nk_spend_list: Array<felt252> = array![];
-        let mut auth_index_list: Array<u64> = array![];
+        let mut auth_index_list: Array<u32> = array![];
         let mut d_j_in_list: Array<felt252> = array![];
         let mut v_in_list: Array<u64> = array![];
         let mut rseed_in_list: Array<felt252> = array![];
@@ -916,7 +916,7 @@ mod tests {
             }
             auth_leaves.append(xmss_common::xmss_ltree(auth_pub_seed, input_idx, endpoints.span()));
             nk_spend_list.append(0xA400 + input_idx.into());
-            auth_index_list.append(input_idx.into());
+            auth_index_list.append(input_idx);
             d_j_in_list.append(0xA500 + input_idx.into());
             v_in_list.append(20_u64 + input_idx.into());
             rseed_in_list.append(0xA600 + input_idx.into());
@@ -1102,7 +1102,7 @@ mod tests {
         let sig = sign_transfer_input(
             sighash,
             *base.auth_pub_seed_list.at(0),
-            (*base.auth_index_list.at(0)).try_into().unwrap(),
+            *base.auth_index_list.at(0),
             0x7500,
         );
         let mut wots_sig_flat: Array<felt252> = array![];
@@ -1314,7 +1314,7 @@ mod tests {
                     fixture.memo_ct_hash_2,
                     fixture.memo_ct_hash_3,
                     *fixture.auth_pub_seed_list.at(0),
-                    (*fixture.auth_index_list.at(0)).try_into().unwrap(),
+                    *fixture.auth_index_list.at(0),
                 );
         run_verify(@fixture);
     }

@@ -324,7 +324,16 @@ The shield circuit is **sound** under standard WOTS+ + BLAKE2s
 assumptions. The findings below are quantitative reductions, code-
 quality gaps, and design observations.
 
-### F-C-1 [LOW, OPEN] — Two trailing message digits are always zero
+### F-C-1 [LOW, WONTFIX] — Two trailing message digits are always zero
+
+**Decision:** forced by the felt252 representation. `u32x8_to_felt`
+masks `h7` to `0x07FFFFFF` (251-bit ceiling); `felt_to_u32x8`
+doesn't re-mask, so `digits[126]` and `digits[127]` are always zero.
+Effective WOTS+ security goes from `4^131` to `4^129` — still
+vastly above 128-bit. Fixing this would require either changing the
+field (impossible) or adding a non-uniform sighash decomposition
+(complex). The reduction is acceptable.
+
 
 `u32x8_to_felt` masks `h7` to `0x07FFFFFF` (251-bit felt252 ceiling),
 but `felt_to_u32x8` doesn't re-mask. So when `sighash_to_wots_digits`
@@ -339,23 +348,65 @@ the protocol is silently giving up two chains; a future change that
 loosened the checksum or shortened the message space could push this
 into "actually exploitable" territory.
 
-### F-C-2 [LOW, OPEN] — Dead WOTS+ IV
+### F-C-2 [LOW, FIXED] — Dead WOTS+ IV
 
-`blake_hash.cairo` defines `blake2s_iv_wots()` ("wotsSP__") and
-`pub fn hash1_wots(a)` that uses it. Neither is called anywhere in
+`blake_hash.cairo` used to define `blake2s_iv_wots()` ("wotsSP__") and
+`pub fn hash1_wots(a)` that used it. Neither was called anywhere in
 production circuit code; `xmss_chain_step` (the actual chain hash)
 uses `hash3_generic` (untyped IV) and relies entirely on the ADRS for
-domain separation. There's even a unit test
-`test_hash1_wots_uses_distinct_domain` keeping the dead code wired to
-test infra.
+domain separation. A unit test `test_hash1_wots_uses_distinct_domain`
+kept the dead code wired into the test infra.
 
-Two risks: (a) someone sees `hash1_wots` and assumes it's the chain
-hash, and (b) refactoring could plausibly switch from one to the other
-and silently change the protocol's hash. ADRS-based domain separation
-is RFC-8391-style and is sound; the issue is purely that the codebase
-advertises an alternative that nothing uses.
+The risk was code-quality only: someone could see `hash1_wots` and
+assume it was the chain hash, or a refactor could silently switch
+from one to the other. ADRS-based domain separation is
+RFC-8391-style and is sound; the issue was just that the codebase
+advertised an alternative that nothing used.
 
-### F-C-3 [LOW, OPEN] — Length checks live at the wrong layer
+**Fix:** deleted `blake2s_iv_wots`, `hash1_wots`, and the dead test.
+"The WOTS+ chain hash" is now exactly one thing in the codebase.
+
+### F-C-12 [INFO, FIXED] — `auth_idx` was `u64` but always immediately narrowed to `u32`
+
+Both `shield::verify` (single `auth_idx: u64`) and
+`transfer::verify` / `unshield::verify` (`auth_index_list: Span<u64>`)
+took `u64` arguments and immediately did
+`(*x).try_into().unwrap()` to narrow to `u32` for use in the WOTS+
+verify. The double-narrowing (felt252 → u64 → u32) was misleading:
+the actual constraint is `auth_idx < 2^AUTH_DEPTH = 65536`, which
+fits comfortably in `u32` (or even `u16`).
+
+**Fix:** narrowed every circuit signature to `u32` directly. The
+`run_*.cairo` wrappers cast felt252 → u32 once at the boundary;
+the inner `try_into().unwrap()` casts and the `auth_idx_u32` rebind
+in `shield::verify` are gone. Same number of runtime conversions,
+but the type signature now self-documents the bound (an auditor can
+read "this is a u32" instead of having to mentally trace the
+`try_into` chain).
+
+Affected files: `cairo/src/shield.cairo`,
+`cairo/src/run_shield.cairo`, `cairo/src/transfer.cairo`,
+`cairo/src/run_transfer.cairo`, `cairo/src/unshield.cairo`,
+`cairo/src/run_unshield.cairo`. Test fixtures updated to drop the
+`u32 -> u64 -> u32` `.into()` round-trips.
+
+The bytecode change is internal — no public-output layout change,
+so the verified-bridge fixture's pinned program_hashes still match
+the proofs in the JSON (the proofs are pinned to specific bytecode
+they were generated against; the on-disk executables move
+independently).
+
+### F-C-3 [LOW, WONTFIX] — Length checks live at the wrong layer
+
+**Decision:** the right home for `assert(wots_sig_flat.len() ==
+WOTS_CHAINS)` and `assert(auth_siblings_flat.len() == AUTH_DEPTH)` is
+the caller (each of `shield::verify`, `transfer::verify`,
+`unshield::verify` already does this). Adding the same asserts inside
+`xmss_recover_pk` would duplicate the property in two places without
+any new soundness guarantee. If a future caller forgets the assert,
+the right fix is to audit that caller, not to bloat every primitive
+with belt-and-braces wrappers. (Originally noted below.)
+
 
 `xmss_recover_pk` does `*wots_sig.at(j)` and `*digits.at(j)` for
 `j in 0..WOTS_CHAINS` without internally validating either length.
@@ -367,7 +418,17 @@ or silently truncates (extra entries unconsumed). `xmss_verify_auth`
 *does* assert siblings length internally; `xmss_recover_pk` is
 asymmetric. Defense-in-depth gap.
 
-### F-C-4 [LOW, OPEN] — `auth_idx` overflow path is `try_into().unwrap()`
+### F-C-4 [LOW, WONTFIX] — `auth_idx` overflow path is `try_into().unwrap()`
+
+**Decision:** the `try_into().unwrap()` form *is* the bound check —
+Cairo's prover refuses to produce a trace that panics, so a malicious
+witness with `auth_idx > u32::MAX` fails to produce a proof. Adding
+an explicit `assert(...)` would change the error message string but
+not the soundness. Since F-C-12 narrowed `auth_idx` to `u32` directly
+at the circuit boundary, this is moot anyway — the cast happens once
+in the `run_*.cairo` wrapper and the inner `verify` functions take
+`u32` natively.
+
 
 `shield.cairo:97`:
 
@@ -410,7 +471,16 @@ Same failure mode as the wallet routing producer notes back to itself,
 which the kernel also doesn't enforce. Worth noting that the *circuit*
 makes it trivially possible.
 
-### F-C-7 [LOW, OPEN] — `producer_fee > 0` is the only positivity check in the circuit
+### F-C-7 [LOW, WONTFIX] — `producer_fee > 0` is the only positivity check in the circuit
+
+**Decision:** circuit proves spending math is consistent (e.g.,
+`producer_fee > 0` so the producer note is non-trivial); kernel
+enforces deployment policy (`fee >= required_tx_fee`,
+`v_note + fee + producer_fee <= pool_balance`). Adding a fee floor
+to the circuit would freeze the kernel's policy into every proof,
+making it impossible to ever change the floor without regenerating
+all circuits. Wrong layer.
+
 
 `v_note == 0` is allowed (legal "donate everything to fees" shield),
 `fee == 0` is allowed (kernel-side `prepare_shield` enforces
@@ -433,7 +503,15 @@ The realistic mitigation is a wallet-side sync-from-chain step that
 clamps `bds.next_index` upward by inferring used auth_idx values from
 recovered notes. Not implemented; tracked as a future feature.
 
-### F-C-9 [INFO, OPEN] — `pack_adrs` slot widths assume u32 fits
+### F-C-9 [INFO, WONTFIX] — `pack_adrs` slot widths assume u32 fits
+
+**Decision:** the slots are *typed* `u32` in the function signature.
+`assert(x < 2^32)` on a `u32` literally cannot fail — it would be
+dead defensive code. The forward-looking concern ("a future change
+that pushes a field above 2^32 silently overlaps the next slot") is
+real but the right defense is comment + structure, not runtime
+asserts.
+
 
 `pack_adrs(tag, key_idx, a, b, c)` packs four 32-bit slots starting at
 bits 64, 96, 128, 160. Tag occupies bits 0–63. Currently
@@ -443,7 +521,15 @@ overlapping in the felt addition. They won't given current values; a
 future change that pushed any field above `2^32` would cause silent
 collisions in the address scheme.
 
-### F-C-10 [INFO, OPEN] — `xmss_recover_pk` doesn't validate `digits.len()`
+### F-C-10 [INFO, WONTFIX] — `xmss_recover_pk` doesn't validate `digits.len()`
+
+**Decision:** same reasoning as F-C-3. The pairing
+`sighash_to_wots_digits` (always returns 133) ↔ `xmss_recover_pk`
+(always indexes 133) is a structural invariant, not a runtime
+property worth asserting. If `WOTS_CHAINS` ever decoupled from the
+digits function's output length, the right defense is to audit the
+decoupling change.
+
 
 The function loops `while j < WOTS_CHAINS` and indexes
 `digits.at(j)`. `sighash_to_wots_digits` always produces 133, so this
@@ -530,15 +616,16 @@ These were verified during the audit and stand as positive results:
 | F-W-5  | P2       | FIXED    |
 | F-W-6  | P3       | FIXED    |
 | F-W-7  | P4       | FIXED    |
-| F-C-1  | LOW      | OPEN     |
-| F-C-2  | LOW      | OPEN     |
-| F-C-3  | LOW      | OPEN     |
-| F-C-4  | LOW      | OPEN     |
-| F-C-5  | INFO     | WONTFIX  |
-| F-C-6  | LOW      | OPEN     |
-| F-C-7  | LOW      | OPEN     |
-| F-C-8  | INFO     | WONTFIX  |
-| F-C-9  | INFO     | OPEN     |
-| F-C-10 | INFO     | OPEN     |
-| F-C-11 | INFO     | WONTFIX  |
+| F-C-1  | LOW      | WONTFIX (251-bit felt forced) |
+| F-C-2  | LOW      | FIXED    |
+| F-C-3  | LOW      | WONTFIX (caller-layer responsibility) |
+| F-C-4  | LOW      | WONTFIX (`try_into().unwrap()` IS the bound check) |
+| F-C-5  | INFO     | WONTFIX (by design)  |
+| F-C-6  | LOW      | OPEN (subsumed by F-X-1) |
+| F-C-7  | LOW      | WONTFIX (kernel-layer policy) |
+| F-C-8  | INFO     | WONTFIX (privacy/recovery trade-off) |
+| F-C-9  | INFO     | WONTFIX (type system enforces) |
+| F-C-10 | INFO     | WONTFIX (caller-layer responsibility) |
+| F-C-11 | INFO     | WONTFIX (251-bit felt forced) |
+| F-C-12 | INFO     | FIXED    |
 | F-X-1  | MED      | OPEN     |

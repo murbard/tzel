@@ -46,7 +46,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let d_j = *args.at(12);
     let rseed = *args.at(13);
     let blind = *args.at(14);
-    let auth_idx: u64 = (*args.at(15)).try_into().unwrap();
+    let auth_idx: u32 = (*args.at(15)).try_into().unwrap();
 
     let wots_start: u32 = fixed_prefix;
     let wots_sig = args.span().slice(wots_start, wots_chains);

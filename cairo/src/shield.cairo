@@ -44,8 +44,12 @@ pub fn verify(
     d_j: felt252,
     rseed: felt252,
     blind: felt252,
-    // WOTS+ signature material
-    auth_idx: u64,
+    // WOTS+ signature material. `auth_idx` is the position of the
+    // recipient's WOTS+ key within their auth tree (0..2^AUTH_DEPTH);
+    // u32 is plenty (AUTH_DEPTH = 16 today) and the signature on the
+    // sighash binds it via the chain-step ADRS, so the kernel never
+    // needs to see this value.
+    auth_idx: u32,
     wots_sig_flat: Span<felt252>,
     auth_siblings_flat: Span<felt252>,
     // private inputs (producer-fee note witness)
@@ -94,19 +98,18 @@ pub fn verify(
     sighash = hash::sighash_fold(sighash, producer_memo_ct_hash);
 
     // In-circuit WOTS+ verify under the recipient's auth tree.
-    let auth_idx_u32: u32 = auth_idx.try_into().unwrap();
     let recovered_pk = xmss_common::xmss_recover_pk(
         sighash,
         auth_pub_seed,
-        auth_idx_u32,
+        auth_idx,
         wots_sig_flat,
     );
-    let leaf = xmss_common::xmss_ltree(auth_pub_seed, auth_idx_u32, recovered_pk.span());
+    let leaf = xmss_common::xmss_ltree(auth_pub_seed, auth_idx, recovered_pk.span());
     xmss_common::xmss_verify_auth(
         leaf,
         auth_root,
         auth_pub_seed,
-        auth_idx_u32,
+        auth_idx,
         auth_siblings_flat,
     );
 
@@ -147,7 +150,7 @@ mod tests {
         d_j: felt252,
         rseed: felt252,
         blind: felt252,
-        auth_idx: u64,
+        auth_idx: u32,
         wots_sig: Array<felt252>,
         auth_siblings: Array<felt252>,
         producer_auth_root: felt252,
@@ -366,7 +369,7 @@ mod tests {
             d_j,
             rseed,
             blind,
-            auth_idx: auth_idx.into(),
+            auth_idx,
             wots_sig,
             auth_siblings,
             producer_auth_root,
@@ -539,7 +542,6 @@ mod tests {
         let mut j: u32 = 0;
         while j < xmss_common::WOTS_CHAINS {
             let mutated_wots = copy_and_mutate(fixture.wots_sig.span(), j);
-            let auth_idx_u32: u32 = fixture.auth_idx.try_into().unwrap();
             let recovered_pk = xmss_common::xmss_recover_pk(
                 shield_sighash(
                     fixture.auth_domain,
@@ -553,14 +555,14 @@ mod tests {
                     fixture.producer_memo_ct_hash,
                 ),
                 fixture.auth_pub_seed,
-                auth_idx_u32,
+                fixture.auth_idx,
                 mutated_wots.span(),
             );
             let leaf = xmss_common::xmss_ltree(
-                fixture.auth_pub_seed, auth_idx_u32, recovered_pk.span(),
+                fixture.auth_pub_seed, fixture.auth_idx, recovered_pk.span(),
             );
             let mutated_root = auth_root_from_leaf(
-                leaf, fixture.auth_pub_seed, auth_idx_u32, fixture.auth_siblings.span(),
+                leaf, fixture.auth_pub_seed, fixture.auth_idx, fixture.auth_siblings.span(),
             );
             assert(mutated_root != fixture.auth_root, 'wots mutation escaped');
             j += 1;

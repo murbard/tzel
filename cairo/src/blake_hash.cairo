@@ -120,17 +120,6 @@ fn blake2s_iv_owner() -> Box<[u32; 8]> {
     )
 }
 
-/// WOTS+ chain hash IV — "wotsSP__".
-/// Dedicated domain for WOTS+ hash chain iterations.
-fn blake2s_iv_wots() -> Box<[u32; 8]> {
-    BoxTrait::new(
-        [
-            0x6B08E647_u32, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x6CF7B6DC,
-            0x04BF9D4A,
-        ],
-    )
-}
-
 /// Sighash IV — "sighSP__".
 /// Used to compute the transaction sighash that WOTS+ signatures bind to.
 fn blake2s_iv_sighash() -> Box<[u32; 8]> {
@@ -317,18 +306,6 @@ pub fn nullifier(nk_spend: felt252, cm: felt252, pos: u64) -> felt252 {
     hash2_with_iv(blake2s_iv_nullifier(), nk_spend, cm_pos)
 }
 
-// ── WOTS+ hash functions
-// ────────────────────────────────────────────
-
-/// WOTS+ chain hash: H_wots(x). Dedicated domain for chain iterations.
-pub fn hash1_wots(a: felt252) -> felt252 {
-    let (a0, a1, a2, a3, a4, a5, a6, a7) = felt_to_u32x8(a);
-    let msg = BoxTrait::new([a0, a1, a2, a3, a4, a5, a6, a7, 0, 0, 0, 0, 0, 0, 0, 0]);
-    let result = blake2s_finalize(blake2s_iv_wots(), 32, msg);
-    let [h0, h1, h2, h3, h4, h5, h6, h7] = result.unbox();
-    u32x8_to_felt(h0, h1, h2, h3, h4, h5, h6, h7)
-}
-
 // ── WOTS+ sighash support
 // ───────────────────────────────────────────
 
@@ -376,7 +353,7 @@ pub fn sighash_to_wots_digits(sighash: felt252) -> Array<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{felt_to_u32x8, hash1, hash1_wots, sighash_to_wots_digits, u32x8_to_felt};
+    use super::{felt_to_u32x8, hash1, sighash_to_wots_digits, u32x8_to_felt};
 
     fn checksum_value(digits: Span<u32>) -> u32 {
         let mut checksum: u32 = 0;
@@ -437,12 +414,6 @@ mod tests {
         assert(w6 == 0xFFFFFFFF_u32, 'rt6');
         assert(w7 == 0x07FFFFFF_u32, 'rt7');
         assert(u32x8_to_felt(w0, w1, w2, w3, w4, w5, w6, w7) == felt, 'max rt');
-    }
-
-    #[test]
-    fn test_hash1_wots_uses_distinct_domain() {
-        let x = 0x1234;
-        assert(hash1_wots(x) != hash1(x), 'wots iv');
     }
 
     #[test]

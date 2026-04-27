@@ -40,7 +40,7 @@ fn main(args: Array<felt252>) -> Array<felt252> {
     let mut nk_spend_list: Array<felt252> = array![];
     let mut auth_root_list: Array<felt252> = array![];
     let mut auth_pub_seed_list: Array<felt252> = array![];
-    let mut auth_idx_list: Array<u64> = array![];
+    let mut auth_idx_list: Array<u32> = array![];
     let mut d_j_list: Array<felt252> = array![];
     let mut v_list: Array<u64> = array![];
     let mut rseed_list: Array<felt252> = array![];

@@ -50,7 +50,7 @@ pub fn verify(
     auth_pub_seed_list: Span<felt252>,
     wots_sig_flat: Span<felt252>,
     auth_siblings_flat: Span<felt252>,
-    auth_index_list: Span<u64>,
+    auth_index_list: Span<u32>,
     d_j_in_list: Span<felt252>,
     v_in_list: Span<u64>,
     rseed_in_list: Span<felt252>,
@@ -121,7 +121,7 @@ pub fn verify(
         let nk_spend = *nk_spend_list.at(i);
         let auth_root = *auth_root_list.at(i);
         let auth_pub_seed = *auth_pub_seed_list.at(i);
-        let auth_idx: u32 = (*auth_index_list.at(i)).try_into().unwrap();
+        let auth_idx: u32 = *auth_index_list.at(i);
         let d_j = *d_j_in_list.at(i);
         let v: u64 = *v_in_list.at(i);
         let rseed = *rseed_in_list.at(i);
@@ -196,7 +196,7 @@ mod tests {
         auth_pub_seed_list: Array<felt252>,
         wots_sig_flat: Array<felt252>,
         auth_siblings_flat: Array<felt252>,
-        auth_index_list: Array<u64>,
+        auth_index_list: Array<u32>,
         d_j_in_list: Array<felt252>,
         v_in_list: Array<u64>,
         rseed_in_list: Array<felt252>,
@@ -473,7 +473,7 @@ mod tests {
             auth_pub_seed_list: array![auth_pub_seed],
             wots_sig_flat,
             auth_siblings_flat,
-            auth_index_list: array![auth_idx.into()],
+            auth_index_list: array![auth_idx],
             d_j_in_list: array![d_j_in],
             v_in_list: array![v_in],
             rseed_in_list: array![rseed_in],
@@ -691,7 +691,7 @@ mod tests {
             auth_pub_seed_list: array![auth_pub_seed, auth_pub_seed],
             wots_sig_flat,
             auth_siblings_flat,
-            auth_index_list: array![auth_idx_0.into(), auth_idx_1.into()],
+            auth_index_list: array![auth_idx_0, auth_idx_1],
             d_j_in_list: array![d_j_in_0, d_j_in_1],
             v_in_list: array![v_in_0, v_in_1],
             rseed_in_list: array![rseed_in_0, rseed_in_1],
@@ -749,7 +749,7 @@ mod tests {
         let sig = sign_unshield_input(
             sighash,
             *base.auth_pub_seed_list.at(0),
-            (*base.auth_index_list.at(0)).try_into().unwrap(),
+            *base.auth_index_list.at(0),
             0x8200,
         );
         let mut wots_sig_flat: Array<felt252> = array![];
@@ -1027,7 +1027,7 @@ mod tests {
                     ),
                     fixture.memo_ct_hash_fee,
                     *fixture.auth_pub_seed_list.at(0),
-                    (*fixture.auth_index_list.at(0)).try_into().unwrap(),
+                    *fixture.auth_index_list.at(0),
                 );
         run_verify(@fixture);
     }
