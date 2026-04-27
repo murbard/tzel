@@ -441,10 +441,16 @@ transfer / unshield / shield sighashes, which use tags \(0x01\), \(0x02\),
 \(0x03\)). The L1 deposit transaction is addressed to the canonical
 recipient string \texttt{deposit:<hex(pubkey\_hash)>}; the kernel
 maintains a per-pool aggregated balance and credits it on each L1 ticket.
-\(blind\) is a per-deposit randomness the wallet derives deterministically
-from \(master\_sk\), so distinct deposits to the same auth tree get
-distinct pool ids by default and the wallet can recover all its pools
-from the seed alone.
+\(blind\) is a per-deposit randomness the wallet derives
+deterministically from \(master\_sk\), so distinct deposits to the
+same auth tree get distinct pool ids by default. The blind derivation
+is reproducible from the seed, but the
+\((\textrm{address\_index}, \textrm{deposit\_nonce})\) pairs the wallet
+actually used live only in the wallet's local state — the rollup
+kernel intentionally stores no enumerable pool index. A wallet that
+loses its local file before shielding therefore cannot discover its
+pools without a bounded brute-force scan over candidate
+\((i, j)\) pairs followed by per-candidate kernel balance probes.
 
 \paragraph{Aggregation and dust resistance.} Multiple L1 tickets to the
 same \texttt{deposit:<hex(pubkey\_hash)>} recipient string aggregate into

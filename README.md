@@ -105,7 +105,7 @@ For local testing and fast integration loops, `--trust-me-bro` is useful: `sp-cl
 |  * Check nullifiers not in global NF_set                |
 |  * Check root in historical anchor set                  |
 |  * Append new commitments to Merkle tree T              |
-|  * Allocate per-deposit slots for L1 bridge tickets     |
+|  * Credit per-pool aggregated balances on L1 deposits   |
 |  * Queue / emit L1 withdrawals                          |
 +---------------------------------------------------------+
 ```
@@ -199,7 +199,7 @@ It:
 - decodes Tezos Data Encoding inbox messages into shared TzEL request types
 - treats `transfer` as the only fully internal rollup transaction, with bridge-`deposit` + `shield` handling rollup ingress and `unshield` (which directly emits an L1-outbox transfer to the requested tz/KT1 recipient) handling egress
 - applies the shared transition logic from `tzel-core`
-- persists path-addressed durable state for notes, per-deposit slots, roots, nullifiers, withdrawal queue, bridge ticketer, verifier config, and the commitment-tree frontier
+- persists path-addressed durable state for notes, per-pool deposit balances, applied-shield commitments, roots, nullifiers, withdrawal queue, bridge ticketer, verifier config, and the commitment-tree frontier
 - verifies proofs through the shared verifier path without linking prover code
 
 Build it with:

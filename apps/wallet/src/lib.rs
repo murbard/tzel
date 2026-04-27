@@ -1863,6 +1863,13 @@ impl<'a> RollupRpc<'a> {
         )
     }
 
+    fn smart_rollup_address_url(&self) -> String {
+        format!(
+            "{}/global/smart_rollup_address",
+            self.profile.rollup_node_url.trim_end_matches('/')
+        )
+    }
+
     fn block_level_url(&self, block_ref: &str) -> String {
         format!(
             "{}/global/block/{}/level",
@@ -2226,6 +2233,30 @@ impl<'a> RollupRpc<'a> {
                     .into(),
             ),
         }
+    }
+
+    /// Confirm the rollup node `rollup_node_url` actually serves the
+    /// rollup at `profile.rollup_address`. Without this cross-check, a
+    /// stale or malicious profile that points the two at different
+    /// rollups could pass the verifier / ticketer / owner_tag preflight
+    /// (all of which read state from `rollup_node_url`) while the L1
+    /// mint targets `rollup_address` — sending real mutez to a rollup
+    /// the wallet has never inspected.
+    fn ensure_rollup_address_matches(&self) -> Result<(), String> {
+        let url = self.smart_rollup_address_url();
+        let raw = get_text(&url)
+            .map_err(|e| format!("rollup RPC {} failed: {}", url, e))?;
+        let served = serde_json::from_str::<String>(&raw)
+            .unwrap_or_else(|_| raw.trim().trim_matches('"').to_string());
+        if served != self.profile.rollup_address {
+            return Err(format!(
+                "rollup-node served address ({}) does not match wallet profile.rollup_address ({}); \
+                 refusing to send a bridge deposit. Update the wallet profile or point \
+                 rollup_node_url at the right rollup.",
+                served, self.profile.rollup_address,
+            ));
+        }
+        Ok(())
     }
 
     /// Read the operator's canonical producer-fee owner_tag from the
@@ -3486,19 +3517,33 @@ fn felt_u64_to_hex(v: u64) -> String {
     format!("0x{:x}", v)
 }
 
+/// Parse a `--pubkey-hash` argument. Accepts exactly one canonical
+/// form: 64 lowercase hex characters, no `0x` prefix, no `deposit:`
+/// prefix. This matches what `pubkey_hash_hex` prints, so a user
+/// can copy a value out of `tzel-wallet check` / `tzel-wallet
+/// balance` directly. Reject the alternate forms outright — there
+/// is no live system to be backwards-compatible with.
 fn parse_pubkey_hash_hex(value: &str) -> Result<F, String> {
-    let value = value.strip_prefix("0x").unwrap_or(value);
-    let value = value
-        .strip_prefix(DEPOSIT_RECIPIENT_PREFIX)
-        .unwrap_or(value);
-    let bytes =
-        hex::decode(value).map_err(|e| format!("invalid pubkey_hash hex: {}", e))?;
-    if bytes.len() != 32 {
+    if value.starts_with("0x") || value.starts_with("0X") {
+        return Err("pubkey_hash must be 64 lowercase hex chars (no `0x` prefix)".into());
+    }
+    if value.starts_with(DEPOSIT_RECIPIENT_PREFIX) {
         return Err(format!(
-            "invalid pubkey_hash: expected 32 bytes, got {}",
-            bytes.len()
+            "pubkey_hash must be 64 lowercase hex chars (no `{}` prefix)",
+            DEPOSIT_RECIPIENT_PREFIX,
         ));
     }
+    if value.len() != 64 {
+        return Err(format!(
+            "pubkey_hash must be 64 lowercase hex chars; got {} chars",
+            value.len(),
+        ));
+    }
+    if value.chars().any(|c| !matches!(c, '0'..='9' | 'a'..='f')) {
+        return Err("pubkey_hash must be lowercase hex (0-9, a-f) only".into());
+    }
+    let bytes =
+        hex::decode(value).map_err(|e| format!("invalid pubkey_hash hex: {}", e))?;
     let mut out = ZERO;
     out.copy_from_slice(&bytes);
     Ok(out)
@@ -3792,12 +3837,9 @@ pub fn validate_detection_service_wallet(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Demo HTTP: query the local sp-ledger for open deposit slots matching the
-/// wallet's pending intents. Slots are keyed by intent and may have multiple
-/// entries per intent if attackers dust-deposit; the wallet picks the slot
-/// whose amount matches the bound debit (see `apply_scan_feed`).
-/// Fetch each tracked deposit pool's current balance from the demo HTTP
-/// ledger. Returns a sparse map (pools with no recorded balance are absent).
+/// Fetch each tracked deposit pool's current balance from the demo
+/// HTTP ledger. Returns a sparse map; pools with no recorded balance
+/// (never credited or fully drained) are absent.
 fn fetch_pool_balances_http(
     ledger: &str,
     pending: &[PendingDeposit],
@@ -6401,6 +6443,10 @@ fn print_deposit_pool_summary(
 fn cmd_wallet_check(path: &str, profile: &WalletNetworkProfile) -> Result<(), String> {
     let wallet = load_wallet(path)?;
     let rollup = RollupRpc::new(profile);
+    // Bind the rollup the wallet inspects below to the rollup the
+    // user's profile targets for L1 mints. Without this, every other
+    // health check could pass while pointing at the wrong rollup.
+    rollup.ensure_rollup_address_matches()?;
     let head_hash = rollup.head_hash()?;
     let snapshot = rollup.load_state_snapshot_at_block(&head_hash)?;
     let auth_domain = snapshot.auth_domain;
@@ -6510,10 +6556,17 @@ fn select_pending_deposit_by_pubkey_hash<'a>(
         })
 }
 
-/// Derive a deterministic blinding factor for a fresh deposit pool. The
-/// blind is hashed from `(master_sk, address_index, deposit_nonce)` so a
-/// wallet recovered from seed alone can reproduce every pool's
-/// `pubkey_hash` and prove ownership.
+/// Derive a deterministic blinding factor for a fresh deposit pool.
+/// The blind is `H("tzel-deposit-blind", master_sk, address_index,
+/// deposit_nonce)`, so the *blind itself* is recoverable from the
+/// seed alone — but the `(address_index, deposit_nonce)` pairs that
+/// were actually used live in the wallet's local `pending_deposits`
+/// state plus its `deposit_nonce` counter, neither of which is on
+/// chain. A wallet that loses its local file therefore cannot
+/// discover its pools without a bounded brute-force scan over
+/// candidate `(i, j)` pairs followed by per-candidate balance probes
+/// (see `findings.md` F-W-4 for the open recovery-scan feature). Do
+/// not assume seed-only recovery is automatic.
 fn derive_deposit_blind(master_sk: &F, address_index: u32, deposit_nonce: u64) -> F {
     let mut payload = b"tzel-deposit-blind".to_vec();
     payload.extend_from_slice(master_sk);
@@ -6548,11 +6601,17 @@ fn cmd_bridge_deposit(
     let address_index = address_state.index;
     save_wallet(path, &wallet)?;
 
-    // Refuse to send the L1 ticket unless the rollup is fully configured
-    // and its bridge ticketer matches our profile. Producer-fee owner_tag
-    // matching no longer applies at deposit time (the producer-fee
-    // recipient is chosen at shield time), but bridge ticketer mismatch
-    // would burn mutez to a slot that never appears in our pool.
+    // Refuse to send the L1 ticket unless every preflight gate
+    // passes. Producer-fee owner_tag matching no longer applies at
+    // deposit time (the producer-fee recipient is chosen at shield
+    // time), but the rollup the wallet just inspected via
+    // `rollup_node_url` MUST match the rollup the L1 mint is going to
+    // target via `rollup_address`, otherwise a stale/malicious profile
+    // could pass verifier+ticketer preflight while the irreversible
+    // L1 ticket flies to the wrong rollup. Bridge-ticketer mismatch
+    // would also burn mutez to a pool that the configured rollup
+    // never sees.
+    rollup.ensure_rollup_address_matches()?;
     rollup.ensure_verifier_configured(&head_hash)?;
     rollup.ensure_bridge_ticketer_matches(&head_hash, &profile.bridge_ticketer)?;
 
@@ -8935,6 +8994,10 @@ mod network_profile_tests {
 
         let base_url = super::tests::spawn_mock_http_server(HashMap::from([
             ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            (
+                "/global/smart_rollup_address".into(),
+                (200, "\"sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP\"".into()),
+            ),
             ("/global/block/BLmockhead/level".into(), (200, "12".into())),
             (
                 format!(
@@ -9041,6 +9104,10 @@ mod network_profile_tests {
 
         let base_url = super::tests::spawn_mock_http_server(HashMap::from([
             ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            (
+                "/global/smart_rollup_address".into(),
+                (200, "\"sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP\"".into()),
+            ),
             ("/global/block/BLmockhead/level".into(), (200, "12".into())),
             (
                 format!(
@@ -9127,6 +9194,10 @@ mod network_profile_tests {
 
         let base_url = super::tests::spawn_mock_http_server(HashMap::from([
             ("/global/block/head/hash".into(), (200, "\"BLmockhead\"".into())),
+            (
+                "/global/smart_rollup_address".into(),
+                (200, "\"sr1C7caq3WfNfQMAri4QxNb9Fkxsn6WrgMQP\"".into()),
+            ),
             ("/global/block/BLmockhead/level".into(), (200, "12".into())),
             (
                 format!(
@@ -9203,6 +9274,44 @@ mod network_profile_tests {
     }
 
     #[test]
+    fn cmd_wallet_check_fails_when_rollup_node_serves_a_different_rollup() {
+        // The actual L1 mint targets `profile.rollup_address`. If the
+        // wallet's `rollup_node_url` happens to point at a different
+        // rollup, every other preflight check is testing the wrong
+        // state. The new `ensure_rollup_address_matches` gate at the
+        // top of `cmd_wallet_check` (and `cmd_bridge_deposit`) catches
+        // this before any other probe runs.
+        let dir = tempfile::tempdir().unwrap();
+        let wallet_path = dir.path().join("wallet.json");
+        let wallet_path_str = wallet_path.to_str().unwrap();
+        let profile_path = default_network_profile_path(wallet_path_str);
+        let wallet = super::tests::test_wallet(1);
+        save_wallet(wallet_path_str, &wallet).expect("save wallet");
+
+        // Mock server reports a *different* rollup than the wallet
+        // profile pins. Nothing else needs to be mocked because the
+        // rollup-address check fails first.
+        let other_address = "sr1Ghp7iJC91k5tukgzMQTfUbY2t8ssVaHJk";
+        let base_url = super::tests::spawn_mock_http_server(HashMap::from([(
+            "/global/smart_rollup_address".into(),
+            (200, format!("\"{}\"", other_address)),
+        )]));
+
+        let profile = super::tests::rollup_profile_for_url(&base_url);
+        // sanity: the test fixture profile is pinned to a different sr1
+        assert_ne!(profile.rollup_address, other_address);
+        save_network_profile(&profile_path, &profile).expect("save profile");
+
+        let err = cmd_wallet_check(wallet_path_str, &profile)
+            .expect_err("wallet check must reject a wrong-rollup mock node");
+        assert!(
+            err.contains("rollup-node served address")
+                && err.contains("does not match wallet profile.rollup_address"),
+            "expected rollup-address mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
     fn mutez_to_tez_string_formats_exact_tezos_amounts() {
         assert_eq!(mutez_to_tez_string(1), "0.000001");
         assert_eq!(mutez_to_tez_string(1_500_000), "1.5");
@@ -9237,28 +9346,35 @@ mod network_profile_tests {
     }
 
     #[test]
-    fn pubkey_hash_hex_round_trips_through_parse_pubkey_hash_hex() {
-        // The wallet exposes both forms (`<32-byte hex>` and
-        // `deposit:<hex>`); both must round-trip. Reject the obvious
-        // malformed cases for completeness.
+    fn parse_pubkey_hash_hex_accepts_only_canonical_lowercase_hex() {
+        // The CLI prints plain lowercase hex (no prefix) and accepts
+        // exactly the same form back. The `0x` prefix and the
+        // `deposit:` prefix used to be allowed as a convenience; both
+        // are explicitly rejected now (no live system to be backwards-
+        // compatible with).
         let mut sample = ZERO;
         for (i, b) in sample.iter_mut().enumerate() {
             *b = i as u8;
         }
         let hex = pubkey_hash_hex(&sample);
-        assert_eq!(parse_pubkey_hash_hex(&hex).unwrap(), sample);
-        assert_eq!(
-            parse_pubkey_hash_hex(&format!("0x{}", hex)).unwrap(),
-            sample
-        );
-        assert_eq!(
-            parse_pubkey_hash_hex(&format!("deposit:{}", hex)).unwrap(),
-            sample
-        );
 
+        // Round-trip: print → parse.
+        assert_eq!(parse_pubkey_hash_hex(&hex).unwrap(), sample);
+
+        // Old prefixed forms now reject.
+        let err = parse_pubkey_hash_hex(&format!("0x{}", hex)).unwrap_err();
+        assert!(err.contains("no `0x` prefix"), "{}", err);
+        let err = parse_pubkey_hash_hex(&format!("0X{}", hex)).unwrap_err();
+        assert!(err.contains("no `0x` prefix"), "{}", err);
+        let err = parse_pubkey_hash_hex(&format!("deposit:{}", hex)).unwrap_err();
+        assert!(err.contains("no `deposit:` prefix"), "{}", err);
+
+        // Plain malformed inputs.
         assert!(parse_pubkey_hash_hex("nope").is_err());
-        assert!(parse_pubkey_hash_hex("0x00").is_err());
-        // 64 hex chars but with an embedded non-hex glyph.
+        assert!(parse_pubkey_hash_hex("00").is_err());
+        // 64 chars but uppercase: rejected.
+        assert!(parse_pubkey_hash_hex(&hex.to_uppercase()).is_err());
+        // 64 chars but with an embedded non-hex glyph.
         let bad = format!("{}g", &hex[..63]);
         assert!(parse_pubkey_hash_hex(&bad).is_err());
     }

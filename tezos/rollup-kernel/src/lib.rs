@@ -737,7 +737,7 @@ fn validate_bridge_deposit<H: Host>(
     }
     if !tzel_core::is_deposit_recipient_string(&deposit.recipient) {
         return Err(
-            "deposit receiver must be a canonical deposit balance key: deposit:<32-byte lowercase hex of intent>"
+            "deposit receiver must be a canonical deposit pool key: deposit:<32-byte lowercase hex of pubkey_hash>"
                 .into(),
         );
     }

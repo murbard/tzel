@@ -340,13 +340,13 @@ The contract maintains an append-only set of historical Merkle roots (anchors). 
 
 The contract or verifier environment MUST verify that `auth_domain` (from the proof's public outputs) equals the deployment's configured spend-authorization domain. Rejection of mismatched domains prevents replay of a valid spend authorization onto a mirrored deployment, fork, or verifier migration that shares the same Merkle root history.
 
-`auth_domain` is **frozen on first verifier configuration** and is single-set for the lifetime of the deployment. The contract MUST reject any subsequent `configure_verifier` whose `auth_domain` differs from the installed one, *even on a still-pristine ledger*. Other verifier-config fields (program hashes, operator producer-fee `owner_tag`) MAY change while the ledger is pristine. Allowing `auth_domain` to change in the in-flight window would silently strand any L1 bridge deposit whose intent was computed against the previous value: intent commits to `auth_domain`, so post-rotation the kernel's slot lookup would either return no slot or a slot with a now-different intent.
+The verifier configuration is **one-shot for the lifetime of the deployment**. The contract MUST reject every subsequent `configure_verifier` message — same fields, different `auth_domain`, different program hashes, anything — once a config is installed. Wallets that read `auth_domain` once therefore never have to worry about it changing under them. The earlier "auth_domain frozen but other fields reconfigurable on a pristine ledger" rule was retired with the deposit-pool redesign; it existed to close a stranding window for in-flight intent-bound deposits, which the pool design no longer has.
 
 ### Verifier configuration
 
 The kernel persists a signed `KernelVerifierConfig` containing:
 
-- `auth_domain` (frozen on first install, see above)
+- `auth_domain` (frozen by the one-shot rule, see above)
 - `verified_program_hashes` for `run_shield`, `run_transfer`, `run_unshield`
 - `operator_producer_owner_tag = H_owner(auth_root, pub_seed, nk_tag)` of the operator's canonical producer-fee receiver
 
@@ -359,7 +359,8 @@ The producer-fee receiver is **not enforced in-circuit** — the shield / transf
 Bridge deposits and unshield/transfer submissions are irreversible at the L1 / inbox layer. The reference wallet refuses to submit until it has read durable storage and confirmed:
 
 1. **Verifier configured** — `verifier_config.bin` exists. Deposits before configuration would land in a kernel that rejects them.
-2. **Bridge ticketer matches** — `bridge/ticketer` equals the wallet profile's `bridge_ticketer`. The kernel rejects deposits whose `transfer.sender` doesn't match its configured ticketer; an L1 ticket against the wrong ticketer burns mutez to a slot that never appears.
+2. **Bridge ticketer matches** — `bridge/ticketer` equals the wallet profile's `bridge_ticketer`. The kernel rejects deposits whose `transfer.sender` doesn't match its configured ticketer; an L1 ticket against the wrong ticketer burns mutez to a pool that never appears.
+4. **Rollup address matches** — the rollup node's `/global/smart_rollup_address` equals the wallet profile's `rollup_address`. The kernel reads at `rollup_node_url`; the L1 mint targets `rollup_address`. Without this cross-check, a stale or malicious profile that points the two at different rollups can pass the verifier / ticketer / owner_tag preflight while sending an irreversible L1 ticket to the wrong rollup.
 3. **Operator producer-fee owner_tag matches** — the `owner_tag` derived from `profile.dal_fee_address` equals `KernelVerifierConfig.operator_producer_owner_tag`. If the rollup-published value is zero (uninitialized), the wallet warns and proceeds; if it is non-zero and disagrees, the wallet refuses.
 
 These checks bind the wallet to the deployment it thinks it is talking to. They are reference behavior, not a consensus rule — a custom wallet that skips them merely loses funds privately.
@@ -732,7 +733,7 @@ Top-ups, partial drains, and abandoned deposits are all natural under this schem
 
 #### Privacy of Aggregation
 
-Multiple L1 deposits to the same `deposit:<hex(pubkey_hash)>` recipient are publicly correlatable on L1 (they share the same recipient string). Wallets that want unlinkable deposits use a fresh `blind` per deposit, producing a fresh pubkey_hash per deposit. Wallets that want top-up convenience reuse a `blind` (and therefore a pubkey_hash) deliberately. The choice is per-deposit and entirely user-controlled.
+Multiple L1 deposits to the same `deposit:<hex(pubkey_hash)>` recipient are publicly correlatable on L1 (they share the same recipient string). Whether a deposit reuses an existing pool or creates a fresh one is the wallet's choice. The reference wallet's `tzel-wallet deposit --amount <v>` always allocates a fresh pool (a new auth-tree address plus a new `deposit_nonce`-derived blind), so deposits are unlinkable by default. Wallets that want top-up convenience can pin to a previously-used pool, but the reference CLI doesn't expose a flag for that yet.
 
 ### L1 Withdrawal Recipient Encoding
 

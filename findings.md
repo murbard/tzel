@@ -137,6 +137,109 @@ sync)".
 
 **Commit:** `a7c7c2c`.
 
+### F-W-4 [P1, OPEN — docs corrected, recovery scan deferred] — Pool ownership material is not actually recoverable from seed-only or chain-only data
+
+The wallet stores the pool ownership material `(blind, address_index,
+auth_domain)` only in local `PendingDeposit` state. The shield path
+refuses to proceed unless the pool is still locally tracked, and on
+the chain side the wallet can only probe balances for pools it
+already knows — the kernel intentionally maintains no enumerable
+deposit-balance index. A successful L1 bridge deposit followed by
+wallet-file loss therefore strands real funds in an opaque pool with
+no discovery path.
+
+This was made worse by a code comment on `derive_deposit_blind` and
+a paragraph in `docs/whitepaper.tex` that *claimed* seed-only recovery
+worked. The blind itself is reproducible from the seed (via
+`H("tzel-deposit-blind", master_sk, address_index, deposit_nonce)`),
+but the actually-used `(i, j)` pairs are local-only, so recovery
+requires a bounded brute-force scan that the wallet doesn't
+implement.
+
+**Partial fix in this commit:** the misleading docs (wallet comment +
+whitepaper paragraph) now say plainly that seed-only recovery requires
+a bounded scan that doesn't exist yet, and reference this finding.
+
+**Open:** add a `tzel-wallet recover-deposits` command that, given a
+seed and bounds `(max_address_index, max_deposit_nonce)`, derives
+each candidate `(blind, pubkey_hash)` and probes the kernel for a
+non-zero balance, reconstructing `PendingDeposit` entries. Bring the
+local `deposit_nonce` counter up to `max+1` for each address so a
+subsequent `deposit` doesn't collide with an existing pool.
+
+### F-W-5 [P2, FIXED] — Deposit preflight didn't bind `rollup_node_url` to `rollup_address`
+
+`cmd_bridge_deposit` and `cmd_wallet_check` ran their preflight
+(verifier configured? bridge ticketer matches? operator owner_tag
+matches?) by reading durable state from `profile.rollup_node_url`,
+but the actual bridge mint targets `profile.rollup_address`. A stale
+or malicious profile that points the two at *different* rollups
+could pass preflight and send an irreversible L1 mint to the wrong
+rollup. The user's `tzel-wallet check` would also report all green
+in that case.
+
+**Fix:** new `RollupRpc::ensure_rollup_address_matches` calls
+`/global/smart_rollup_address` on `rollup_node_url` and asserts the
+returned `sr1...` equals `profile.rollup_address`. The check runs
+*first* in both `cmd_bridge_deposit` (before any state reads) and
+`cmd_wallet_check`, so a misconfigured profile fails the gate before
+any irreversible action.
+
+**Regression:**
+`cmd_wallet_check_fails_when_rollup_node_serves_a_different_rollup`
+mocks the rollup node to report a different rollup than the wallet
+profile and asserts the check rejects with a clear message.
+
+The spec's "Wallet preflight gates" section now lists the rollup-
+address check alongside the verifier-configured / ticketer-matches /
+owner_tag-matches gates.
+
+### F-W-6 [P3, FIXED] — Documentation drift: slot-era prose, old config semantics
+
+A handful of docs and comments still described the pre-redesign
+behavior:
+
+- `README.md` listed "Allocate per-deposit slots for L1 bridge
+  tickets" in the contract description and "per-deposit slots" in
+  the durable-state list. Updated to "Credit per-pool aggregated
+  balances" and "per-pool deposit balances, applied-shield
+  commitments, ..." respectively.
+- `specs/spec.md` still described the "auth_domain frozen but other
+  verifier-config fields reconfigurable on a pristine ledger" rule
+  and the slot-stranding story. Replaced with a one-shot rule that
+  matches the current kernel.
+- `specs/spec.md`'s ticketer-mismatch warning said the deposit
+  burns mutez "to a slot that never appears". Now says "to a pool
+  that never appears".
+- `specs/spec.md`'s privacy paragraph said reusing or rotating
+  `blind` is "user-controlled per-deposit". The current CLI doesn't
+  expose a flag for that — the paragraph now describes what the
+  reference wallet actually does (always allocate a fresh pool).
+- A wallet comment on `fetch_pool_balances_http` still described
+  the old slot/intent matching logic. Rewritten.
+- The kernel's `validate_bridge_deposit` rejection message said
+  "deposit:<32-byte lowercase hex of intent>". Now says "...of
+  pubkey_hash".
+
+**Regression:** a workspace-wide grep for `intent`-era language now
+returns nothing in the production code paths.
+
+### F-W-7 [P4, FIXED] — Backwards-compat residue in `parse_pubkey_hash_hex`
+
+`parse_pubkey_hash_hex` accepted three input forms — plain hex,
+`0x<hex>`, and `deposit:<hex>` — even though the redesign explicitly
+opted out of backwards compatibility. The CLI prints plain
+lowercase hex, so any user copying the value from `tzel-wallet
+check` or `tzel-wallet balance` already sees the canonical form.
+
+**Fix:** parser now accepts exactly one form: 64 lowercase hex
+chars, no prefix. The two prefixed forms reject with a clear
+message pointing the user at the canonical shape; uppercase hex
+rejects too. Old test
+`pubkey_hash_hex_round_trips_through_parse_pubkey_hash_hex` is
+replaced with `parse_pubkey_hash_hex_accepts_only_canonical_lowercase_hex`,
+which asserts the rejection paths.
+
 ### F-W-3 [LOW, FIXED] — Multi-stage drain of the same pool pinned `PendingDeposit` forever
 
 Two compounding mistakes in the F-W-2 fix:
@@ -402,6 +505,10 @@ These were verified during the audit and stand as positive results:
 | F-W-1  | MED      | FIXED    |
 | F-W-2  | LOW      | FIXED    |
 | F-W-3  | LOW      | FIXED    |
+| F-W-4  | P1       | OPEN (docs corrected; recovery scan deferred) |
+| F-W-5  | P2       | FIXED    |
+| F-W-6  | P3       | FIXED    |
+| F-W-7  | P4       | FIXED    |
 | F-C-1  | LOW      | OPEN     |
 | F-C-2  | LOW      | OPEN     |
 | F-C-3  | LOW      | OPEN     |
