@@ -3409,7 +3409,7 @@ enum UserCmd {
         /// so subsequent `--json` reads and `shield` can find it.
         ///
         /// Emits JSON under the `--json` envelope with fields:
-        ///   bridge_contract, entrypoint, params, deposit_id, amount, pending_saved.
+        ///   bridge_contract, entrypoint, params, pubkey_hash, amount, pending_saved.
         /// Without `--json`, prints human-readable lines; machine callers
         /// should always combine `--json --prepare-only`.
         #[arg(long)]
