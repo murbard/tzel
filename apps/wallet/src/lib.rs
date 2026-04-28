@@ -4507,19 +4507,25 @@ fn compute_address_breakdown(w: &WalletFile) -> AddressBreakdown {
 fn cmd_addresses(path: &str) -> Result<(), String> {
     let w = load_wallet(path)?;
     let report = compute_address_breakdown(&w);
-    // The original `user_out!` JSON-envelope wrapping is deferred to the
-    // re-applied `--json` envelope patch (eefe5d0). For now the human
-    // form is always emitted; once `user_out!` lands the JSON arm will
-    // be wired back in here.
-    println!(
-        "{} address(es), total {} (available {})",
+    let addresses_json =
+        serde_json::to_value(&report.addresses).unwrap_or(serde_json::Value::Null);
+    user_out!(
+        json: {
+            "addresses" => addresses_json,
+            "total" => report.total,
+            "total_available" => report.total_available,
+            "address_count" => report.address_count,
+        },
+        human: "{} address(es), total {} (available {})",
         report.address_count, report.total, report.total_available
     );
-    for entry in &report.addresses {
-        println!(
-            "  #{}  balance={}  available={}  notes={}",
-            entry.index, entry.balance, entry.available, entry.notes
-        );
+    if !json_mode() {
+        for entry in &report.addresses {
+            println!(
+                "  #{}  balance={}  available={}  notes={}",
+                entry.index, entry.balance, entry.available, entry.notes
+            );
+        }
     }
     Ok(())
 }
@@ -7375,17 +7381,23 @@ fn print_deposit_pool_summary(
             awaiting_credit += 1;
         }
     }
-    println!(
-        "Deposit pools: {} funded, total balance {} mutez",
+    user_out!(
+        json: {
+            "deposit_pools_funded" => funded_count,
+            "deposit_pools_total_mutez" => total_funded,
+            "deposit_pools_awaiting_credit" => awaiting_credit,
+            "deposit_pools_drained_pending_prune" => drained_pending_scan,
+        },
+        human: "Deposit pools: {} funded, total balance {} mutez",
         funded_count, total_funded
     );
-    if awaiting_credit > 0 {
+    if awaiting_credit > 0 && !json_mode() {
         println!(
             "Deposit pools awaiting on-chain credit: {}",
             awaiting_credit
         );
     }
-    if drained_pending_scan > 0 {
+    if drained_pending_scan > 0 && !json_mode() {
         println!(
             "Deposit pools drained but not yet pruned (run `tzel-wallet sync`): {}",
             drained_pending_scan
