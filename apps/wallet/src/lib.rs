@@ -8659,6 +8659,8 @@ fn cmd_shield_rollup(
         args.push(felt_to_hex(&producer_address.d_j));
         args.push(felt_to_hex(&note_producer.rseed));
 
+        let args_bytes = serde_json::to_string(&args).map(|s| s.len() as u64).unwrap_or(0);
+        phase_event!("witness_built", { "args_count": args.len() as u64, "args_bytes": args_bytes });
         persist_wallet_and_make_proof(path, &w, pc, "run_shield", &args)?
     };
 
@@ -8896,6 +8898,8 @@ fn cmd_transfer_rollup(
         args.push(felt_to_hex(&producer_address.nk_tag));
         args.push(felt_to_hex(&note_3.mh));
 
+        let args_bytes = serde_json::to_string(&args).map(|s| s.len() as u64).unwrap_or(0);
+        phase_event!("witness_built", { "args_count": args.len() as u64, "args_bytes": args_bytes });
         persist_wallet_and_make_proof(path, &w, pc, "run_transfer", &args)?
     };
 
@@ -9144,6 +9148,8 @@ fn cmd_unshield_rollup(
         args.push(felt_to_hex(&producer_address.nk_tag));
         args.push(felt_to_hex(&producer_note.mh));
 
+        let args_bytes = serde_json::to_string(&args).map(|s| s.len() as u64).unwrap_or(0);
+        phase_event!("witness_built", { "args_count": args.len() as u64, "args_bytes": args_bytes });
         persist_wallet_and_make_proof(path, &w, pc, "run_unshield", &args)?
     };
 
