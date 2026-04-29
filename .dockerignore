@@ -1,0 +1,33 @@
+# Build artifacts — both the workspace target/ and the separate
+# apps/prover crate's target/ are built fresh inside the image.
+target/
+apps/prover/target/
+cairo/target/
+ocaml/_build/
+ocaml/vendor/mlkem-native/test/build/
+fuzz/target/
+services/reprover/target/
+tools/wasm-opscan/target/
+
+# Git metadata — revision info is passed via --build-arg, so the
+# image build doesn't need .git/.
+.git/
+.gitignore
+.gitattributes
+
+# Editor / dev-tool noise
+.vscode/
+.idea/
+.direnv/
+.envrc
+*.swp
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# CI / repo-only files (not needed inside the image)
+.github/
+findings.md
+new_findings.md

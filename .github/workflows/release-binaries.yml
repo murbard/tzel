@@ -55,14 +55,20 @@ jobs:
           TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
           echo "revision=$SHA" >> "$GITHUB_OUTPUT"
           echo "timestamp=$TS" >> "$GITHUB_OUTPUT"
+          # smoke_tag is the deterministic per-build tag we exec against
+          # in the smoke step. Always present in `tags`, so loading into
+          # the local daemon lets the next step run docker against it
+          # by name.
           case "$GITHUB_REF" in
             refs/tags/v*)
               VERSION="${GITHUB_REF#refs/tags/}"
               echo "tags=${IMAGE}:${VERSION},${IMAGE}:latest,${IMAGE}:sha-${SHA}" >> "$GITHUB_OUTPUT"
+              echo "smoke_tag=${IMAGE}:sha-${SHA}" >> "$GITHUB_OUTPUT"
               echo "push=true" >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "tags=${IMAGE}:dev-${SHA}" >> "$GITHUB_OUTPUT"
+              echo "smoke_tag=${IMAGE}:dev-${SHA}" >> "$GITHUB_OUTPUT"
               echo "push=${{ github.event.inputs.push }}" >> "$GITHUB_OUTPUT"
               ;;
           esac
@@ -90,6 +96,10 @@ jobs:
           # could continue to build the wallet CLI from source until
           # an arm64 native runner is wired up here.
           platforms: linux/amd64
+          # `load: true` lands the image in the local daemon so the
+          # smoke step below can exec the binaries before we push.
+          # Compatible with `push: true` for single-platform builds.
+          load: true
           push: ${{ steps.tags.outputs.push == 'true' }}
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
@@ -104,6 +114,25 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.description=tzel runtime binaries (tzel-wallet, tzel-detect, tzel-operator, reprove, gen-proof-bench-args, cairo executables) for downstream image consumption
+
+      - name: Smoke binaries
+        env:
+          SMOKE_TAG: ${{ steps.tags.outputs.smoke_tag }}
+        # Catches the obvious "image assembled but doesn't run" classes
+        # of failure (renamed binary, missing runtime lib, wrong COPY
+        # source path) before anything ships under :latest. Each docker
+        # run is sub-second once the image is loaded.
+        run: |
+          set -euo pipefail
+          # Default CMD reads /opt/tzel/VERSION — confirms the image
+          # boots and the manifest is in place.
+          docker run --rm "$SMOKE_TAG"
+          # User-facing CLIs: clap exits 0 on --help, so a non-zero exit
+          # means the binary itself failed to start.
+          for bin in tzel-wallet tzel-detect tzel-operator reprove; do
+            echo "smoking $bin --help"
+            docker run --rm --entrypoint "$bin" "$SMOKE_TAG" --help >/dev/null
+          done
 
       - name: Summary
         run: |

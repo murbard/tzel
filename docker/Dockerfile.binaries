@@ -31,10 +31,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config libssl-dev build-essential ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Pin the toolchain that matches rust-toolchain.toml at workspace root
-# AND apps/prover/rust-toolchain.toml. Both currently track the same
-# nightly; if they diverge, set RUST_TOOLCHAIN at build time and bump
-# both pin files in lockstep.
+# Pin the toolchain. The workspace itself has no rust-toolchain.toml
+# (CI .github/workflows/unit-tests.yml deliberately exercises the
+# workspace on stable and uses nightly only for verifier and
+# rollup-kernel crates that need it). For the binary-distribution
+# image we compile every workspace crate uniformly on nightly so the
+# verifier/kernel crates that depend on it work — apps/prover lives
+# outside the workspace and carries its own apps/prover/rust-toolchain.toml
+# pinning the same nightly. Bump both this default and that file in
+# lockstep, or override RUST_TOOLCHAIN at build time.
 RUN rustup toolchain install "${RUST_TOOLCHAIN}" --profile minimal \
     && rustup component add --toolchain "${RUST_TOOLCHAIN}" rustfmt cargo
 
