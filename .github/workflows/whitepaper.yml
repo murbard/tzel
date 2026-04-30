@@ -3,9 +3,18 @@ name: site (landing page + whitepaper)
 # Builds the site bundle: landing page (docs/index.html) plus a
 # freshly-compiled whitepaper PDF (xelatex over docs/whitepaper.tex).
 #
-# Deploys to two targets:
-#   1. GitHub Pages  — https://trilitech.github.io/tzel/
-#   2. Amazon S3     — https://tzel.tezos.com (requires AWS_* secrets)
+# Two-environment publishing model:
+#   1. Staging  — https://trilitech.github.io/tzel/   (auto, every push to main)
+#   2. Production — https://tzel.tezos.com  (only on `site-v*` tag push)
+#
+# Tagging workflow for a production release:
+#
+#   git tag site-v2026.05.07      # date-based; suffix `-2`, `-3`, ... for re-deploys
+#   git push origin site-v2026.05.07
+#
+# Tag prefix is `site-v*` to keep the release-binaries.yml `v*` tag
+# namespace distinct — pushing a `vX.Y.Z` binary release tag will not
+# trigger a site deploy, and vice versa.
 #
 # Pages source is set to "GitHub Actions" (build_type = workflow).
 # Rollback to legacy /docs deploy:
@@ -19,11 +28,14 @@ name: site (landing page + whitepaper)
 
 on:
   push:
+    # No `paths:` filter here on purpose. We want a `site-v*` tag push
+    # to always trigger a production build, even when the tagged
+    # commit doesn't itself touch docs/ — the operator's intent is
+    # "ship the current state of the site," not "ship because the
+    # last commit changed docs."
     branches: [main]
-    paths:
-      - "docs/index.html"
-      - "docs/whitepaper.tex"
-      - ".github/workflows/whitepaper.yml"
+    tags:
+      - "site-v*"
   pull_request:
     paths:
       - "docs/index.html"
@@ -87,11 +99,14 @@ jobs:
           path: _site
 
   deploy:
-    # Only deploy on main pushes (and manual dispatches from main).
-    # PRs from forks would not have the pages:write permission anyway,
-    # but the explicit guard keeps the deploy job from running for
-    # PR-build feedback.
-    if: github.event_name != 'pull_request'
+    # STAGING — https://trilitech.github.io/tzel/
+    #
+    # Auto-publishes on every push to main (and on workflow_dispatch
+    # from main). Explicitly skips PR builds (which run for CI
+    # feedback only) and tag pushes (which target production, not
+    # staging — Pages would otherwise overwrite staging with
+    # whatever older commit the tag points at).
+    if: github.event_name != 'pull_request' && startsWith(github.ref, 'refs/heads/')
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -103,31 +118,88 @@ jobs:
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128  # v5.0.0
 
   deploy-s3:
+    # PRODUCTION — https://tzel.tezos.com
+    #
+    # Triggered by `site-v*` tag pushes only. The tag is the audit
+    # trail: `git tag site-v2026.05.07 <sha>` records exactly which
+    # commit shipped to prod, and re-pushing or moving the tag
+    # re-runs this job. Rollback = delete the bad tag, re-tag a
+    # known-good SHA, push.
+    #
+    # Two-tier publishing model:
+    #   * Every main push  → staging (deploy job)
+    #   * Every site-v* tag → production (this job)
+    #
+    # The workflow-level concurrency group (pages-${{ github.ref }})
+    # uses the ref, so staging pushes and prod tags don't fight each
+    # other; back-to-back tag pushes serialize on the same group key.
     needs: build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: startsWith(github.ref, 'refs/tags/site-v')
     environment: production
     steps:
       - name: Download Pages artifact
+        # The Pages artifact uploaded by upload-pages-artifact@v5 is a
+        # regular GitHub artifact named `github-pages` containing a
+        # single `artifact.tar`. download-artifact@v4 (also v2 of the
+        # @actions/artifact API) reads it directly, no rebuild needed.
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: github-pages
           path: _site
 
       - name: Extract artifact
+        # The tar's contents (index.html, whitepaper.pdf) sit at the
+        # root, so extracting into _site/ reproduces the layout the
+        # build job staged.
         run: tar -xf _site/artifact.tar -C _site && rm _site/artifact.tar
 
       - name: Configure AWS credentials
+        # Sets AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY / AWS_REGION
+        # env vars for subsequent `aws` calls. Pinned to a commit SHA
+        # for the same reason as the actions/* pins above.
         uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722  # v4.1.0
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Deploy to S3
-        run: aws s3 sync _site/ s3://${{ secrets.AWS_S3_BUCKET }}/ --delete
+      - name: Upload index.html
+        # The bucket is shared with other static pages/docs, so we
+        # never use `aws s3 sync --delete` (it would prune anything
+        # at the root that isn't in _site/). Each file we manage is
+        # uploaded explicitly by name; unrelated keys in the bucket
+        # are left untouched.
+        #
+        # `--cache-control "no-cache"` ensures direct-to-bucket
+        # requests (no CDN, or CDN bypass) re-validate the landing
+        # page on every load instead of relying on browser heuristic
+        # caching. CloudFront TTLs are governed by the distribution;
+        # the invalidation step below busts the edge cache.
+        # `--content-type` is set explicitly because the AWS CLI
+        # otherwise infers from extension only on `sync`, not `cp`.
+        run: |
+          aws s3 cp _site/index.html \
+            s3://${{ secrets.AWS_S3_BUCKET }}/index.html \
+            --cache-control "no-cache" \
+            --content-type "text/html"
+
+      - name: Upload whitepaper.pdf
+        # PDF is replaced wholesale on every deploy. No Cache-Control
+        # override: default behaviour is fine because the URL is
+        # stable and CloudFront invalidation (when configured)
+        # handles freshness at the edge.
+        run: |
+          aws s3 cp _site/whitepaper.pdf \
+            s3://${{ secrets.AWS_S3_BUCKET }}/whitepaper.pdf \
+            --content-type "application/pdf"
 
       - name: Invalidate CloudFront cache
+        # Optional: only runs when AWS_CLOUDFRONT_DISTRIBUTION_ID is
+        # set, so the workflow works whether or not a CDN fronts the
+        # bucket. `/*` is one wildcard path = one billable invalidation
+        # (free tier covers 1000/month, well above any plausible deploy
+        # rate here).
         if: ${{ secrets.AWS_CLOUDFRONT_DISTRIBUTION_ID != '' }}
         run: |
           aws cloudfront create-invalidation \
