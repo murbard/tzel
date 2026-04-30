@@ -27,15 +27,15 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: Set up Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable @ 2026-04-30
 
       - name: Set up Rust nightly for verifier/prover crates
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master @ 2026-04-30
         with:
           toolchain: nightly-2025-07-14
 
       - name: Set up Scarb
-        uses: software-mansion/setup-scarb@v1
+        uses: software-mansion/setup-scarb@2a96b748888e3329ee44ac9ac073d930e692b3cd  # v1
         with:
           scarb-version: "2.16.1"
 
@@ -94,7 +94,7 @@ jobs:
           sudo apt-get install -y libgmp-dev pkg-config
 
       - name: Set up OCaml
-        uses: ocaml/setup-ocaml@v3
+        uses: ocaml/setup-ocaml@e32b06a3e831ff2fbc6f08cf35be2085e3918014  # v3
         with:
           ocaml-compiler: "5.2.0"
 
@@ -106,7 +106,7 @@ jobs:
         run: make -C ocaml/vendor/mlkem-native lib
 
       - name: Set up Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable @ 2026-04-30
 
       - name: Run OCaml unit tests
         run: opam exec -- ./scripts/ocaml_unit_tests.sh
