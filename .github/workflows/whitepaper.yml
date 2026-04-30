@@ -1,46 +1,64 @@
-name: whitepaper PDF
+name: site (landing page + whitepaper)
 
-# Compiles docs/whitepaper.tex to PDF with xelatex on every push to main
-# that touches the whitepaper (or this workflow), on PRs that touch the
-# same paths, and on workflow_dispatch. The PDF is uploaded as a
-# workflow artifact; nothing is committed back to the repo.
+# Builds the GitHub Pages bundle for https://trilitech.github.io/tzel/:
+# the landing page (docs/index.html) plus a freshly-compiled whitepaper
+# PDF (xelatex over docs/whitepaper.tex). The bundle is uploaded as a
+# Pages artifact and deployed via actions/deploy-pages, so the PDF
+# never needs to be committed to git.
 #
-# We install TeX Live from Ubuntu's apt repos rather than pulling a
-# third-party LaTeX action — slower per run (~3-5 min for the apt
-# install) but the dependency surface is just `actions/checkout` and
-# `actions/upload-artifact` from the GitHub-maintained `actions/*`
-# namespace. No individually-maintained Docker image in the chain.
+# Pages source for this repo is set to "GitHub Actions" (build_type =
+# workflow). Switching it back to legacy /docs deploy is a one-click /
+# one-API-call rollback if something here breaks badly:
+#
+#   gh api repos/trilitech/tzel/pages -X PUT \
+#     -f build_type=legacy \
+#     -f source[branch]=main -f source[path]=/docs
+#
+# The other files in docs/ (markdown READMEs, the .tex source itself,
+# tutorials) are not part of the published site — readers reach those
+# via the public github.com repo browser. Only index.html and the
+# generated whitepaper.pdf are staged into the Pages bundle.
 
 on:
   push:
     branches: [main]
     paths:
+      - "docs/index.html"
       - "docs/whitepaper.tex"
       - ".github/workflows/whitepaper.yml"
   pull_request:
     paths:
+      - "docs/index.html"
       - "docs/whitepaper.tex"
       - ".github/workflows/whitepaper.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
+  pages: write
+  id-token: write
 
+# Pages-deploy concurrency: don't cancel an in-flight deploy with a
+# fresher commit; let the running deploy finish first.
 concurrency:
-  group: whitepaper-pdf-${{ github.ref }}
-  cancel-in-progress: true
+  group: pages-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        # Pinned to a commit SHA rather than @v4 so a tag retag cannot
-        # silently change what we run. Update by re-resolving the v4
-        # tag against actions/checkout when bumping.
+        # Pinned to commit SHA rather than @v4 so a tag retag cannot
+        # silently change what we run. Bump by re-resolving the v4
+        # tag against the upstream actions/checkout repo.
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Install TeX Live (xelatex + latexmk + common packages)
+        # Stock Ubuntu apt repos rather than a third-party LaTeX action,
+        # so the dependency chain is just GitHub-maintained actions/*
+        # plus apt. ~3-5 min install per cold run; transparent
+        # provenance.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -51,17 +69,37 @@ jobs:
             latexmk
 
       - name: Compile whitepaper with xelatex
-        # latexmk drives the multi-pass build (xelatex + thebibliography
-        # re-resolution) automatically. The whitepaper uses a manual
-        # \begin{thebibliography} block, so two xelatex passes are
-        # enough — latexmk schedules whatever is needed.
+        # Manual \begin{thebibliography} (no biber/biblatex), so two
+        # xelatex passes resolve all citations. latexmk schedules them.
         working-directory: docs
         run: latexmk -xelatex -interaction=nonstopmode -halt-on-error whitepaper.tex
 
-      - name: Upload PDF artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+      - name: Stage Pages bundle
+        # Two-file bundle: the landing page and the freshly-built PDF.
+        # The rest of docs/ stays out of the published site — readers
+        # reach those files via the public repo on github.com.
+        run: |
+          mkdir -p _site
+          cp docs/index.html _site/index.html
+          cp docs/whitepaper.pdf _site/whitepaper.pdf
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa  # v3
         with:
-          name: whitepaper
-          path: docs/whitepaper.pdf
-          retention-days: 90
-          if-no-files-found: error
+          path: _site
+
+  deploy:
+    # Only deploy on main pushes (and manual dispatches from main).
+    # PRs from forks would not have the pages:write permission anyway,
+    # but the explicit guard keeps the deploy job from running for
+    # PR-build feedback.
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e  # v4
