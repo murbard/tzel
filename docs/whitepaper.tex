@@ -505,16 +505,15 @@ to worry about it changing under them.
 producer-fee note recipient is a private input; the circuit only proves
 that \(\cm_{producer}\) commits to some
 \(producer\_otag = \Hash_{owner}(auth\_root, pub\_seed, nk\_tag)\) and
-that the note has positive value. There is no privileged rollup
-operator: the producer fee is paid to whichever DAL slot publisher
-chooses to include the transaction, in a permissionless market where
-publishers pay bakers for slot inclusion and keep the spread between
-producer fees collected and L1 inclusion costs. Publishers therefore
-gate inclusion off-chain on \(producer\_otag\) matching their own
-address — a wallet routing fees elsewhere simply won't be bundled. The
-kernel does not — and intentionally need not — cross-check the producer
-receiver against any on-chain value, because there is no canonical
-receiver to check against.
+that the note has positive value. The producer fee is paid to whichever
+DAL slot publisher includes the transaction. DAL slot publishing is a
+permissionless market: any participant can pay bakers to publish a slot
+and keep the spread between producer fees they collect and the L1
+inclusion costs they pay. Publishers therefore gate inclusion off-chain
+on \(producer\_otag\) matching an address they control — a wallet that
+routes fees elsewhere simply does not get bundled. The kernel
+intentionally does not cross-check the producer receiver against any
+on-chain value: enforcement lives at the publisher, where it belongs.
 
 \paragraph{Top-ups and partial drains.} A user can send multiple L1
 tickets to the same \texttt{deposit:<hex(pubkey\_hash)>} recipient; each

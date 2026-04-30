@@ -1,7 +1,7 @@
-# Shadownet Operator Box
+# Shadownet Ops Host
 
 This directory contains the minimum deployment assets for a public Shadownet
-operator machine that runs:
+host that runs:
 
 - `octez-node`
 - `octez-dal-node`
@@ -52,12 +52,13 @@ by the rest of the DAL network. In practice that means:
 5. Initialize local state and node identity.
    - `sudo ./scripts/init_shadownet_operator_box.sh /etc/tzel/shadownet.env`
    - this also creates `TZEL_OPERATOR_BEARER_TOKEN_FILE` if it does not exist
-6. Export view material for the operator fee address and copy it onto the box.
+6. Export view material for the DAL fee address and copy it onto the box.
    - example:
      - `/usr/local/bin/tzel-wallet --wallet operator-fee.wallet export-view --out operator-dal-fee.view.json`
    - place the exported file at `TZEL_OPERATOR_DAL_FEE_VIEW_MATERIAL`
    - `TZEL_OPERATOR_DAL_FEE_ADDRESS_INDEX` must match the address index used for `dal_fee_address`
-7. Import the operator key once.
+7. Import the L1 secret key that `tzel-operator` will use to inject
+   operations.
    - `sudo -u tzel octez-client -d /var/lib/tzel/octez-client import secret key tzelshadownet <SECRET_KEY>`
 8. Copy the service units.
    - `sudo cp ops/shadownet/systemd/*.service /etc/systemd/system/`
@@ -76,7 +77,7 @@ by the rest of the DAL network. In practice that means:
 - L1 node RPC: `http://127.0.0.1:8732`
 - DAL node RPC: `http://127.0.0.1:10732`
 - rollup node RPC: `http://127.0.0.1:28944`
-- operator HTTP: `http://127.0.0.1:8787`
+- `tzel-operator` HTTP: `http://127.0.0.1:8787`
 - detection HTTP: `http://127.0.0.1:8789` when enabled
 
 ## Firewall

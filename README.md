@@ -57,7 +57,7 @@ target/release/sp-client -w alice.json balance
 For deployment-oriented installs with standard paths instead of a workspace checkout:
 
 - docs map: `docs/README.md`
-- operator box: `ops/shadownet/README.md`
+- ops host (rollup node + DAL node + `tzel-operator`): `ops/shadownet/README.md`
 - prover layout: `ops/prover/README.md`
 - watch-only detection service: `docs/wallet_detection_service.md`
 - shared binary installer: `./scripts/install_tzel_binaries.sh --prefix /usr/local --executables-dir /opt/tzel/cairo/target/dev`

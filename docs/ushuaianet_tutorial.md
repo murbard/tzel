@@ -1,9 +1,9 @@
 # Ushuaianet Tutorial
 
 This tutorial covers an Ushuaianet `deposit -> shield -> send -> unshield`
-flow against the deployed TzEL rollup using the operator box.
+flow against the deployed TzEL rollup using the public ops host.
 
-> **Naming note:** a few wallet-CLI subcommands and operator-box file paths
+> **Naming note:** a few wallet-CLI subcommands and ops-host file paths
 > still use the legacy `shadownet` spelling (`profile init-shadownet`,
 > `/etc/tzel/shadownet.env`, `ops/shadownet/`, `scripts/shadownet_*.sh`,
 > `--source-alias tzelshadownet`). They are kept as-is in this tutorial
@@ -35,7 +35,7 @@ burn fee.
 
 It assumes:
 
-- a public operator machine running `octez-node`, `octez-dal-node`,
+- a public ops host running `octez-node`, `octez-dal-node`,
   `octez-smart-rollup-node`, and `tzel-operator`
 - a live rollup `sr1...`
 - a live bridge ticketer `KT1...`
@@ -75,8 +75,8 @@ from the live deployment.
 | TzKT explorer | `https://ushuaianet.tzkt.io` |
 | TzEL rollup address | `sr1...` — see `tzel-infra/networks/ushuaianet.yml` (`tzel_rollup_address`) |
 | TzEL bridge ticketer | `KT1...` — see `tzel-infra/networks/ushuaianet.yml` (`tzel_bridge_ticketer`) |
-| Operator DAL fee (mutez) | `100000` |
-| Operator fee address | see `tzel-infra/networks/ushuaianet-operator-fee-address.json` |
+| Default DAL fee (mutez) | `100000` |
+| DAL fee address | see `tzel-infra/networks/ushuaianet-operator-fee-address.json` |
 
 Both addresses live at:
 
@@ -157,8 +157,9 @@ sudo ./scripts/init_shadownet_operator_box.sh /etc/tzel/shadownet.env
 
 Import a funded Ushuaianet key (top up via the faucet at
 `https://faucet.ushuaianet.teztnets.com` if needed — Ushuaianet baking
-needs ~6000 ꜩ but the operator account only needs enough to cover gas
-plus the bridge ticket amounts you intend to deposit):
+needs ~6000 ꜩ; the L1 account `tzel-operator` injects from only needs
+enough to cover gas plus the bridge ticket amounts you intend to
+deposit):
 
 ```bash
 sudo -u tzel octez-client -d /var/lib/tzel/octez-client import secret key tzelshadownet <SECRET_KEY>
@@ -221,7 +222,7 @@ export TRANSFER_HASH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)[
 export UNSHIELD_HASH="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["unshield_program_hash"])' <<<"$META_JSON")"
 ```
 
-Submit `configure-verifier` through the operator:
+Submit `configure-verifier` through `tzel-operator`:
 
 ```bash
 /usr/local/bin/submit_rollup_config \
@@ -235,7 +236,7 @@ Submit `configure-verifier` through the operator:
   "$UNSHIELD_HASH"
 ```
 
-Submit `configure-bridge` through the operator:
+Submit `configure-bridge` through `tzel-operator`:
 
 ```bash
 /usr/local/bin/submit_rollup_config \
@@ -246,9 +247,9 @@ Submit `configure-bridge` through the operator:
   "$BRIDGE_TICKETER"
 ```
 
-The operator automatically falls back to DAL when a config message is too large
-for the direct inbox path, which is the normal case for the signed config
-payloads now. Each command returns JSON with a `submission.id`; poll
+`tzel-operator` automatically falls back to DAL when a config message is too
+large for the direct inbox path, which is the normal case for the signed
+config payloads now. Each command returns JSON with a `submission.id`; poll
 `$OPERATOR_URL/v1/rollup/submissions/<id>` until both submissions reach
 `submitted_to_l1`, then verify local services again:
 
@@ -272,7 +273,7 @@ exercises Ushuaianet.)
 
 ## 4. Decide Where To Run The Wallet
 
-Simplest option: run the wallet on the operator box itself.
+Simplest option: run the wallet on the public ops host itself.
 
 If you want to run it from another machine, create SSH tunnels first:
 
@@ -285,7 +286,7 @@ Then use:
 - `http://127.0.0.1:8787` for `operator_url`
 - `http://127.0.0.1:28944` for `rollup_node_url`
 
-Load the operator bearer token before creating wallet profiles:
+Load the `tzel-operator` bearer token before creating wallet profiles:
 
 ```bash
 export OPERATOR_BEARER_TOKEN="$(cat /etc/tzel/operator-bearer-token)"
@@ -308,22 +309,20 @@ Create wallet files:
 ```
 
 > **DAL fee address.** Every shield/transfer/unshield attaches a small
-> note encrypted under `dal_fee_address`. Whoever bundles a transaction
-> into a DAL slot earns that note as their inclusion fee, so they only
-> bundle submissions whose note is payable to them — they enforce this
-> by trial-decrypting the note against their own view material and
-> rejecting submissions where decryption fails.
+> note encrypted under `dal_fee_address`. The DAL slot publisher who
+> includes the transaction earns that note as their inclusion fee, and
+> only accepts submissions whose note decrypts under view material they
+> hold. Wallets pick a publisher to pay by setting `dal_fee_address` to
+> the address that publisher has advertised.
 >
-> Ushuaianet's deployed bundling service (the `tzel-operator` instance
-> running on the public ops box) has a published address for this
-> purpose; use it directly:
-> `tzel-infra/networks/ushuaianet-operator-fee-address.json`. The
-> service rejects submissions routed elsewhere with `502 DAL fee note
-> is not detectable by the configured operator fee address`. The
-> mechanism is documented in `tzel-infra/docs/gcp-deploy-runbook.md`
-> §16.
+> For Ushuaianet, the public host advertises its address in
+> `tzel-infra/networks/ushuaianet-operator-fee-address.json` — point
+> your wallet at that file. Submissions whose `dal_fee_address` does
+> not match are rejected upstream with `502 DAL fee note is not
+> detectable by the configured operator fee address`. Mechanism details
+> in `tzel-infra/docs/gcp-deploy-runbook.md` §16.
 
-Fetch the canonical operator-fee address:
+Fetch the DAL fee address advertised by the public Ushuaianet host:
 
 ```bash
 curl -fsSL \
@@ -331,7 +330,7 @@ curl -fsSL \
   -o ushuaianet-operator-fee-address.json
 ```
 
-(If you are running your own bundling service, generate the equivalent
+(If you are running your own DAL slot publisher, generate the equivalent
 file from its DAL-fee wallet — `wallet receive --json` followed by
 `export-view`, in that order from the same wallet state, per
 gcp-deploy-runbook §16.)
@@ -369,10 +368,10 @@ Create wallet profiles for Ushuaianet (the CLI subcommand is still spelled
 
 Notes:
 
-- `dal_fee_address` is the published PaymentAddress for Ushuaianet's
-  bundling service (full record with `ek_v` and `ek_d`, not just the
-  auth fields). Each shield/transfer/unshield encrypts the DAL fee
-  note to this address — see the callout above. `--dal-fee-address`
+- `dal_fee_address` is the PaymentAddress that Ushuaianet's DAL slot
+  publisher advertises (full record with `ek_v` and `ek_d`, not just
+  the auth fields). Each shield/transfer/unshield encrypts the DAL
+  fee note to this address — see the callout above. `--dal-fee-address`
   reads the file once and inlines the JSON into the saved profile;
   editing the file later does not re-read it (gcp-deploy-runbook §17).
 - each `deposit` derives a fresh `pubkey_hash = H_pubkey(auth_domain, auth_root, auth_pub_seed, blind)` for a wallet-controlled auth tree, then L1-tickets the deposit amount to `deposit:<hex(pubkey_hash)>`. Multiple deposits to the same `pubkey_hash` aggregate (top-ups). The shield circuit verifies an in-circuit WOTS+ signature under the recipient's auth tree, binding the entire shield request — only the wallet that holds the auth tree's signing material can drain the pool.
@@ -445,7 +444,7 @@ Track the submission:
   --submission-id sub-REPLACE_ME
 ```
 
-Keep polling until the operator reports a final state. Then sync Alice:
+Keep polling until the submission reaches a final state. Then sync Alice:
 
 ```bash
 /usr/local/bin/tzel-wallet --wallet alice.wallet sync
@@ -490,7 +489,7 @@ Expected output includes:
 - `Submitted transfer of ...`
 - `Submission id: sub-...`
 
-Poll operator status until final:
+Poll submission status until final:
 
 ```bash
 /usr/local/bin/tzel-wallet \
@@ -541,10 +540,10 @@ Track the submission:
   --submission-id sub-REPLACE_ME
 ```
 
-Once the operator reports `submitted_to_l1`, the outbox message is queued.
+Once the submission reaches `submitted_to_l1`, the outbox message is queued.
 **On Ushuaianet the commitment period is short — wait roughly 6 to 7 minutes**
-(vs. ~14 days on Shadownet) for the rollup to publish the executable
-commitment, then dispatch the outbox message:
+for the rollup to publish the executable commitment, then dispatch the
+outbox message:
 
 ```bash
 /usr/local/bin/tzel-wallet \
@@ -568,8 +567,8 @@ curl -fsS "https://rpc.ushuaianet.teztnets.com/chains/main/blocks/head/context/c
 For the first successful live run, save:
 
 - the L1 deposit op hash
-- the operator submission ids for `shield`, `send`, and `unshield`
-- the operator status JSON for each
+- the submission ids returned by `tzel-operator` for `shield`, `send`, and `unshield`
+- the submission status JSON for each
 - the rollup address and bridge ticketer
 - TzKT links for the L1 ops (https://ushuaianet.tzkt.io/<op_hash>)
 - the L1 outbox-execution op hash
@@ -583,14 +582,14 @@ For the first successful live run, save:
   - the public DAL node is not reachable enough from the network
 - `pool_funded_total=0` even after the L1 deposit lands:
   - bridge config is wrong, the kernel did not parse the ticket, or the rollup node is not following the right rollup
-- `sync` finds nothing after a successful operator state:
+- `sync` finds nothing after the submission reaches a successful state:
   - rollup node is stale, wrong `rollup_node_url`, or wrong wallet profile
 - Shield rejected with "deposit pool balance too small":
   - the pool wasn't credited with enough mutez for `v + fee + producer_fee`. Send another L1 ticket to the same `deposit:<hex(pubkey_hash)>` recipient (top-up); shielding can be retried once sync sees the larger balance.
 - Shield rejected with "fee below minimum":
   - the rollup's `required_tx_fee` ticked up since the wallet quoted it. Re-run shield (the wallet re-quotes on each invocation); regenerate the proof if necessary.
-- Operator returns `502 DAL fee note is not detectable by the configured operator fee address`:
-  - `dal_fee_address` did not match the bundling service's published address. Re-run `profile init-shadownet` with `--dal-fee-address ushuaianet-operator-fee-address.json` (or patch `wallet.json.network.json` in place — the field is embedded JSON, see gcp-deploy-runbook §17).
+- `tzel-operator` returns `502 DAL fee note is not detectable by the configured operator fee address`:
+  - `dal_fee_address` does not match the address Ushuaianet's DAL slot publisher advertises. Re-run `profile init-shadownet` with `--dal-fee-address ushuaianet-operator-fee-address.json` (or patch `wallet.json.network.json` in place — the field is embedded JSON, see gcp-deploy-runbook §17).
 - `execute-outbox` rejected as "commitment not yet finalized":
   - the Ushuaianet commitment period (~6.5 min) has not elapsed. Wait and retry.
 
@@ -601,4 +600,4 @@ We can say "Ushuaianet shielded tx is working" when all of the following are tru
 - one live `deposit -> shield` succeeds
 - one live `send` succeeds (Bob can independently sync and observe the received note)
 - one live `unshield -> execute-outbox` round-trip lands the funds back on L1
-- the flow is reproducible on the public operator box from a clean wallet directory
+- the flow is reproducible on the public ops host from a clean wallet directory

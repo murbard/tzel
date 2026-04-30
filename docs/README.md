@@ -30,15 +30,15 @@ This directory is the entry point for the project documentation.
 - `sp-client`
   - local developer/test wallet that talks to `sp-ledger`
 - `tzel-wallet`
-  - rollup-backed wallet that talks to the rollup node, optional operator, and
-    L1 tooling
+  - rollup-backed wallet that talks to a rollup node, an optional
+    `tzel-operator` HTTP submission broker, and L1 tooling
 - `tzel-detect`
   - watch-only service built on the same rollup-backed wallet model
 
 ## Deployment Docs
 
 - [../ops/shadownet/README.md](../ops/shadownet/README.md)
-  - public operator box setup
+  - public ops host setup (rollup node + DAL node + `tzel-operator`)
 - [../ops/prover/README.md](../ops/prover/README.md)
   - prover deployment layout
 
