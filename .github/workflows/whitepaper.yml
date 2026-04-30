@@ -1,0 +1,67 @@
+name: whitepaper PDF
+
+# Compiles docs/whitepaper.tex to PDF with xelatex on every push to main
+# that touches the whitepaper (or this workflow), on PRs that touch the
+# same paths, and on workflow_dispatch. The PDF is uploaded as a
+# workflow artifact; nothing is committed back to the repo.
+#
+# We install TeX Live from Ubuntu's apt repos rather than pulling a
+# third-party LaTeX action — slower per run (~3-5 min for the apt
+# install) but the dependency surface is just `actions/checkout` and
+# `actions/upload-artifact` from the GitHub-maintained `actions/*`
+# namespace. No individually-maintained Docker image in the chain.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/whitepaper.tex"
+      - ".github/workflows/whitepaper.yml"
+  pull_request:
+    paths:
+      - "docs/whitepaper.tex"
+      - ".github/workflows/whitepaper.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: whitepaper-pdf-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        # Pinned to a commit SHA rather than @v4 so a tag retag cannot
+        # silently change what we run. Update by re-resolving the v4
+        # tag against actions/checkout when bumping.
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Install TeX Live (xelatex + latexmk + common packages)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            texlive-xetex \
+            texlive-fonts-recommended \
+            texlive-latex-recommended \
+            texlive-latex-extra \
+            latexmk
+
+      - name: Compile whitepaper with xelatex
+        # latexmk drives the multi-pass build (xelatex + thebibliography
+        # re-resolution) automatically. The whitepaper uses a manual
+        # \begin{thebibliography} block, so two xelatex passes are
+        # enough — latexmk schedules whatever is needed.
+        working-directory: docs
+        run: latexmk -xelatex -interaction=nonstopmode -halt-on-error whitepaper.tex
+
+      - name: Upload PDF artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
+        with:
+          name: whitepaper
+          path: docs/whitepaper.pdf
+          retention-days: 90
+          if-no-files-found: error
