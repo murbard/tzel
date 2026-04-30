@@ -7597,8 +7597,8 @@ fn deposit_mint_michelson_params(
 /// chain. A wallet that loses its local file therefore cannot
 /// discover its pools without a bounded brute-force scan over
 /// candidate `(i, j)` pairs followed by per-candidate balance probes
-/// (see `findings.md` F-W-4 for the open recovery-scan feature). Do
-/// not assume seed-only recovery is automatic.
+/// (`cmd_recover_deposits` implements that scan). Do not assume
+/// seed-only recovery is automatic.
 fn derive_deposit_blind(master_sk: &F, address_index: u32, deposit_nonce: u64) -> F {
     let mut payload = b"tzel-deposit-blind".to_vec();
     payload.extend_from_slice(master_sk);
