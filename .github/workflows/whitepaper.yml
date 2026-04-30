@@ -1,23 +1,21 @@
 name: site (landing page + whitepaper)
 
-# Builds the GitHub Pages bundle for https://trilitech.github.io/tzel/:
-# the landing page (docs/index.html) plus a freshly-compiled whitepaper
-# PDF (xelatex over docs/whitepaper.tex). The bundle is uploaded as a
-# Pages artifact and deployed via actions/deploy-pages, so the PDF
-# never needs to be committed to git.
+# Builds the site bundle: landing page (docs/index.html) plus a
+# freshly-compiled whitepaper PDF (xelatex over docs/whitepaper.tex).
 #
-# Pages source for this repo is set to "GitHub Actions" (build_type =
-# workflow). Switching it back to legacy /docs deploy is a one-click /
-# one-API-call rollback if something here breaks badly:
+# Deploys to two targets:
+#   1. GitHub Pages  — https://trilitech.github.io/tzel/
+#   2. Amazon S3     — https://tzel.tezos.com (requires AWS_* secrets)
+#
+# Pages source is set to "GitHub Actions" (build_type = workflow).
+# Rollback to legacy /docs deploy:
 #
 #   gh api repos/trilitech/tzel/pages -X PUT \
 #     -f build_type=legacy \
 #     -f source[branch]=main -f source[path]=/docs
 #
-# The other files in docs/ (markdown READMEs, the .tex source itself,
-# tutorials) are not part of the published site — readers reach those
-# via the public github.com repo browser. Only index.html and the
-# generated whitepaper.pdf are staged into the Pages bundle.
+# Only index.html and the generated whitepaper.pdf are published.
+# Other docs/ files are reached via the repo browser on github.com.
 
 on:
   push:
@@ -103,3 +101,35 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128  # v5.0.0
+
+  deploy-s3:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    environment: production
+    steps:
+      - name: Download Pages artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: github-pages
+          path: _site
+
+      - name: Extract artifact
+        run: tar -xf _site/artifact.tar -C _site && rm _site/artifact.tar
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@ececac1a45f3b08a01d2dd070d28d111c5fe6722  # v4.1.0
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy to S3
+        run: aws s3 sync _site/ s3://${{ secrets.AWS_S3_BUCKET }}/ --delete
+
+      - name: Invalidate CloudFront cache
+        if: ${{ secrets.AWS_CLOUDFRONT_DISTRIBUTION_ID != '' }}
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.AWS_CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
