@@ -1478,9 +1478,11 @@ fn encode_targeted_rollup_message(rollup_address: &str, payload: &[u8]) -> Resul
 // Ceiling on a single octez-client invocation. `-w 1` waits for the op to be
 // baked (~1-2 blocks); this bounds the wait so a stuck/never-confirmed op can't
 // hang forever while advance_lock is held and wedge the whole operator.
-// ponytail: fixed ceiling, generous vs the ~8-16s happy path; make it a config
-// flag if operators ever need to tune per-network block times.
-const OCTEZ_CLIENT_TIMEOUT: Duration = Duration::from_secs(180);
+// 60s is ~4-7 blocks: well past the ~8-16s happy path, so it only fires when
+// confirmation genuinely never comes, and frees a wedged operator quickly.
+// ponytail: fixed ceiling; make it a config flag if operators ever need to
+// tune per-network block times.
+const OCTEZ_CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn temp_output_path(kind: &str) -> Result<PathBuf, String> {
     let mut path = std::env::temp_dir();
